@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><!-- TODO(legal): Entity is TryBuzzCall LLC; confirm filed name matches Terms, Privacy, A2P 10DLC brand and Stripe before launch. All prices are estimates. -->
+<title>BuzzCall for Braiders | TryBuzzCall</title>
+<style>
+@page{size:Letter;margin:0}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;color:#1d2433;width:8.5in;height:11in;overflow:hidden;font-size:10pt;line-height:1.35;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+.page{display:flex;flex-direction:column;height:11in}
+header{background:#0f2a4a;color:#fff;padding:.2in .55in .16in;position:relative}
+header .brand{font-size:9pt;letter-spacing:.14em;text-transform:uppercase;color:#ffc93c;font-weight:700}
+header h1{font-size:23pt;line-height:1.08;margin:.04in 0 .05in;font-weight:800;max-width:6.3in}
+header h1 span{color:#ffc93c}
+header p{font-size:10.5pt;color:#d6e2f2;max-width:6.4in}
+header .tag{position:absolute;right:.55in;top:.26in;background:#ffc93c;color:#0f2a4a;font-weight:800;font-size:9pt;padding:.07in .14in;border-radius:20px}
+main{padding:.13in .55in .1in;flex:1;display:flex;flex-direction:column;gap:.13in}
+h2{font-size:12pt;color:#0f2a4a;margin-bottom:.05in;font-weight:800}
+h2 small{font-weight:400;color:#5b6577;font-size:9.5pt;margin-left:6px}
+.problem{display:flex;gap:.3in;align-items:stretch}
+.problem .txt{flex:1.4}
+.problem .txt p{margin-bottom:.04in;font-size:9.5pt}
+.problem .callout{flex:1;align-self:flex-start;background:#fff4d6;border-left:5px solid #ffc93c;border-radius:6px;padding:.1in .14in;font-size:9.3pt}
+.callout b{color:#0f2a4a}
+.steps{display:grid;grid-template-columns:repeat(4,1fr);gap:.14in}
+.step{background:#f2f6fb;border-radius:8px;padding:.07in .11in;border-top:4px solid #1f6feb}
+.step .n{display:inline-block;width:20px;height:20px;border-radius:50%;background:#1f6feb;color:#fff;font-weight:800;text-align:center;line-height:20px;font-size:9pt;margin-bottom:.03in}
+.step h3{font-size:10.5pt;color:#0f2a4a;margin-bottom:.04in}
+.step p{font-size:8.6pt;color:#3a4458;line-height:1.3}
+.mid{display:flex;gap:.3in}
+.benefits{flex:1.15}
+.benefits ul{list-style:none}
+.benefits li{padding-left:.24in;position:relative;margin-bottom:.02in;font-size:9pt}
+.benefits li:before{content:"✓";position:absolute;left:0;top:0;color:#fff;background:#1a9e5c;border-radius:50%;width:15px;height:15px;font-size:9pt;text-align:center;line-height:15px;font-weight:700}
+.phone{flex:.85;background:#0f2a4a;border-radius:14px;padding:.11in .14in;color:#fff;font-size:8.6pt}
+.phone .lbl{font-size:8pt;color:#9fb3cf;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.06in}
+.bubble{background:#1f3d63;border-radius:10px;padding:.06in .1in;margin-bottom:.05in}
+.bubble.alert{background:#1a9e5c;font-weight:600}
+.bubble.urgent{background:#d64545}
+.pricing{display:flex;gap:.16in;align-items:stretch}
+.price{flex:1;border:1.5px solid #d5deea;border-radius:8px;padding:.06in .12in;text-align:center}
+.price .k{font-size:8.5pt;text-transform:uppercase;letter-spacing:.08em;color:#5b6577;font-weight:700}
+.price .v{font-size:16pt;font-weight:800;color:#0f2a4a;line-height:1.15}
+.price .s{font-size:8.5pt;color:#5b6577;white-space:nowrap}
+.price.pilot{background:#1a9e5c;border-color:#1a9e5c;color:#fff}
+.price.pilot .k,.price.pilot .s{color:#e1f7ea}.price.pilot .v{color:#fff}
+.fine{font-size:8pt;color:#6b7486;margin-top:.06in}
+.proof{border:1.5px dashed #b9c4d4;border-radius:8px;padding:.08in .16in;font-size:9pt;color:#5b6577;display:flex;justify-content:space-between;gap:.2in}
+.proof b{color:#0f2a4a}
+footer{background:#ffc93c;padding:.14in .55in;display:flex;justify-content:space-between;align-items:center;margin-top:auto}
+footer .cta{font-size:15pt;font-weight:800;color:#0f2a4a;line-height:1.2}
+footer .cta small{display:block;font-size:10pt;font-weight:500}
+footer .contact{text-align:right;font-size:11pt;color:#0f2a4a;font-weight:700;line-height:1.5}
+.scripts{display:flex;gap:.16in}
+.script{flex:1;border-radius:8px;padding:.06in .12in;font-size:8.4pt;color:#3a4458;line-height:1.3}
+.script.heat{background:#fff0e6;border-left:5px solid #e8742a}
+.script.freeze{background:#e8f3ff;border-left:5px solid #1f6feb}
+.script h3{font-size:10pt;color:#0f2a4a;margin-bottom:.03in}
+.script i{color:#1d2433}
+.bubble.recap{background:#2b4f7d}
+.price.waive .v{color:#1a9e5c}
+.price .v s{color:#8a93a3;font-size:13pt;font-weight:700}
+.script.warm{background:#fff0e6;border-left:5px solid #e8742a}
+.script.cool{background:#e8f3ff;border-left:5px solid #1f6feb}
+.bubble.in{background:#3a5a84;margin-left:.35in}
+header h1{font-size:18pt;max-width:6.1in !important;padding-right:0}
+main{gap:.1in}
+.note{font-size:8.6pt;color:#3a4458;background:#f2f6fb;border-radius:8px;padding:.07in .14in}
+</style></head><body><div class="page">
+<header>
+  <div class="tag">Local · Atlanta</div>
+  <div class="brand">TryBuzzCall · BuzzCall for Braiders</div>
+  <h1>The client who called mid-braid gets texted back<br>and booked, <span>with a deposit</span>, before you finish&nbsp;the&nbsp;row.</h1>
+  <p>For Atlanta braiders and loctitians, including home studios. When your hands are in someone's hair, BuzzCall texts the missed caller, books the style, and collects a deposit for you.</p>
+</header>
+<main>
+  <section class="problem">
+    <div class="txt">
+      <h2>Your hands are busy. Your phone keeps ringing.</h2>
+      <p>A knotless set or box braids can keep you in the chair for hours. A new client calls, you can't pick up, and they try the next stylist. BuzzCall texts them back in seconds, asks which style they want, offers times that fit how long it takes, and holds the time while they pay a <b>$50 deposit</b> toward their service.</p>
+    </div>
+    <div class="callout"><b>Done for you. Plain text messages.</b><br>No app for your clients and no dashboard for you. Texts to clients come from a <b>local BuzzCall number</b>, not your personal number. We do the setup <i>and</i> the carrier texting registration (A2P 10DLC). Use Booksy, StyleSeat or GlossGenius? We can add your link.</div>
+  </section>
+
+  <section>
+    <h2>How it works <small>4 steps, all by text</small></h2>
+    <div class="steps">
+      <div class="step"><div class="n">1</div><h3>Missed call → text</h3><p>A warm text in your name, within seconds of the missed call.</p></div>
+      <div class="step"><div class="n">2</div><h3>Name + style</h3><p>They pick from your menu (knotless, box braids, retwist, twists) and can add size and length.</p></div>
+      <div class="step"><div class="n">3</div><h3>Day + time + $50</h3><p>They pick a day and 1 of 3 start times that fit the style, held while they pay a $50 Stripe deposit.</p></div>
+      <div class="step"><div class="n">4</div><h3>BOOKED + PAID</h3><p>You get a text with name, style, time, deposit and notes.</p></div>
+    </div>
+  </section>
+
+  <section class="mid">
+    <div class="benefits">
+      <h2>Why it fits a braiding business</h2>
+      <ul>
+        <li><b>Deposit up front</b>: $50 down, credited toward the service.</li>
+        <li><b>Times that fit the style</b>: a 6-hour knotless set only gets offered where 6 hours are open.</li>
+        <li><b>No double-booking</b>: held and booked times aren't offered again.</li>
+        <li><b>Your menu, your hours</b>: set your styles, how long each takes, your days (Saturdays too).</li>
+        <li><b>They can still talk to you</b>: clients can reply "call" and you get a callback note.</li>
+        <li><b>A local person to call</b>: we set it up with you, here in Atlanta.</li>
+      </ul>
+    </div>
+    <div class="phone">
+      <div class="lbl">What your phone gets (sample)</div>
+      <div class="bubble alert">✅ BOOKED + PAID: [Client name], Knotless braids, Sat 9:00 AM, $50 deposit. Notes: medium, mid-back.</div>
+      <div class="bubble">BUZZ: [Client name] wants Locs retwist. Call back: tonight after 7.</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>What your client sees <small>sample texts, worded your way</small></h2>
+    <div class="scripts">
+      <div class="script warm"><h3>First text</h3><i>"Hi, this is [Your studio]! Sorry I missed your call. I'm probably in the middle of a client's hair. I can get you booked by text. What's your name? Reply STOP to opt out, HELP for help. Msg &amp; data rates may apply."</i></div>
+      <div class="script cool"><h3>Time offer</h3><i>"Here's what I have open for Knotless braids: 1) Sat 9:00 AM (done ~3:00 PM) 2) Sat 10:00 AM 3) Sat 11:00 AM. Reply 1, 2 or 3 to book, or "call" if you'd rather I call you."</i></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Simple pricing <small>estimates · starting at</small></h2>
+    <div class="pricing">
+      <div class="price pilot"><div class="k">Try it first</div><div class="v">FREE</div><div class="s">14-day pilot</div></div>
+      <div class="price"><div class="k">Plan</div><div class="v">$49/mo + ~$5</div><div class="s">per paid booking (estimate)</div></div>
+      <div class="price waive"><div class="k">No paid booking</div><div class="v">No $5 fee</div><div class="s">only when a client books + pays</div></div>
+    </div>
+    <div class="fine">Prices are estimates and may change; your order confirms final pricing. Setup $99, waived for our first 10 founding shops and on annual plans; charged only after your free trial (estimate). The $50 deposit is separate: your client pays it through Stripe and it goes toward their service. It's not a fee to you. You can change the deposit amount. Deposit and refund terms: trybuzzcall.com/refunds.</div>
+  </section>
+</main>
+<footer>
+  <div class="cta">Start your free 14-day pilot<small>We set it all up. Nothing for you or your clients to install.</small></div>
+  <div class="contact">📞 [phone]<br>✉️ [email] · 🌐 trybuzzcall.com</div>
+</footer>
+</div></body></html>

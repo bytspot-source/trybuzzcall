@@ -1,0 +1,32 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<!-- TODO(legal): Entity is TryBuzzCall LLC (Georgia, owned by Bytspot Inc.); confirm filed name and its own EIN match Terms, Privacy, A2P 10DLC brand and Stripe before launch. -->
+<title>BuzzCall | TryBuzzCall — Booked, paid jobs from missed calls</title>
+<meta name="description" content="BuzzCall texts your missed callers back, books them into one of your open slots, and collects a $49 Stripe deposit credited to their bill. For Georgia plumbing and HVAC shops with 1–5 trucks.">
+<link rel="stylesheet" href="styles.css"></head><body>
+<header class="site-header"><div class="wrap"><a class="brand" href="index.html">Try<span>BuzzCall</span></a>
+<nav><a href="#pricing">Pricing</a><a href="#waitlist">Waitlist</a><a href="sms-consent.html">How texting works</a></nav></div></header>
+<section class="hero"><div class="wrap">
+<span class="tag">Local · Georgia</span>
+<h1><span>$49 deposit</span> in your account before you're off the ladder.</h1>
+<p><b>We don't sell texts. We sell booked, paid jobs.</b> For Georgia plumbing and HVAC shops with 1–5 trucks. When you're under a sink or up in an attic, BuzzCall texts the missed caller back in seconds, books them into one of your open slots, and collects a $49 Stripe deposit credited to their bill.</p>
+</div></section>
+<main><div class="wrap">
+<div class="callout"><p style="margin:0"><b>Done for you.</b> Keep your current number. Everything runs over plain text, no app. We handle setup and carrier (A2P 10DLC) registration.</p></div>
+<h2>How it works</h2>
+<div class="box"><ol><li>Customer calls, you can't pick up.</li><li>They get a friendly text from your business within seconds, asking their name and what's wrong.</li><li>They pick one of your next 3 open times and pay a $49 deposit through Stripe, credited to their bill.</li><li>You get a text like this <small>(illustration)</small>: <i>"✅ BOOKED + PAID $49: [Caller name], [job], [time]. Tap to call."</i> Urgent jobs are flagged.</li></ol></div>
+<h2 id="pricing">Pricing</h2><p><b>You only pay more when you get paid jobs.</b> A low base plan, plus a small fee only when a missed caller books and pays their deposit. A weekly recap shows calls caught, jobs booked, and deposits collected.</p>
+<p><b>Free 14-day pilot</b> for the first 10 Georgia shops. See what it books before you pay anything.<br><b>Base plan</b> starting at $49/mo: 1 line, unlimited text-backs and owner alerts.<br><b>Per paid lead</b> estimated at $12, charged only when a caller books a slot <i>and</i> pays the deposit. No paid booking, no lead fee.<br><b>Setup</b> $99 (estimate), <b>waived for our first 10 founding shops and on annual plans</b>; charged only after your free trial, never at signup. Done for you: keep your current number, everything runs over text (no app), and we handle setup and carrier (A2P 10DLC) registration.</p>
+<p><small>Prices are estimates and may vary by setup; your order confirms final pricing. The base plan and lead fees are billed to the shop. The $49 deposit is separate: it's paid by your customer through Stripe and credited to their bill, so it isn't a fee to you. Refunds: the deposit is fully refunded if the shop cancels or can't make the slot, or the customer cancels 24+ hours ahead; if work is declined on site, it may cover the trip fee. Full policy at <a href="refunds.html">trybuzzcall.com/refunds</a>.</small></p>
+<button class="cta" onclick="checkout('monthly')">Start monthly</button> <button class="cta" onclick="checkout('annual')">Start annual (setup waived)</button>
+<h2 id="waitlist">Join the waitlist</h2>
+<form id="wl"><input type="email" name="email" placeholder="you@yourshop.com" required aria-label="Email address"> <button class="cta">Join</button></form><p id="msg"></p>
+</div></main>
+<footer class="site-footer"><div class="wrap">
+<nav aria-label="Legal"><a href="privacy.html">Privacy</a><a href="terms.html">Terms</a><a href="refunds.html">Refunds</a><a href="terms.html#sms">SMS Terms</a><a href="sms-consent.html">SMS Consent</a></nav>
+<address><b>TryBuzzCall LLC</b> · 8735 Dunwoody Place #13893, Atlanta, GA 30350, USA<br>[support email] · [phone]</address>
+<p style="margin:.6rem 0 0"><small style="color:#9fb3cf">© 2026 TryBuzzCall LLC. BuzzCall is a product of TryBuzzCall LLC.</small></p>
+</div></footer>
+<script>
+document.getElementById('wl').onsubmit=async e=>{e.preventDefault();let ok=false;try{const r=await fetch('/api/waitlist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:e.target.email.value})});ok=r.ok}catch(_){}document.getElementById('msg').textContent=ok?"You're on the list!":'Please enter a valid email.'};
+async function checkout(plan){let j={};try{const r=await fetch('/api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({plan})});j=await r.json()}catch(_){}if(j.url)location=j.url;else alert(j.error||'Checkout unavailable — join the waitlist!')}
+</script></body></html>

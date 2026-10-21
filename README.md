@@ -1,0 +1,106 @@
+# BuzzCall (TryBuzzCall) — MVP
+
+When a customer call is missed, we text the caller back, collect **name / need / callback window**, then **buzz the owner by SMS** with who/what and a tap-to-call link. Built for Georgia plumbers and HVAC shops, and (with `VERTICAL=braiders`) Atlanta hair braiders. It does not do spam filtering.
+
+## Stack
+Node 20 + Express. Leads are stored in a JSON file (`data/db.json`), with no native dependencies. Uses the Twilio SDK, optional OpenAI (via fetch), and the Stripe SDK.
+
+```
+Caller ──call──▶ Twilio number ──POST /twilio/voice──▶ <Dial FORWARD_TO_PHONE>
+                                   │ no-answer/busy ──▶ POST /twilio/voice/status
+                                   ▼
+                       text-back SMS to caller (agent.firstMessage)
+Caller ──SMS──▶ POST /twilio/sms ──▶ agent.handleReply (name → need → window)
+                                   └─ when complete ──▶ BUZZ SMS to OWNER_PHONE
+```
+
+### Optional booking + deposit
+With `BOOKING_ENABLED=1`, after the *need* step the caller gets the 3 next open slots (from `BUSINESS_HOURS`, `BUSINESS_DAYS`, `SLOT_MINUTES`, `BUSINESS_TZ`) and replies `1`/`2`/`3`, or `callback` to fall back to the classic callback-window flow.
+- **No deposit** (`DEPOSIT_ENABLED` off): the slot is booked at once, the caller gets a confirmation, and the owner gets `BOOKED (no deposit)`.
+- **Deposit** (`DEPOSIT_ENABLED=1`, `DEPOSIT_AMOUNT` default 49): the slot is *held* for `HOLD_MINUTES` and the caller gets a pay link. The owner gets `slot held, deposit pending`.
+  - With `STRIPE_SECRET_KEY`, the link is a Stripe Checkout Session (mode `payment`, `metadata.bookingId`). Point a Stripe webhook at `{PUBLIC_BASE_URL}/stripe/webhook` (event `checkout.session.completed`). When `STRIPE_WEBHOOK_SECRET` is set, signatures are verified; if it is unset, the JSON is trusted (dev only).
+  - Without a key, the link is `{PUBLIC_BASE_URL}/pay/mock/:id`, and visiting it marks the deposit paid.
+  - On payment the booking becomes `confirmed`, the caller gets a confirmation text, and the owner gets `BOOKED + PAID $49: name, need, slot, lead fee $12, tel:…`.
+- **Per-paid-lead fee** (`LEAD_FEE`, default 12 USD): charged to the shop only when a caller books *and* pays the deposit. Recorded on the booking as `lead_fee` + `lead_fee_status` when it is marked paid:
+  - **Stripe Connect** (`STRIPE_CONNECT_ACCOUNT_ID=acct_…` set): the deposit Checkout Session is a destination charge: `payment_intent_data.transfer_data.destination` = the shop's account and `application_fee_amount` = `LEAD_FEE*100` (capped at the deposit). Status `collected`.
+  - **No Connect** (including the mock flow without Stripe keys): the deposit goes to the platform account and the fee is recorded with status `due` for monthly invoicing.
+  - `LEAD_FEE_WAIVED=1` (free pilot): no application fee; status `waived`, fee $0. A payment that arrives after its slot was lost (`paid_conflict`) gets status `review`.
+  - `/admin` shows the lead-fee total (due / collected / waived / review) and the fee on each booking. Invoicing `due` fees and refunding application fees on deposit refunds are still manual (TODO).
+- Files: `src/booking.js` (slots, holds, Stripe/mock links, Connect params, lead fees, mark-paid).
+- Bookings live in `data/db.json` → `bookings`. A slot that is `held` (and not expired) or `confirmed` is never offered or booked again, and the hold is re-checked at pick time. Expired holds release the slot. A payment that arrives after expiry, when someone else has taken the slot, is flagged `paid_conflict` and the owner is told to reschedule or refund.
+Files: `src/server.js` (routes), `src/billing.js` (shop subscription billing), `src/agent.js` (conversation; OpenAI if `OPENAI_API_KEY`, else plumber/HVAC templates), `src/sms.js` (Twilio or log-only), `src/store.js`, `public/index.html` (landing page and waitlist).
+
+### Verticals (`VERTICAL`)
+- `home_services` (default): plumber/HVAC wording (`BUSINESS_VERTICAL=plumber|hvac`), flow *name → need → slot*, fixed `SLOT_MINUTES` blocks, $49 deposit, $12 lead fee, urgent-keyword flag.
+- `braiders`: warm stylist wording in first person, no urgent/emergency language. Flow: *name → style from the `SERVICES` menu (plus optional size/length notes) → preferred day → 3 start times → hold + deposit*. Each caller can also reply `call` for a callback instead.
+  - `SERVICES="Knotless braids:360,Box braids:300,Locs retwist:120,Twists:180"` (name:minutes). Start times are spaced `SLOT_STEP_MINUTES` apart (default 60). The whole appointment must fit inside `BUSINESS_HOURS`, and a time is never offered if it overlaps a held or confirmed booking.
+  - Defaults when the var is unset: `BUSINESS_HOURS=09:00-19:00`, `BUSINESS_DAYS=1,2,3,4,5,6` (Mon-Sat), `DEPOSIT_AMOUNT=50` (credited toward the service), `LEAD_FEE=5`. Explicit values always override, so remove the home-services values from `.env` when you switch.
+  - Preferred day understands `today`, `tomorrow`, weekday names, `10/24`, `Oct 24`. Anything else (like `soonest`) means the earliest opening. If that day is full, the caller gets the closest openings after it.
+  - `BOOKING_LINK` (optional): the stylist's own Booksy/StyleSeat/GlossGenius link, added to the time-offer and callback texts.
+  - Owner texts: `BUZZ …: time held, deposit pending …`, then `BOOKED + PAID: <name>, <service>, <time>, $50 deposit. Notes: <size/length>. tel:…`.
+  - Demo: `bash scripts/demo_braiders.sh`. If nothing is listening on `PORT` (default 3000), it starts a temporary braider server with Twilio/Stripe blanked, runs a booking + mock deposit and a callback, prints the SMS log, and stops the server. Only run one server against `data/` at a time.
+
+## Run locally (demo, no keys needed)
+```bash
+cp .env.example .env
+npm install
+npm start                      # http://localhost:3000
+bash scripts/demo_simulate.sh  # in a second terminal: booking + mock deposit, then the classic callback path
+bash scripts/demo_billing.sh   # shop subscription lifecycle (mock Stripe; own temp server on :3077)
+bash scripts/demo_braiders.sh  # braider flow (stop the server above first, or it will refuse if that server isn't VERTICAL=braiders)
+```
+SMS output goes to the console and `data/sms.log`. Admin page: http://localhost:3000/admin (any username, password `ADMIN_PASSWORD`).
+
+## Env vars
+See `.env.example`. Key ones: `BUSINESS_NAME`, `VERTICAL` (home_services|braiders), `BUSINESS_VERTICAL` (plumber|hvac), braiders: `SERVICES`, `SLOT_STEP_MINUTES`, `BOOKING_LINK`; `OWNER_PHONE`, `FORWARD_TO_PHONE`, `TWILIO_*`, `OPENAI_API_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_PRICE_ID_BASE_MONTHLY/_ANNUAL`, `STRIPE_PRICE_ID_SETUP`, `TRIAL_DAYS`, `ANNUAL_UPGRADE_PRORATION`, `MONTHLY_DOWNGRADE_PRORATION`, `BILLING_PORTAL_RETURN_URL`, `BILLING_ENFORCE`, `BILLING_REQUIRE_SUBSCRIPTION`, `PAST_DUE_GRACE_DAYS`, `INACTIVE_MODE`, `INACTIVE_MESSAGE`, `MOCK_PRICE_*`, `DATA_DIR`, `LEAD_FEE`, `LEAD_FEE_WAIVED`, `STRIPE_CONNECT_ACCOUNT_ID`, `ADMIN_PASSWORD`, `PUBLIC_BASE_URL`; booking: `BOOKING_ENABLED`, `BUSINESS_TZ`, `BUSINESS_HOURS`, `BUSINESS_DAYS`, `SLOT_MINUTES`, `BOOKING_LEAD_MINUTES`, `DEPOSIT_ENABLED`, `DEPOSIT_AMOUNT`, `HOLD_MINUTES`, `STRIPE_WEBHOOK_SECRET`.
+
+## Twilio setup
+1. Buy a local GA number (404/470/678/770/706/912/229/478/762).
+2. **A2P 10DLC**: register a brand and campaign (required for US SMS deliverability).
+3. Number → Voice "A call comes in": `POST {PUBLIC_BASE_URL}/twilio/voice`
+4. Number → Messaging "A message comes in": `POST {PUBLIC_BASE_URL}/twilio/sms`
+5. Set `FORWARD_TO_PHONE` to the owner's cell. Calls ring there for `RING_TIMEOUT_SECONDS`, and if unanswered the text-back starts. Alternative: keep the shop's existing number and set *conditional call forwarding (no-answer)* on the carrier to the Twilio number, leaving `FORWARD_TO_PHONE` empty.
+6. When Twilio keys are set, webhook signatures are validated against `PUBLIC_BASE_URL`, so it must match the public URL exactly.
+
+## Public tunnel
+```bash
+ngrok http 3000                                  # or:
+cloudflared tunnel --url http://localhost:3000
+```
+Put the https URL in `PUBLIC_BASE_URL`, restart, and paste the webhook URLs into Twilio.
+
+## Stripe
+Pricing: base plan starting at $49/mo, plus a per-paid-lead fee (default $12, `LEAD_FEE`) only when a caller books and pays the deposit; free 14-day trial; setup $99 (estimate), waived for the first 10 founding shops and on annual plans, charged only after the free trial. Deposits for bookings use one-off Checkout Sessions plus `/stripe/webhook` (see above). For automatic lead-fee collection, onboard the shop as a Stripe Connect account and set `STRIPE_CONNECT_ACCOUNT_ID`.
+
+### Shop subscription billing (`src/billing.js`)
+Built on the installed `stripe` npm package **16.12.0** (API version `2024-06-20`, where `current_period_end` is on the subscription).
+- **Signup:** `POST /api/checkout {plan: "monthly"|"annual", email?}` creates a Checkout Session with `mode: "subscription"`, `payment_method_collection: "always"` (card required), and `subscription_data.trial_period_days = TRIAL_DAYS` (default 14). It also sets `trial_settings.end_behavior.missing_payment_method = "cancel"`. There's no `billing_cycle_anchor`, so the cycle anchors on signup and the first paid period starts when the trial ends (no partial first month).
+- **Setup fee** (`STRIPE_PRICE_ID_SETUP`, ~$99 estimate): *Setup $99, waived for our first 10 founding shops and on annual plans; charged only after your free trial.*
+  - Waived when: (1) the plan is annual; (2) there's an override (`SETUP_FEE_WAIVED=1`, a signup with `setup_waiver_code` = `SETUP_WAIVER_CODE`, or `setup_waived=1` on an admin-authenticated `/api/checkout`); (3) the shop is one of the first `FOUNDING_SHOPS_LIMIT` (default 10) shops in `db.billing.shops`. A shop that cancels during its trial without ever paying frees its founding slot.
+  - Otherwise, on `checkout.session.completed` we call `stripe.invoiceItems.create({customer, price: STRIPE_PRICE_ID_SETUP, subscription})` with an idempotency key. A pending invoice item with `subscription` set is pulled into that subscription's **next** invoice, which is the first one after the trial, so nothing is charged at signup. Checkout shows a `custom_text.submit` note about this.
+  - If the subscription is deleted during the trial (cancelled, or no card at trial end), or the shop switches to annual during the trial, the pending item is deleted (`invoiceItems.del`) and no setup fee is charged. `invoice.paid` marks it `paid` when its line appears on the invoice.
+  - With `TRIAL_DAYS=0` the setup price is a Checkout line item instead, since the first invoice is at signup.
+  - Status per shop (waived/pending/paid/voided) shows in `/admin` → Shops and in `/billing/status`.
+- **Plan change** (admin auth): `POST /api/billing/preview {plan}` uses `invoices.createPreview` with `subscription_details` and `proration_date`. `POST /api/billing/change-plan {plan, proration_date?}` uses `subscriptions.update` to swap the item price with `proration_behavior` `always_invoice` (monthly→annual, `ANNUAL_UPGRADE_PRORATION`) or `create_prorations` (annual→monthly, `MONTHLY_DOWNGRADE_PRORATION`). Changing the interval restarts the cycle on the change date. Pass the preview's `proration_date` to charge exactly what was previewed.
+- **Cancel / resume** (admin): `POST /api/billing/cancel` sets `cancel_at_period_end: true`. Access continues to `current_period_end` and there are no partial refunds. `POST /api/billing/resume` undoes it.
+- **Self-service:** `GET /billing/portal` (admin) redirects to a Stripe Billing Portal session (`return_url` = `BILLING_PORTAL_RETURN_URL` or `{PUBLIC_BASE_URL}/`).
+- **Webhooks** (`/stripe/webhook`, verified with `STRIPE_WEBHOOK_SECRET`): `checkout.session.completed` (subscription mode), `customer.subscription.created|updated|deleted`, `invoice.paid`, `invoice.payment_failed`, and `customer.subscription.trial_will_end`. Events are de-duplicated by id. In live mode the subscription is **re-fetched from Stripe** on each event, so out-of-order events can't store a stale status. The store keeps `db.billing.subscription` = status, plan, price, amount, `current_period_end`, `trial_end`, `cancel_at_period_end`, and `past_due_since`, plus invoices.
+  - The owner gets a text on `invoice.payment_failed` (with the portal link) and on `trial_will_end` (Stripe sends it 3 days before the trial ends).
+- **Service gating** (`billing.access()`): `trialing`/`active` means full service. `past_due` (after `PAST_DUE_GRACE_DAYS`), `canceled`, `unpaid`, `incomplete*` and `paused` mean inactive.
+  - When inactive, a missed call or text gets one polite generic text per number per 24h (`INACTIVE_MODE=generic`, or `INACTIVE_MESSAGE`), with no conversation, booking, or deposit. `silent` sends nothing.
+  - Deposits already in progress still complete.
+  - With no subscription on file, service stays active unless `BILLING_REQUIRE_SUBSCRIPTION=1`, so manual pilots keep working. `BILLING_ENFORCE=0` turns gating off.
+- **Status:** `/admin` shows a Subscription section at the top. `GET /billing/status` (admin) returns JSON, and `/health` shows `billing` and `serviceActive`.
+- **Mock mode** (no `STRIPE_SECRET_KEY`): `/api/checkout` returns `/billing/mock/checkout/:id`. Its form posts to `/billing/mock/checkout/:id/complete`, which starts the trial, charges the mock setup fee on monthly, and fires the same events through the same handler.
+  - Admin-only controls: `POST /billing/mock/advance {days}` moves a mock clock and fires `trial_will_end`, renewals, and period-end cancellation. `POST /billing/mock/fail-next {on}` makes the next renewal fail. `POST /billing/mock/update-card` pays the open invoice. `GET /billing/mock/portal` is the mock portal.
+  - Mock proration credits unused time on the old plan and charges the new plan for a full new period; any negative remainder becomes account credit. Amounts come from `MOCK_PRICE_*`.
+  - Demo: `bash scripts/demo_billing.sh` starts its own server on `:3077` with a throwaway `DATA_DIR`, so `data/` and `:3000` are untouched. It shows founding shop #1 (no setup fee), shop #11 monthly ($49 + $99 on the first post-trial invoice), shop #12 cancelling in its trial (setup voided, $0), and shop #13 annual (waived). Then it runs the full lifecycle on shop #11 (`/billing/mock/primary` picks which mock shop drives gating; the billing APIs accept an optional `sub`).
+- **Stripe dashboard setup (live):**
+  1. Create a Product with a monthly and a yearly recurring Price, plus an optional one-time setup Price, and put their ids in the env.
+  2. Turn on the Customer Portal (Settings → Billing → Customer portal): allow payment-method updates, invoice history, and cancel *at end of billing period*. If you want switching in the portal, add both Prices to its plan-switching list.
+  3. Add a webhook endpoint for the events above.
+  4. Under Billing → Subscriptions and emails, pick the retry schedule and what happens after all retries fail (cancel or mark unpaid). Both count as inactive here.
+  5. Optionally enable the trial-ending reminder email.
+
+## Limits / next steps
+Single-tenant (one business per deploy, one subscription), JSON store, no retry queue for SMS. STOP/HELP opt-out is handled by Twilio's default Advanced Opt-Out.

@@ -1,0 +1,8 @@
+{
+  "name": "missedcall-buzz",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/server.js",
+  "scripts": { "start": "node src/server.js", "demo": "bash scripts/demo_simulate.sh" },
+  "dependencies": { "dotenv": "^16.4.5", "express": "^4.19.2", "stripe": "^16.0.0", "twilio": "^5.2.0" }
+}
