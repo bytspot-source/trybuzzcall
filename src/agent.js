@@ -2,6 +2,8 @@
 // braiders (VERTICAL=braiders): name -> service from SERVICES menu (+ size/length) -> preferred day -> start time or callback.
 // OpenAI phrasing if key set, else templates.
 const biz = () => process.env.BUSINESS_NAME || 'our team';
+const city = () => (process.env.BUSINESS_CITY || '').trim();
+const inCity = () => (city() ? ` in ${city()}` : '');
 const booking = require('./booking');
 const isBraiders = () => booking.vertical() === 'braiders';
 const vertical = () => (isBraiders() ? 'braiders' : (process.env.BUSINESS_VERTICAL || 'plumber').toLowerCase());
@@ -79,8 +81,8 @@ async function polish(fallback, context) {
         model: process.env.OPENAI_MODEL || 'gpt-4o-mini', max_tokens: 120,
         messages: [
           { role: 'system', content: isBraiders()
-            ? `You text missed callers for ${biz()}, a hair braiding stylist in Atlanta, writing as the stylist ("I"). Rewrite the draft as one warm, plain SMS under 300 chars. Keep the same question/intent and any numbered list or link exactly. No prices, no urgency, no promises.`
-            : `You text missed callers for ${biz()}, a Georgia ${vertical()} business. Rewrite the draft as one friendly SMS under 300 chars. Keep the same question/intent. No prices, no promises of arrival times.` },
+            ? `You text missed callers for ${biz()}, a hair braiding stylist${inCity()}, writing as the stylist ("I"). Rewrite the draft as one warm, plain SMS under 300 chars. Keep the same question/intent and any numbered list or link exactly. No prices, no urgency, no promises.`
+            : `You text missed callers for ${biz()}, a local ${vertical()} business${inCity()}. Rewrite the draft as one friendly SMS under 300 chars. Keep the same question/intent. No prices, no promises of arrival times.` },
           { role: 'user', content: `Context: ${context}\nDraft: ${fallback}` },
         ],
       }),
