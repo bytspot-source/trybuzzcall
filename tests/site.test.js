@@ -136,21 +136,26 @@ class TimerDouble {
 
 function harness(t, fetchImpl = async () => jsonResponse({ ok: true })) {
   const nodes = Object.fromEntries([
-    'waitlist-form', 'waitlist-email', 'waitlist-status', 'checkout-status',
+    'waitlist-form', 'waitlist-email', 'waitlist-business', 'waitlist-status', 'checkout-status',
   ].map((id) => [id, new ElementDouble(byId(id).attrs)]));
   const form = nodes['waitlist-form'];
   const email = nodes['waitlist-email'];
+  const business = nodes['waitlist-business'];
+  // Most interaction tests model a visitor who has already chosen Home Services.
+  business.value = 'home_services';
   const formMarkup = blocks(html, 'form').find(({ attrs }) => attrs.id === 'waitlist-form');
   const submitTag = tags(formMarkup.content, 'button').find(({ attrs }) => attrs.type === 'submit');
   assert.ok(submitTag, 'Waitlist submit button must exist');
   const submit = new ElementDouble(submitTag.attrs);
   const checkoutButtons = elements.filter(({ attrs }) => Object.hasOwn(attrs, 'data-checkout'))
     .map(({ attrs }) => new ElementDouble(attrs));
+  const audienceLinks = elements.filter(({ attrs }) => Object.hasOwn(attrs, 'data-audience'))
+    .map(({ attrs }) => new ElementDouble(attrs));
   form.valid = true;
   form.validityChecks = 0;
   form.resetCount = 0;
-  form.reportValidity = () => { form.validityChecks += 1; return form.valid; };
-  form.reset = () => { form.resetCount += 1; email.value = ''; };
+  form.reportValidity = () => { form.validityChecks += 1; return form.valid && business.value !== ''; };
+  form.reset = () => { form.resetCount += 1; email.value = ''; business.value = ''; };
   form.querySelector = (selector) => {
     assert.equal(selector, 'button[type="submit"]');
     return submit;
@@ -162,8 +167,9 @@ function harness(t, fetchImpl = async () => jsonResponse({ ok: true })) {
     document: {
       getElementById: (id) => nodes[id] ?? null,
       querySelectorAll(selector) {
-        assert.equal(selector, '[data-checkout]');
-        return checkoutButtons;
+        if (selector === '[data-checkout]') return checkoutButtons;
+        if (selector === '[data-audience]') return audienceLinks;
+        assert.fail(`Unexpected selector: ${selector}`);
       },
     },
     window: { location: { origin, assign: (url) => redirects.push(url) } },
@@ -181,7 +187,7 @@ function harness(t, fetchImpl = async () => jsonResponse({ ok: true })) {
     assert.equal(timers.cleared.length, requests.length, 'Every request must clear its timeout');
   });
   return {
-    form, email, submit, checkoutButtons, requests, redirects, timers,
+    form, email, business, submit, checkoutButtons, audienceLinks, requests, redirects, timers,
     waitlistStatus: nodes['waitlist-status'],
     checkoutStatus: nodes['checkout-status'],
     checkout: (plan) => checkoutButtons.find((button) => button.dataset.checkout === plan),
@@ -200,6 +206,7 @@ function assertPost(request, url, body) {
 function assertWaitlistControls(h, busy) {
   assert.equal(h.submit.disabled, busy);
   assert.equal(h.email.readOnly, busy);
+  assert.equal(h.business.disabled, busy);
   assert.equal(h.form.getAttribute('aria-busy'), busy ? 'true' : null);
 }
 
@@ -246,7 +253,7 @@ test('waitlist submits a trimmed email, shows pending state, and resets on succe
   assert.match(h.waitlistStatus.textContent, /adding/i);
   assert.equal(h.waitlistStatus.dataset.state, '');
   assert.equal(h.requests.length, 1);
-  assertPost(h.requests[0], '/api/waitlist', { email: 'shop@example.test' });
+  assertPost(h.requests[0], '/api/waitlist', { email: 'shop@example.test', businessType: 'home_services' });
   assert.equal(h.form.resetCount, 0);
 
   pending.resolve(jsonResponse({ ok: true }));
@@ -254,7 +261,8 @@ test('waitlist submits a trimmed email, shows pending state, and resets on succe
   assert.equal(h.form.resetCount, 1);
   assert.equal(h.email.value, '');
   assert.equal(h.waitlistStatus.dataset.state, 'success');
-  assert.match(h.waitlistStatus.textContent, /on the list/i);
+  assert.match(h.waitlistStatus.textContent, /on the Home Services pilot list/i);
+  assert.equal(h.business.value, '');
   assertWaitlistControls(h, false);
   assert.equal(h.requests[0].options.signal.aborted, false);
   await h.email.dispatch('input');
@@ -297,6 +305,90 @@ test('a 400 waitlist response marks and focuses the email; input clears the erro
   assert.equal(h.requests.length, 2);
   assert.equal(h.waitlistStatus.dataset.state, 'success');
   assert.equal(h.form.resetCount, 1);
+});
+
+test('an empty business choice fails validation without submitting or locking controls', async (t) => {
+  const h = harness(t);
+  h.email.value = 'studio@example.test';
+  h.business.value = '';
+  await h.form.dispatch('submit');
+  assert.equal(h.requests.length, 0);
+  assertWaitlistControls(h, false);
+});
+
+test('audience links preselect the matching pilot without preventing anchor navigation', async (t) => {
+  const h = harness(t);
+  h.email.value = 'owner@example.test';
+  assert.ok(h.audienceLinks.length >= 2);
+  for (const link of h.audienceLinks) {
+    h.business.setAttribute('aria-invalid', 'true');
+    h.waitlistStatus.textContent = 'Old message';
+    const event = await link.dispatch('click');
+    assert.equal(event.defaultPrevented, false);
+    assert.equal(link.getAttribute('href'), '#waitlist');
+    assert.equal(h.business.value, link.dataset.audience);
+    assert.equal(h.business.getAttribute('aria-invalid'), null);
+    assert.equal(h.waitlistStatus.textContent, '');
+    assert.equal(h.email.value, 'owner@example.test');
+  }
+  assert.equal(h.requests.length, 0);
+});
+
+test('unsupported audience links are ignored rather than selecting an unoffered niche', async (t) => {
+  const h = harness(t);
+  h.audienceLinks[0].dataset.audience = 'nails';
+  await h.audienceLinks[0].dispatch('click');
+  assert.equal(h.business.value, 'home_services');
+  assert.equal(h.requests.length, 0);
+});
+
+test('braider inquiry sends its segment, keeps it stable during submission and never starts checkout', async (t) => {
+  const pending = deferred();
+  const h = harness(t, () => pending.promise);
+  h.email.value = 'braider@example.test';
+  const braiderLink = h.audienceLinks.find((link) => link.dataset.audience === 'braiders');
+  await braiderLink.dispatch('click');
+  const request = h.form.dispatch('submit');
+  assertWaitlistControls(h, true);
+  const pendingStatus = h.waitlistStatus.textContent;
+  const homeLink = h.audienceLinks.find((link) => link.dataset.audience === 'home_services');
+  await homeLink.dispatch('click');
+  assert.equal(h.business.value, 'braiders');
+  assert.equal(h.waitlistStatus.textContent, pendingStatus);
+  assert.equal(h.requests.length, 1);
+  assertPost(h.requests[0], '/api/waitlist', { email: 'braider@example.test', businessType: 'braiders' });
+  pending.resolve(jsonResponse({ ok: true }));
+  await request;
+  assert.match(h.waitlistStatus.textContent, /Braiders pilot list/);
+  assert.equal(h.email.value, '');
+  assert.equal(h.business.value, '');
+  assert.equal(h.form.resetCount, 1);
+  assert.equal(h.redirects.length, 0);
+  assertWaitlistControls(h, false);
+});
+
+test('invalid business response focuses its field and permits correction and retry', async (t) => {
+  let attempts = 0;
+  const h = harness(t, () => ++attempts === 1
+    ? jsonResponse({ error: 'invalid business type' }, 400) : jsonResponse({ ok: true }));
+  h.email.value = 'studio@example.test';
+  await h.form.dispatch('submit');
+  assert.equal(h.business.getAttribute('aria-invalid'), 'true');
+  assert.equal(h.business.focusCount, 1);
+  assert.equal(h.email.getAttribute('aria-invalid'), null);
+  assert.equal(h.email.focusCount, 0);
+  assert.match(h.waitlistStatus.textContent, /choose a business type/);
+  assert.equal(h.email.value, 'studio@example.test');
+  assertWaitlistControls(h, false);
+  h.business.value = 'braiders';
+  await h.business.dispatch('change');
+  assert.equal(h.business.getAttribute('aria-invalid'), null);
+  assert.equal(h.waitlistStatus.textContent, '');
+  await h.form.dispatch('submit');
+  assert.equal(h.requests.length, 2);
+  assertPost(h.requests[1], '/api/waitlist', { email: 'studio@example.test', businessType: 'braiders' });
+  assert.match(h.waitlistStatus.textContent, /Braiders pilot list/);
+  assertWaitlistControls(h, false);
 });
 
 const transportFailures = [
@@ -350,9 +442,10 @@ test('duplicate waitlist submissions are suppressed until the first request sett
   assert.equal(h.form.resetCount, 1);
   assertWaitlistControls(h, false);
   h.email.value = 'another-shop@example.test';
+  h.business.value = 'home_services';
   await h.form.dispatch('submit');
   assert.equal(h.requests.length, 2);
-  assertPost(h.requests[1], '/api/waitlist', { email: 'another-shop@example.test' });
+  assertPost(h.requests[1], '/api/waitlist', { email: 'another-shop@example.test', businessType: 'home_services' });
 });
 
 for (const [plan, destination, label] of [
@@ -514,7 +607,8 @@ test('markup has unique expected IDs and a labelled native email form', () => {
   const ids = elements.filter(({ attrs }) => attrs.id).map(({ attrs }) => attrs.id);
   assert.equal(new Set(ids).size, ids.length, 'IDs must be unique');
   for (const id of [
-    'main', 'how-it-works', 'pricing', 'faq', 'waitlist', 'waitlist-form',
+    'main', 'for-your-business', 'home-services', 'braiders', 'how-it-works', 'pricing', 'faq', 'waitlist', 'waitlist-form',
+    'home-services-pricing', 'braider-pricing', 'waitlist-business',
     'waitlist-email', 'waitlist-status', 'waitlist-privacy', 'checkout-status', 'checkout-terms',
   ]) byId(id);
   assert.equal(byId('main').tag, 'main');
@@ -552,6 +646,43 @@ test('both status messages are accessible live regions and both checkout actions
     assert.ok(text(button.content), 'Checkout must have a text label');
     describedBy(button, 'checkout-status', 'checkout-terms');
   }
+});
+
+test('business select has a visible label, an empty initial choice and only supported audiences', () => {
+  const business = byId('waitlist-business');
+  assert.equal(business.tag, 'select');
+  assert.equal(business.attrs.name, 'businessType');
+  assert.ok(Object.hasOwn(business.attrs, 'required'));
+  describedBy(business, 'waitlist-privacy', 'waitlist-status');
+  const label = blocks(html, 'label').find(({ attrs }) => attrs.for === 'waitlist-business');
+  assert.ok(label && text(label.content));
+  const select = blocks(html, 'select').find(({ attrs }) => attrs.id === 'waitlist-business');
+  assert.deepEqual(tags(select.content, 'option').map(({ attrs }) => attrs.value), ['', 'home_services', 'braiders']);
+  assert.ok(tags(select.content, 'option').every(({ attrs }) => !Object.hasOwn(attrs, 'selected')));
+});
+
+test('audiences have separate examples and only Home Services offers checkout', () => {
+  const articles = blocks(html, 'article');
+  for (const id of ['home-services', 'braiders']) {
+    const audience = articles.find(({ attrs }) => attrs.id === id);
+    assert.ok(audience);
+    const examples = blocks(audience.content, 'figure');
+    assert.equal(examples.length, 1);
+    assert.match(text(examples[0].content), /illustrative.*after SMS consent/i);
+    assert.ok(tags(audience.content, 'a').some(({ attrs }) => attrs['data-audience'] === (id === 'braiders' ? 'braiders' : 'home_services')));
+  }
+  const homePricing = articles.find(({ attrs }) => attrs.id === 'home-services-pricing');
+  const braiderPricing = articles.find(({ attrs }) => attrs.id === 'braider-pricing');
+  assert.match(text(homePricing.content), /\$49/);
+  assert.match(text(homePricing.content), /\$12 per paid booking/);
+  assert.equal(tags(homePricing.content, 'button').filter(({ attrs }) => attrs['data-checkout']).length, 2);
+  assert.equal(tags(braiderPricing.content, 'button').length, 0);
+  assert.match(text(braiderPricing.content), /Home Services rates do not automatically apply/);
+  assert.match(text(braiderPricing.content), /No card or payment/);
+  assert.doesNotMatch(text(braiderPricing.content), /\$\d/);
+  for (const { content } of blocks(homePricing.content, 'button')) assert.match(text(content), /Home Services/);
+  assert.doesNotMatch(text(html), /Weekly recap|1–5 trucks/);
+  assert.match(text(html), /not a live sync/);
 });
 
 test('noscript offers usable email and phone contact fallbacks', () => {

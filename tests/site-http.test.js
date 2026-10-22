@@ -3,7 +3,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
-const { mkdtemp, readFile, readdir, rm } = require('node:fs/promises');
+const { mkdtemp, readFile, readdir, rm, stat } = require('node:fs/promises');
+const { randomBytes } = require('node:crypto');
 const http = require('node:http');
 const net = require('node:net');
 const os = require('node:os');
@@ -42,7 +43,7 @@ function availablePort() {
   });
 }
 
-function launchServer(port, cwd) {
+function launchServer(port, cwd, adminPassword) {
   const origin = `http://127.0.0.1:${port}`;
   const child = spawn(process.execPath, [SERVER], {
     cwd,
@@ -65,7 +66,7 @@ function launchServer(port, cwd) {
       TWILIO_AUTH_TOKEN: '',
       TWILIO_PHONE_NUMBER: '',
       OPENAI_API_KEY: '',
-      ADMIN_PASSWORD: '',
+      ADMIN_PASSWORD: adminPassword,
       OWNER_PHONE: '',
       FORWARD_TO_PHONE: '',
       BOOKING_LINK: '',
@@ -140,6 +141,8 @@ function assertResponse(response, status, contentType, label) {
 
 async function startSite(t) {
   const cwd = await mkdtemp(path.join(os.tmpdir(), 'buzzcall-site-http-'));
+  const adminPassword = randomBytes(24).toString('hex');
+  const storeFile = path.join(cwd, 'db.json');
   let state;
   t.after(async () => {
     if (state) await stopServer(state);
@@ -149,7 +152,7 @@ async function startSite(t) {
   assert.deepEqual(await readdir(cwd), [], 'Child cwd/DATA_DIR starts empty, with no .env');
   for (let attempt = 0; attempt < 5; attempt++) {
     t.signal.throwIfAborted();
-    state = launchServer(await availablePort(), cwd);
+    state = launchServer(await availablePort(), cwd, adminPassword);
     try {
       await state.ready;
       break;
@@ -166,7 +169,7 @@ async function startSite(t) {
     assert.equal(url.username + url.password, '', 'No URL credentials');
     const method = body === undefined ? 'GET' : 'POST';
     if (method === 'GET') {
-      assert.ok(PUBLIC_PATHS.has(url.pathname) || url.pathname === '/health' || checkoutPaths.has(url.pathname),
+      assert.ok(PUBLIC_PATHS.has(url.pathname) || ['/health', '/admin'].includes(url.pathname) || checkoutPaths.has(url.pathname),
         `Refusing unexpected GET ${url.pathname} (especially deposit/payment actions)`);
     } else {
       assert.ok(['/api/waitlist', '/api/checkout'].includes(url.pathname), 'Never complete a checkout or charge');
@@ -180,9 +183,14 @@ async function startSite(t) {
         method,
         agent: false,
         signal: t.signal,
-        headers: payload === undefined ? {} : {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(payload),
+        headers: {
+          ...(payload === undefined ? {} : {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(payload),
+          }),
+          ...(url.pathname === '/admin' ? {
+            Authorization: `Basic ${Buffer.from(`test:${adminPassword}`).toString('base64')}`,
+          } : {}),
         },
       });
       const timer = setTimeout(() => req.destroy(new Error(`${method} ${url.pathname} timed out`)), REQUEST_MS);
@@ -224,7 +232,11 @@ async function startSite(t) {
   }
   return {
     origin: state.origin, request, publicResource, checkoutPaths,
-    readStore: async () => JSON.parse(await readFile(path.join(cwd, 'db.json'), 'utf8')),
+    readStore: async () => JSON.parse(await readFile(storeFile, 'utf8')),
+    readStoreSnapshot: async () => {
+      const [contents, metadata] = await Promise.all([readFile(storeFile, 'utf8'), stat(storeFile)]);
+      return { contents, mtimeMs: metadata.mtimeMs, ctimeMs: metadata.ctimeMs };
+    },
   };
 }
 
@@ -264,7 +276,7 @@ test('public site over real local HTTP', { timeout: 60000 }, async (t) => {
     assert.equal(home, index);
     assert.match(home, /<title>BuzzCall\b/i);
     assert.match(home, /<h1\b[^>]*>Missed call\./i);
-    assert.match(home, /Booked job\./i);
+    assert.match(home, /Next customer\./i);
     await Promise.all(['/home.css', '/site.js', '/styles.css'].map(site.publicResource));
   });
 
@@ -279,7 +291,7 @@ test('public site over real local HTTP', { timeout: 60000 }, async (t) => {
   await t.test('expected local page links and assets resolve, including cross-page and SVG fragments', async () => {
     const home = await site.publicResource('/');
     const homeLinks = new Set(localReferences(home, '/', site.origin).map((url) => url.pathname + url.hash));
-    for (const expected of ['/', '/#main', '/#how-it-works', '/#pricing', '/#faq', '/#waitlist',
+    for (const expected of ['/', '/#main', '/#home-services', '/#braiders', '/#how-it-works', '/#pricing', '/#faq', '/#waitlist',
       '/home.css', '/site.js', '/privacy.html', '/terms.html', '/refunds.html', '/terms.html#sms', '/sms-consent.html']) {
       assert.ok(homeLinks.has(expected), `Homepage must link to ${expected}`);
     }
@@ -307,24 +319,98 @@ test('public site over real local HTTP', { timeout: 60000 }, async (t) => {
       const { waitlist } = await site.readStore();
       assert.equal(waitlist.length, 1);
       assert.equal(waitlist[0].email, 'shop.owner+pilot@example.com');
+      assert.equal(Object.hasOwn(waitlist[0], 'businessType'), false, 'Legacy signup has no segment');
       assert.ok(Number.isFinite(Date.parse(waitlist[0].at)), 'Persisted signup timestamp');
       if (firstEntry) assert.deepEqual(waitlist[0], firstEntry, 'Duplicate preserves the original entry');
       firstEntry = waitlist[0];
     }
-    const response = await site.request('/api/waitlist', { email: ' Other.Shop@Example.COM ' });
+    const response = await site.request('/api/waitlist', { email: ' Other.Shop@Example.COM ', businessType: '' });
     assertResponse(response, 200, /^application\/json$/i, 'second unique signup');
-    assert.deepEqual((await site.readStore()).waitlist.map((entry) => entry.email),
+    assert.deepEqual(JSON.parse(response.body), { ok: true });
+    const { waitlist } = await site.readStore();
+    assert.deepEqual(waitlist.map((entry) => entry.email),
       ['shop.owner+pilot@example.com', 'other.shop@example.com']);
+    assert.equal(Object.hasOwn(waitlist[1], 'businessType'), false, 'Empty segment remains legacy');
   });
 
-  await t.test('invalid waitlist emails return 400 and leave persisted data unchanged', async () => {
-    const before = await site.readStore();
-    for (const email of [undefined, null, '', '   ', 'not-an-email', 'shop@example', '@example.com', 'shop@@example.com', 'shop owner@example.com']) {
-      const response = await site.request('/api/waitlist', { email });
-      assertResponse(response, 400, /^application\/json$/i, 'invalid waitlist signup');
-      assert.deepEqual(JSON.parse(response.body), { error: 'invalid email' });
-      assert.deepEqual(await site.readStore(), before, 'Rejected signup must not mutate data');
+  await t.test('both business types persist and duplicates preserve the segment and timestamp', async () => {
+    for (const businessType of ['home_services', 'braiders']) {
+      const email = `${businessType}@example.com`;
+      const response = await site.request('/api/waitlist', { email: ` ${email.toUpperCase()} `, businessType });
+      assertResponse(response, 200, /^application\/json$/i, 'segmented signup');
+      assert.deepEqual(JSON.parse(response.body), { ok: true });
+      const before = await site.readStore();
+      const entries = before.waitlist.filter((entry) => entry.email === email);
+      assert.equal(entries.length, 1);
+      assert.deepEqual(entries[0], { email, at: entries[0].at, businessType });
+      assert.ok(Number.isFinite(Date.parse(entries[0].at)), 'Persisted signup timestamp');
+      for (const duplicateType of [businessType, undefined, '']) {
+        const duplicate = await site.request('/api/waitlist', { email, businessType: duplicateType });
+        assertResponse(duplicate, 200, /^application\/json$/i, 'duplicate segmented signup');
+        assert.deepEqual(JSON.parse(duplicate.body), { ok: true });
+        assert.deepEqual(await site.readStore(), before, 'Duplicate cannot erase the segment or reset the timestamp');
+      }
     }
+  });
+
+  await t.test('legacy entries can be enriched and updated without duplicates or timestamp changes', async () => {
+    const before = await site.readStore();
+    const email = 'shop.owner+pilot@example.com';
+    const original = before.waitlist.find((entry) => entry.email === email);
+    assert.equal(Object.hasOwn(original, 'businessType'), false);
+    let segment;
+    for (const businessType of ['home_services', 'braiders', undefined, '', 'home_services']) {
+      const response = await site.request('/api/waitlist', { email: ` ${email.toUpperCase()} `, businessType });
+      assertResponse(response, 200, /^application\/json$/i, 'enrich/update signup');
+      assert.deepEqual(JSON.parse(response.body), { ok: true });
+      if (businessType) segment = businessType;
+      assert.deepEqual(await site.readStore(), {
+        ...before,
+        waitlist: before.waitlist.map((entry) => entry.email === email ? { ...original, businessType: segment } : entry),
+      });
+    }
+  });
+
+  await t.test('invalid business types return 400 without writes for new or existing emails', async () => {
+    const before = await site.readStoreSnapshot();
+    const invalidTypes = [null, 'unknown', 'HOME_SERVICES', 'Braiders', ' home_services', 'braiders ', ' ',
+      '__proto__', 0, 1, true, false, [], ['home_services'], ['braiders'], ['home_services', 'braiders'], {}, { businessType: 'braiders' }];
+    for (const email of ['rejected@example.com', 'home_services@example.com']) {
+      for (const businessType of invalidTypes) {
+        const response = await site.request('/api/waitlist', { email, businessType });
+        assertResponse(response, 400, /^application\/json$/i, 'invalid business type');
+        assert.deepEqual(JSON.parse(response.body), { error: 'invalid business type' });
+        assert.deepEqual(await site.readStoreSnapshot(), before, 'Rejected signup must not write data');
+      }
+    }
+  });
+
+  await t.test('invalid waitlist emails keep their existing response and leave persisted data unchanged', async () => {
+    const before = await site.readStoreSnapshot();
+    for (const email of [undefined, null, '', '   ', 'not-an-email', 'shop@example', '@example.com', 'shop@@example.com', 'shop owner@example.com']) {
+      for (const businessType of [undefined, 'home_services', 'braiders', null]) {
+        const response = await site.request('/api/waitlist', { email, businessType });
+        assertResponse(response, 400, /^application\/json$/i, 'invalid waitlist signup');
+        assert.deepEqual(JSON.parse(response.body), { error: 'invalid email' });
+        assert.deepEqual(await site.readStoreSnapshot(), before, 'Rejected signup must not write data');
+      }
+    }
+  });
+
+  await t.test('admin waitlist labels both segments, escapes email text, and retains legacy entries', async () => {
+    const email = '<owner&"tag>@example.com';
+    const signup = await site.request('/api/waitlist', { email, businessType: 'braiders' });
+    assertResponse(signup, 200, /^application\/json$/i, 'escaped admin signup');
+    assert.deepEqual(JSON.parse(signup.body), { ok: true });
+    const before = await site.readStore();
+    const response = await site.request('/admin');
+    assertResponse(response, 200, /^text\/html$/i, '/admin');
+    assert.ok(response.body.includes('<li>home_services@example.com · Business type: Home services</li>'));
+    assert.ok(response.body.includes('<li>braiders@example.com · Business type: Braiders</li>'));
+    assert.ok(response.body.includes('<li>other.shop@example.com</li>'));
+    assert.ok(response.body.includes('<li>&lt;owner&amp;&quot;tag&gt;@example.com · Business type: Braiders</li>'));
+    assert.ok(!response.body.includes(email), 'Raw HTML must not appear in the admin waitlist');
+    assert.deepEqual(await site.readStore(), before, 'Viewing admin must not change persisted data');
   });
 
   for (const plan of ['monthly', 'annual']) {

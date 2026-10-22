@@ -20,11 +20,11 @@ body { margin: 0; font-size: 1rem; line-height: 1.6; }
 h1, h2, h3, p, figure { margin: 0; }
 h1, h2 { overflow-wrap: anywhere; }
 a { color: inherit; text-underline-offset: .2em; }
-button, input { font: inherit; }
-button, a, input, summary { -webkit-tap-highlight-color: transparent; }
+button, input, select { font: inherit; }
+button, a, input, select, summary { -webkit-tap-highlight-color: transparent; }
 button, summary { touch-action: manipulation; }
 button { cursor: pointer; }
-a, button, input, summary { outline-offset: 5px; }
+a, button, input, select, summary { outline-offset: 5px; }
 :focus-visible { outline: 3px solid #32756b; }
 ::selection { color: var(--ink); background: var(--yellow); }
 .container { width: min(100% - 5rem, 1180px); margin-inline: auto; }
@@ -69,6 +69,37 @@ h1 { margin-top: 1.5rem; font-size: clamp(3.2rem, 5.8vw, 5rem); line-height: 1.0
 .hero-note { margin-top: .75rem; color: var(--muted); font-size: .75rem; }
 .hero-audience { display: flex; align-items: center; gap: .75rem; margin-top: 2.7rem; font-size: .73rem; color: var(--muted); }
 .mini-rule { width: 1.7rem; height: 1px; background: #89918a; flex-shrink: 0; }
+.audience-overview { min-width: 0; padding: 1.8rem; border: 1px solid var(--line); border-radius: 1.5rem; background: #eeeee3; }
+.audience-overview > .eyebrow { margin-bottom: 1.3rem; color: var(--green); }
+.audience-preview { display: flex; align-items: flex-start; gap: 1rem; background: #fff; border: 1px solid #dce1d6; padding: 1.5rem; border-radius: 1rem; text-decoration: none; }
+.audience-preview + .audience-preview { margin-top: 1rem; }
+.audience-preview:hover { border-color: var(--green); }
+.audience-preview > span:nth-child(2) { min-width: 0; flex: 1; }
+.audience-preview .step-icon { flex: 0 0 auto; }
+.audience-preview > .icon { margin-top: .5rem; }
+.audience-preview strong { display: block; font-size: clamp(1.1rem, 1.8vw, 1.45rem); line-height: 1.25; letter-spacing: -.03em; overflow-wrap: anywhere; margin-block: .45rem .75rem; }
+.preview-label { display: block; color: var(--green); font-size: .65rem; text-transform: uppercase; letter-spacing: .09em; font-weight: 700; }
+.preview-detail, .overview-note { display: block; color: var(--muted); font-size: .72rem; line-height: 1.7; }
+.audience-preview-braiders .step-icon { background: #ffe7c8; }
+.overview-note { margin: 1.25rem .3rem 0; }
+.audience-section { border-bottom: 1px solid var(--line); }
+.audience-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.5rem; }
+.audience-card { display: flex; flex-direction: column; min-width: 0; background: #eeeee3; border: 1px solid #dce1d6; border-radius: 1rem; padding: 2rem; }
+.audience-card-braiders { background: #f5ece1; border-color: #e6dacb; }
+.audience-card > .eyebrow { color: var(--green); margin-bottom: 1rem; }
+.audience-card h3 { font-size: 1.75rem; letter-spacing: -.04em; line-height: 1.2; overflow-wrap: anywhere; }
+.audience-card > p:not(.eyebrow) { font-size: .9rem; line-height: 1.8; color: var(--muted); margin-top: 1rem; }
+.audience-example { padding: 1.25rem; background: #fff; border: 1px solid #e1e3dc; border-radius: .9rem; margin-top: 1.5rem; }
+.example-label { color: var(--muted); font-weight: 700; font-size: .65rem; letter-spacing: .07em; text-transform: uppercase; margin-bottom: 1rem; }
+.audience-example .message { font-size: .8rem; line-height: 1.65; padding: .8rem; }
+.example-result { display: flex; align-items: flex-start; gap: .65rem; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--line); color: var(--green); font-size: .72rem; }
+.example-result .icon { width: 1.1rem; height: 1.1rem; margin-top: .2rem; }
+.example-result strong { display: block; margin-bottom: .2rem; }
+.audience-example figcaption { color: var(--muted); font-size: .65rem; line-height: 1.7; margin-top: 1rem; }
+.audience-card > .audience-boundary { font-size: .75rem; }
+.audience-actions { margin-top: auto; padding-top: 1.5rem; display: flex; flex-direction: column; align-items: flex-start; gap: .4rem; }
+.audience-actions .button { max-width: 100%; text-align: left; }
+.audience-fit-note { font-size: .8rem; color: var(--muted); margin-top: 1.5rem; max-width: 55rem; }
 .demo { min-width: 0; }
 .demo-stage { position: relative; isolation: isolate; background: #eeeee3; border: 1px solid #e4e5d9; border-radius: 1.5rem; padding: 1.5rem 1.6rem 4.2rem; }
 .demo-stage::before { content: ""; position: absolute; inset: 28% 6% 10%; border: 1px solid #d5d8c9; border-radius: 50%; z-index: -1; transform: rotate(-30deg); }
@@ -168,6 +199,12 @@ h3 { font-size: 1.1rem; line-height: 1.35; letter-spacing: -.025em; }
 .pilot-card h3 { margin-top: 1rem; font-size: 1.3rem; }
 .pilot-card p { font-size: .85rem; color: var(--muted); margin-block: .7rem .5rem; }
 .pricing-fine { max-width: 61rem; font-size: .7rem; color: var(--muted); margin-top: 1.5rem; line-height: 1.8; }
+.braider-price-card { background: #f5ece1; }
+.braider-price-card h3 { font-size: 2.2rem; letter-spacing: -.04em; line-height: 1.2; margin-block: 1rem; }
+.braider-price-card > .braider-price-note { font-size: .7rem; margin-top: .9rem; }
+.price-card-heading { flex-wrap: wrap; }
+.price-card-heading .pill { white-space: normal; }
+.pricing .button { text-align: left; }
 .faq { border-top: 1px solid var(--line); }
 .faq-grid { display: grid; grid-template-columns: .9fr 1.1fr; gap: 5rem; }
 .faq-grid > div > p:not(.eyebrow) { font-size: .85rem; color: var(--muted); line-height: 1.9; margin-top: 1.5rem; }
@@ -186,6 +223,9 @@ h3 { font-size: 1.1rem; line-height: 1.35; letter-spacing: -.025em; }
 .signup h2 { font-size: clamp(1.9rem, 2.7vw, 2.5rem); }
 .signup-copy > p:not(.eyebrow) { margin-top: 1.25rem; font-size: .85rem; color: #c5d1cf; max-width: 25rem; }
 .signup label { display: block; margin-bottom: .65rem; font-size: .8rem; font-weight: 600; }
+.signup select { display: block; width: 100%; min-width: 0; min-height: 54px; padding: .8rem; margin-bottom: 1rem; border: 1px solid #b7c5bd; border-radius: .5rem; background: #fff; color: var(--ink); font-size: 1rem; }
+.signup select[aria-invalid="true"] { border: 2px solid #ffb5a8; }
+.signup select:disabled { opacity: .65; cursor: not-allowed; }
 .email-row { display: flex; flex-wrap: wrap; gap: .6rem; }
 .email-row input { flex: 1 1 180px; width: 100%; min-width: 0; border: 1px solid #b7c5bd; border-radius: .5rem; background: #fff; color: var(--ink); min-height: 54px; padding: .9rem 1rem; font-size: 1rem; }
 .email-row input::placeholder { color: #65716a; opacity: 1; }
@@ -232,6 +272,9 @@ h3 { font-size: 1.1rem; line-height: 1.35; letter-spacing: -.025em; }
   .section { padding-block: 4rem; }
   .hero { padding-top: 2.5rem; }
   .hero-grid { grid-template-columns: 1fr; gap: 2.5rem; }
+  .audience-grid { grid-template-columns: 1fr; }
+  .audience-overview { max-width: 35rem; }
+  .audience-preview strong { font-size: 1.45rem; }
   .hero-copy { max-width: 35rem; }
   h1 { font-size: clamp(3.4rem, 9vw, 4.8rem); }
   .hero-description { max-width: 32rem; }
@@ -266,6 +309,16 @@ h3 { font-size: 1.1rem; line-height: 1.35; letter-spacing: -.025em; }
   h1 { font-size: clamp(2.8rem, 11vw, 3.6rem); }
   .eyebrow { font-size: .62rem; letter-spacing: .09em; }
   .hero-description { font-size: 1rem; }
+  .audience-overview, .audience-card { padding: 1.25rem; }
+  .audience-preview { padding: 1rem; gap: .7rem; flex-wrap: wrap; }
+  .audience-preview > .icon { display: none; }
+  .audience-preview strong { font-size: 1.25rem; }
+  .audience-preview .step-icon { width: 2rem; height: 2rem; }
+  .audience-example { padding: 1rem; }
+  .audience-card h3 { font-size: 1.6rem; }
+  .audience-actions .button { width: 100%; justify-content: space-between; }
+  .audience-actions .text-link { font-size: .8rem; }
+  .pricing .pill { white-space: normal; }
   .hero-actions { gap: .7rem; align-items: flex-start; flex-direction: column; }
   .hero-actions .button { width: 100%; }
   .hero-note { font-size: .7rem; }

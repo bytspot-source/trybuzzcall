@@ -3,6 +3,7 @@
 
   const form = document.getElementById('waitlist-form');
   const email = document.getElementById('waitlist-email');
+  const business = document.getElementById('waitlist-business');
   const waitlistStatus = document.getElementById('waitlist-status');
   const checkoutStatus = document.getElementById('checkout-status');
   const submit = form.querySelector('button[type="submit"]');
@@ -46,6 +47,20 @@
     }
   }
 
+  business.addEventListener('change', () => {
+    business.removeAttribute('aria-invalid');
+    if (!joining) status(waitlistStatus, '');
+  });
+
+  document.querySelectorAll('[data-audience]').forEach((link) => {
+    link.addEventListener('click', () => {
+      if (joining || !['home_services', 'braiders'].includes(link.dataset.audience)) return;
+      business.value = link.dataset.audience;
+      business.removeAttribute('aria-invalid');
+      status(waitlistStatus, '');
+    });
+  });
+
   email.addEventListener('input', () => {
     email.removeAttribute('aria-invalid');
     if (!joining) status(waitlistStatus, '');
@@ -59,18 +74,25 @@
     joining = true;
     submit.disabled = true;
     email.readOnly = true;
+    business.disabled = true;
     form.setAttribute('aria-busy', 'true');
     email.removeAttribute('aria-invalid');
+    business.removeAttribute('aria-invalid');
+    const businessType = business.value;
+    const pilotName = businessType === 'braiders' ? 'Braiders' : 'Home Services';
     status(waitlistStatus, 'Adding you to the list…');
     try {
-      const { response, data } = await post('/api/waitlist', { email: email.value });
+      const { response, data } = await post('/api/waitlist', { email: email.value, businessType });
       if (response.ok && data.ok === true) {
         form.reset();
-        status(waitlistStatus, "You're on the list! We'll be in touch about your shop.", 'success');
+        status(waitlistStatus, `You're on the ${pilotName} pilot list! We'll follow up about fit and terms.`, 'success');
       } else if (response.status === 400) {
-        email.setAttribute('aria-invalid', 'true');
-        status(waitlistStatus, 'Please check your email address and try again.', 'error');
-        email.focus();
+        const invalidBusiness = data?.error === 'invalid business type';
+        const field = invalidBusiness ? business : email;
+        field.disabled = false;
+        field.setAttribute('aria-invalid', 'true');
+        status(waitlistStatus, invalidBusiness ? 'Please choose a business type and try again.' : 'Please check your email address and try again.', 'error');
+        field.focus();
       } else {
         throw new Error('Waitlist unavailable');
       }
@@ -80,6 +102,7 @@
       joining = false;
       submit.disabled = false;
       email.readOnly = false;
+      business.disabled = false;
       form.removeAttribute('aria-busy');
     }
   });

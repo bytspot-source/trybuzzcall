@@ -4,12 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <!-- TODO(legal): Confirm filed entity name and EIN match Terms, Privacy, A2P 10DLC and Stripe before launch. -->
-  <title>BuzzCall | Turn missed calls into booked, paid jobs</title>
-  <meta name="description" content="On the job? BuzzCall texts your missed callers, books an open slot, and collects a $49 deposit. Built for Georgia plumbing and HVAC shops with 1–5 trucks.">
+  <title>BuzzCall | Missed-call follow-up for home services &amp; braiders</title>
+  <meta name="description" content="Keep working without leaving your next customer waiting. Explore BuzzCall's Georgia pilots for owner-operated plumbing and HVAC businesses and independent braiders.">
   <meta name="theme-color" content="#142b32">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="BuzzCall — Missed call. Booked job.">
-  <meta property="og:description" content="You handle the job. We'll handle the missed call. Text-back, booking, and deposits for Georgia's small shops.">
+  <meta property="og:title" content="BuzzCall — Missed call. Next customer.">
+  <meta property="og:description" content="For hands-on businesses that can't always pick up. Two focused Georgia pilots: Home Services and Braiders, with separate workflows and pricing.">
   <meta property="og:url" content="https://trybuzzcall.com/">
   <link rel="canonical" href="https://trybuzzcall.com/">
   <link rel="stylesheet" href="home.css">
@@ -32,6 +32,7 @@
     <div class="container header-inner">
       <a class="logo" href="/" aria-label="BuzzCall home"><span class="logo-mark"><svg class="icon" aria-hidden="true"><use href="#icon-bolt"/></svg></span>buzzcall<span class="logo-period">.</span></a>
       <nav class="main-nav" aria-label="Main navigation">
+        <a href="#for-your-business">Who it's for</a>
         <a href="#how-it-works">How it works</a>
         <a href="#pricing">Pricing</a>
         <a href="#faq">FAQs</a>
@@ -44,37 +45,23 @@
     <section class="hero section" aria-labelledby="hero-title">
       <div class="container hero-grid">
         <div class="hero-copy">
-          <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> Georgia shops. This one's for you.</p>
-          <h1 id="hero-title">Missed call.<br>Booked job.<br><span class="highlight-text">Just like that.</span></h1>
-          <p class="hero-description">You're under a sink. Your next customer is on the phone. BuzzCall texts them back, books a time, and collects a <strong>$49 deposit</strong>—while you keep working.</p>
+          <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> Hands-on businesses. Georgia roots.</p>
+          <h1 id="hero-title">Missed call.<br>Next customer.<br><span class="highlight-text">Keep working.</span></h1>
+          <p class="hero-description">On a repair or halfway through a braid, you can't always pick up. BuzzCall helps turn missed inquiries into <strong>bookings or callbacks</strong>—with text follow-up built around your business.</p>
           <div class="hero-actions">
             <a class="button button-yellow" href="#waitlist">Get on the pilot list <svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></a>
             <a class="text-link" href="#how-it-works">See how it works <span aria-hidden="true">↗</span></a>
           </div>
-          <p class="hero-note">Free 14-day pilot for the first 10 Georgia shops.</p>
-          <div class="hero-audience"><span class="mini-rule" aria-hidden="true"></span>Built for plumbing &amp; HVAC teams with 1–5 trucks.</div>
+          <p class="hero-note">Two focused pilots. No payment to join the list.</p>
+          <div class="hero-audience"><span class="mini-rule" aria-hidden="true"></span>For owners with missed phone inquiries and room for more work.</div>
         </div>
 
-        <figure class="demo">
-          <div class="demo-stage">
-            <div class="demo-topline"><span class="eyebrow">Less phone tag. More paid work.</span><svg class="icon" aria-hidden="true"><use href="#icon-bolt"/></svg></div>
-            <div class="phone-frame">
-              <div class="phone-top"><span>9:41</span><span class="phone-speaker" aria-hidden="true"></span><span aria-hidden="true">▮▮▮</span></div>
-              <div class="conversation-header"><span class="shop-avatar"><svg class="icon" aria-hidden="true"><use href="#icon-phone"/></svg></span><div><strong>Your plumbing shop</strong><span>Text message · SMS</span></div><svg class="icon" aria-hidden="true"><use href="#icon-shield"/></svg></div>
-              <div class="conversation">
-                <p class="missed-call"><svg class="icon" aria-hidden="true"><use href="#icon-phone"/></svg> Missed call · 9:41 AM</p>
-                <p class="message message-shop">Sorry we missed you! What's your name, and how can we help?<span class="message-fine">Reply STOP to opt out, HELP for help. Msg &amp; data rates may apply.</span></p>
-                <p class="message message-customer">I'm Dana. My water heater is leaking.</p>
-                <div class="message message-shop">Let's get you on the schedule.<ol class="time-options"><li>Tue · 8:00 AM</li><li>Tue · 10:00 AM</li><li>Tue · 1:00 PM</li></ol><span class="message-fine">Reply 1, 2, or 3 to choose a time.</span></div>
-                <p class="message message-customer">1 works for me. Thanks!</p>
-                <div class="deposit-receipt"><span class="check-circle"><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg></span><div><strong>$49 deposit paid</strong><span>Via Stripe · credited to the job</span></div></div>
-              </div>
-              <div class="phone-bottom" aria-hidden="true"></div>
-            </div>
-            <div class="owner-alert"><span class="alert-icon"><svg class="icon" aria-hidden="true"><use href="#icon-bolt"/></svg></span><div><span class="alert-label">Meanwhile, on your phone</span><strong>Booked + paid: Dana.</strong><p>Water heater leak · Tue, 8 AM · $49 paid</p></div><span class="alert-now">now</span></div>
-          </div>
-          <figcaption>Illustrative conversation, shortened for clarity. <a href="sms-consent.html">See the full texting flow.</a></figcaption>
-        </figure>
+        <aside class="audience-overview" aria-labelledby="audience-overview-title">
+          <p class="eyebrow" id="audience-overview-title">One less thing to juggle</p>
+          <a class="audience-preview" href="#home-services"><span class="step-icon"><svg class="icon" aria-hidden="true"><use href="#icon-phone"/></svg></span><span><span class="preview-label">Home Services</span><strong>On the job?<br>Catch the next one.</strong><span class="preview-detail">Owner-operated plumbing &amp; HVAC</span></span><svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></a>
+          <a class="audience-preview audience-preview-braiders" href="#braiders"><span class="step-icon"><svg class="icon" aria-hidden="true"><use href="#icon-message"/></svg></span><span><span class="preview-label">Braiders</span><strong>Hands on your client.<br>Not your phone.</strong><span class="preview-detail">Independent braiding &amp; loc studios</span></span><svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></a>
+          <p class="overview-note">Different work. Different booking needs. Choose the pilot that fits yours.</p>
+        </aside>
       </div>
     </section>
 
@@ -87,55 +74,93 @@
       </div>
     </div>
 
+    <section class="section audience-section" id="for-your-business" aria-labelledby="audience-title">
+      <div class="container">
+        <div class="section-heading"><div><p class="eyebrow">Built for your kind of busy</p><h2 id="audience-title">Not every business.<br>The right fit for yours.</h2></div><p>Start here if customers call to book, you miss those calls, and you have capacity for more work. We're focusing on two Georgia pilots.</p></div>
+        <div class="audience-grid">
+          <article class="audience-card" id="home-services" aria-labelledby="home-services-title">
+            <p class="eyebrow">01 / Home Services</p><h3 id="home-services-title">Catch the next job<br>while you're on this one.</h3>
+            <p>For owner-operated plumbing and HVAC businesses. Collect the customer's name and need, arrange a callback, or offer the openings you set aside for BuzzCall.</p>
+            <figure class="audience-example" aria-labelledby="home-example-caption">
+              <p class="example-label">Example · plumbing inquiry</p>
+              <p class="message message-customer">I'm Dana. I'd like a water heater service visit.</p>
+              <p class="message message-shop">We have Tue at 8 AM, 10 AM, or 1 PM. Pick a time, or ask for a callback.</p>
+              <p class="message message-customer">8 AM works for me.</p>
+              <div class="example-result"><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg><span><strong>After the Stripe payment: booked + paid.</strong>$49 deposit credited to Dana's job bill.</span></div>
+              <figcaption id="home-example-caption">Illustrative, shortened flow after SMS consent. Availability and booking settings must be confirmed.</figcaption>
+            </figure>
+            <p class="audience-boundary">For scheduled service inquiries—not emergency dispatch. The pilot does not automatically assign jobs across trucks or sync your existing calendar.</p>
+            <div class="audience-actions"><a class="button button-dark" href="#waitlist" data-audience="home_services">I'm a home-service owner <svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></a><a class="text-link" href="#home-services-pricing">Home Services pricing <span aria-hidden="true">↗</span></a></div>
+          </article>
+          <article class="audience-card audience-card-braiders" id="braiders" aria-labelledby="braiders-title">
+            <p class="eyebrow">02 / Braiders</p><h3 id="braiders-title">Keep your hands on your client.<br>Not your phone.</h3>
+            <p>For independent braiders and loc stylists with phone inquiries they can't answer. Collect the style, size or length notes, and preferred day, then offer time for the full service—or a callback.</p>
+            <figure class="audience-example" aria-labelledby="braider-example-caption">
+              <p class="example-label">Example · braiding appointment</p>
+              <p class="message message-customer">I'm Maya. Medium knotless braids, mid-back.</p>
+              <p class="message message-shop">Knotless braids take about 6 hours here. What day works best for you?</p>
+              <p class="message message-customer">Saturday, if you have space.</p>
+              <div class="example-result"><svg class="icon" aria-hidden="true"><use href="#icon-calendar"/></svg><span><strong>Next: offer a time that fits the full service.</strong>A deposit can confirm it, if enabled for your pilot.</span></div>
+              <figcaption id="braider-example-caption">Illustrative, shortened flow after SMS consent. Service duration, deposit amount and terms are agreed for your studio.</figcaption>
+            </figure>
+            <p class="audience-boundary">Already use Booksy or StyleSeat? We can include your booking link, but do not sync those calendars. We'll check the fit before setting up a separate booking flow.</p>
+            <div class="audience-actions"><a class="button button-dark" href="#waitlist" data-audience="braiders">I'm a braider <svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></a><a class="text-link" href="#braider-pricing">Braider pilot pricing <span aria-hidden="true">↗</span></a></div>
+          </article>
+        </div>
+        <p class="audience-fit-note">Mostly booked through DMs or an app? Already fully booked? BuzzCall may not be the right next step. Let's talk about the calls you're actually losing first.</p>
+      </div>
+    </section>
+
     <section class="section workflow" id="how-it-works" aria-labelledby="workflow-title">
       <div class="container">
-        <div class="section-heading"><div><p class="eyebrow">From ringing to booked</p><h2 id="workflow-title">You do the work.<br>We'll catch the next job.</h2></div><p>No new dashboard to babysit. Just a simple path from a missed call to a customer on your schedule.</p></div>
+        <div class="section-heading"><div><p class="eyebrow">A better follow-up</p><h2 id="workflow-title">You do the work.<br>Keep the conversation going.</h2></div><p>During onboarding, we confirm the consent process, carrier approval, available times and booking rules before activation.</p></div>
         <ol class="workflow-grid">
           <li class="workflow-step"><div class="step-top"><span class="step-icon"><svg class="icon" aria-hidden="true"><use href="#icon-phone"/></svg></span><span class="step-number">01</span></div><h3>You miss a call.</h3><p>You're on a job, driving between stops, or simply can't pick up. It happens.</p><span class="step-caption">Keep doing what you do best.</span></li>
-          <li class="workflow-step"><div class="step-top"><span class="step-icon"><svg class="icon" aria-hidden="true"><use href="#icon-message"/></svg></span><span class="step-number">02</span></div><h3>BuzzCall texts back.</h3><p>A friendly reply in seconds collects their name and what they need. Urgent jobs are flagged.</p><span class="step-caption">Your business. A quick response.</span></li>
-          <li class="workflow-step"><div class="step-top"><span class="step-icon"><svg class="icon" aria-hidden="true"><use href="#icon-calendar"/></svg></span><span class="step-number">03</span></div><h3>They book. They pay.</h3><p>They choose from your next three open times and confirm with a $49 Stripe deposit.</p><span class="step-caption">Applied to their final bill.</span></li>
-          <li class="workflow-step"><div class="step-top"><span class="step-icon"><svg class="icon" aria-hidden="true"><use href="#icon-bolt"/></svg></span><span class="step-number">04</span></div><h3>You get the good news.</h3><p>A text with the name, job, time, and paid deposit. Tap to call when you're ready.</p><span class="step-caption">Booked. Paid. Back to work.</span></li>
+          <li class="workflow-step"><div class="step-top"><span class="step-icon"><svg class="icon" aria-hidden="true"><use href="#icon-message"/></svg></span><span class="step-number">02</span></div><h3>Follow up by text.</h3><p>With the required SMS consent in place, collect their name and what they need using your business's flow.</p><span class="step-caption">Consent first. A useful response.</span></li>
+          <li class="workflow-step"><div class="step-top"><span class="step-icon"><svg class="icon" aria-hidden="true"><use href="#icon-calendar"/></svg></span><span class="step-number">03</span></div><h3>A time, or a callback.</h3><p>Offer configured openings or collect a callback request. When deposits are enabled, a Stripe payment confirms the booking.</p><span class="step-caption">Your service. Your agreed terms.</span></li>
+          <li class="workflow-step"><div class="step-top"><span class="step-icon"><svg class="icon" aria-hidden="true"><use href="#icon-bolt"/></svg></span><span class="step-number">04</span></div><h3>You get the details.</h3><p>Receive a text with the inquiry or booking details and payment status. Tap to call when you're ready.</p><span class="step-caption">Less phone tag. More context.</span></li>
         </ol>
       </div>
     </section>
 
     <section class="section built-for" aria-labelledby="built-title">
       <div class="container built-grid">
-        <div class="built-copy"><p class="eyebrow">For the people doing the work</p><h2 id="built-title">Big-shop follow-up.<br>Small-shop simple.</h2><p>You don't need another app. You need your next customer taken care of. BuzzCall fits around the way your shop already works.</p><a class="text-link" href="#waitlist">Let's get your shop set up <span aria-hidden="true">↗</span></a></div>
+        <div class="built-copy"><p class="eyebrow">For the people doing the work</p><h2 id="built-title">A little backup.<br>Not another full-time job.</h2><p>You don't need another app to babysit. You need the next inquiry followed up. We'll work through your number, availability and service details together.</p><a class="text-link" href="#waitlist">Let's find the right fit <span aria-hidden="true">↗</span></a></div>
         <div class="feature-list">
-          <article><span class="feature-number">01 /</span><div><h3>Your number stays yours.</h3><p>Keep the number on your truck, your website, and your business cards. We help set up missed-call forwarding.</p></div></article>
+          <article><span class="feature-number">01 /</span><div><h3>Keep the number people call.</h3><p>We help set up missed-call forwarding for your current business number. The outbound texting number is confirmed during setup.</p></div></article>
           <article><span class="feature-number">02 /</span><div><h3>Plain texts. Nothing to download.</h3><p>Customers book over SMS. You get the details on the phone you already carry.</p></div></article>
-          <article><span class="feature-number">03 /</span><div><h3>We handle the setup.</h3><p>We'll help with your schedule and carrier registration (A2P 10DLC), so you don't have to figure it out alone.</p></div></article>
+          <article><span class="feature-number">03 /</span><div><h3>Guided setup. Clear expectations.</h3><p>We'll help with consent requirements and carrier registration (A2P 10DLC). Activation depends on approval—not a promise to go live in ten minutes.</p></div></article>
         </div>
       </div>
     </section>
 
     <section class="section pricing" id="pricing" aria-labelledby="pricing-title">
       <div class="container">
-        <div class="section-heading"><div><p class="eyebrow">Simple, job-first pricing</p><h2 id="pricing-title">A small base.<br>Then pay for paid bookings.</h2></div><p>We don't sell texts. We help you book paid jobs. No paid booking? No lead fee.</p></div>
+        <div class="section-heading"><div><p class="eyebrow">Different businesses. Clear offers.</p><h2 id="pricing-title">Choose your pilot.<br>Know what you're paying.</h2></div><p>Business fees and customer deposits are different things. Home Services has a published estimate; braider terms are confirmed individually.</p></div>
         <div class="pricing-grid">
-          <article class="price-card">
-            <div class="price-card-heading"><h3>Your shop, covered.</h3><span class="pill">Monthly plan</span></div>
+          <article class="price-card" id="home-services-pricing" aria-labelledby="home-price-title">
+            <div class="price-card-heading"><h3 id="home-price-title">Home Services</h3><span class="pill">Plumbing &amp; HVAC</span></div>
             <p class="price-overline">Base plan starting at</p>
             <p class="price"><span class="price-amount">$49</span><span>/ month</span></p>
-            <p class="price-subtitle">One business line. A better way to catch the calls you miss.</p>
+            <p class="price-subtitle">One business line. Plus an estimated <strong>$12 per paid booking</strong>, only when a caller books and pays the deposit.</p>
+            <div class="deposit-note"><svg class="icon" aria-hidden="true"><use href="#icon-shield"/></svg><p><strong>The $49 customer deposit is separate.</strong>It's credited to their job bill, not an extra subscription fee for your shop.</p></div>
             <ul class="check-list">
               <li><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg>Unlimited text-backs and owner alerts</li>
               <li><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg>Booking and deposit collection</li>
-              <li><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg>Weekly recap of calls, bookings, and deposits</li>
+              <li><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg>Callback requests when booking isn't the right fit</li>
               <li><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg>Done-for-you setup and carrier registration</li>
             </ul>
-            <button class="button button-yellow button-full" type="button" data-checkout="monthly" aria-describedby="checkout-status checkout-terms" disabled>Start monthly <svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
-            <button class="annual-button" type="button" data-checkout="annual" aria-describedby="checkout-status checkout-terms" disabled>Prefer annual? Setup is waived <span aria-hidden="true">↗</span></button>
-            <p class="checkout-terms" id="checkout-terms">Card required at checkout. Subscription billing begins after the trial unless you cancel. Review your final price before confirming.</p>
+            <button class="button button-yellow button-full" type="button" data-checkout="monthly" aria-describedby="checkout-status checkout-terms" disabled>Start Home Services monthly <svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
+            <button class="annual-button" type="button" data-checkout="annual" aria-describedby="checkout-status checkout-terms" disabled>Home Services annual · setup waived <span aria-hidden="true">↗</span></button>
+            <p class="checkout-terms" id="checkout-terms">Home Services checkout only. Card required. Subscription billing begins after the checkout trial unless you cancel; checkout does not activate texting. Confirm setup readiness and your final price before subscribing.</p>
             <p class="form-status" id="checkout-status" role="status" aria-live="polite" aria-atomic="true"></p>
           </article>
           <div class="pricing-extras">
-            <article class="lead-card"><span class="eyebrow">Only when they book &amp; pay</span><p class="lead-price">+ $12 <span>/ paid lead, estimated</span></p><p>A lead fee applies only when a missed caller books a slot <strong>and</strong> pays the deposit. Not for a missed call. Not for a text.</p><div class="deposit-note"><svg class="icon" aria-hidden="true"><use href="#icon-shield"/></svg><p><strong>The $49 deposit is your customer's payment.</strong> It's credited to their job bill—not an extra subscription fee for your shop.</p></div></article>
-            <article class="pilot-card"><span class="pill pill-outline">The founding-shop offer</span><h3>Try it on real missed calls.</h3><p>Free 14-day pilot for the first 10 Georgia shops, with setup waived. See what it books before you pay.</p><a class="text-link" href="#waitlist">Join the pilot list <span aria-hidden="true">↗</span></a></article>
+            <article class="lead-card braider-price-card" id="braider-pricing" aria-labelledby="braider-price-title"><span class="eyebrow">Braiders · inquiry-only pilot</span><h3 id="braider-price-title">Your services.<br>Your pilot quote.</h3><p>We'll confirm the monthly price, any paid-booking fee, setup cost and customer deposit terms with you before activation. <strong>Home Services rates do not automatically apply.</strong></p><ul class="check-list"><li><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg>A service menu with appointment durations</li><li><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg>Style details, preferred day and callback requests</li><li><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg>Optional deposits agreed for your studio</li></ul><a class="button button-dark button-full" href="#waitlist" data-audience="braiders">Ask about the braider pilot <svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></a><p class="braider-price-note">No card or payment to inquire. We'll agree the pilot length and terms; this is not an automatic subscription.</p></article>
+            <article class="pilot-card"><span class="pill pill-outline">Home Services founding offer</span><h3>Try it on real inquiries.</h3><p>Free 14-day pilot for the first 10 qualifying Georgia plumbing and HVAC shops, with setup waived. We confirm readiness before the live pilot begins.</p><a class="text-link" href="#waitlist" data-audience="home_services">Ask about the Home Services pilot <span aria-hidden="true">↗</span></a></article>
           </div>
         </div>
-        <p class="pricing-fine">Prices are estimates and may vary by setup; your order confirms final pricing. Setup is estimated at $99, waived for the first 10 founding shops and on annual plans; otherwise charged only after your free trial, never at signup. Base and lead fees are billed to the shop. Customer deposits are separate. <a href="refunds.html">View the refund policy.</a></p>
+        <p class="pricing-fine">Home Services prices are estimates; your order confirms final pricing. Setup is estimated at $99, waived for the first 10 founding shops and on annual plans; otherwise charged only after your checkout trial, never at signup. Base and paid-booking fees are billed to the business. Customer deposits are separate. <a href="refunds.html">Home Services deposit refund policy.</a> Braider pricing and deposit terms are confirmed separately before activation.</p>
       </div>
     </section>
 
@@ -143,24 +168,28 @@
       <div class="container faq-grid">
         <div><p class="eyebrow">Good questions</p><h2 id="faq-title">A few things<br>you might be wondering.</h2><p>Have a different question?<br><a href="mailto:hello@trybuzzcall.com">Talk to us. We're in Georgia, too.</a></p></div>
         <div class="faq-list">
-          <details><summary>Do I have to change my business number?<svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></summary><p>No. Keep your current number. We help configure missed-call forwarding so BuzzCall can handle calls you can't answer. We'll confirm the right setup for your carrier during onboarding.</p></details>
+          <details><summary>Do I have to change my business number?<svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></summary><p>You can keep the number customers call, subject to your carrier's forwarding options. We confirm forwarding and the outbound texting number during onboarding; they aren't necessarily the same number.</p></details>
           <details><summary>What does my customer need to download?<svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></summary><p>Nothing. The conversation happens over regular text messages, and the deposit link opens Stripe's checkout page. You receive booking alerts by text, too.</p></details>
-          <details><summary>Where does the $49 deposit go?<svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></summary><p>Your customer pays through Stripe to confirm the booking. That $49 is credited toward their final job bill. It's separate from your shop's base plan and paid-lead fee. Payment routing and payout timing depend on your Stripe setup.</p></details>
-          <details><summary>What if the customer cancels?<svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></summary><p>The deposit is fully refunded if your shop cancels, can't make the slot, or the customer cancels at least 24 hours ahead. If work is declined on site, it may cover the trip fee. See the <a href="refunds.html">full refund policy</a> for details.</p></details>
-          <details><summary>Who is the pilot for?<svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></summary><p>Georgia plumbing and HVAC shops running 1–5 trucks. The first 10 founding shops get a free 14-day pilot and waived setup. Join the list and we'll follow up about your shop and availability.</p></details>
-          <details><summary>Can callers opt out of texts?<svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></summary><p>Yes. Callers can reply STOP to opt out or HELP for help. Message frequency varies, and message and data rates may apply. Read <a href="sms-consent.html">how texting and consent work</a>.</p></details>
+          <details><summary>Is the customer deposit a BuzzCall fee?<svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></summary><p>No. A customer deposit is credited toward their service bill. It is separate from the business's subscription and any paid-booking fee. The Home Services example uses $49; braider deposit amounts and terms are agreed separately. Payment routing and payout timing depend on your Stripe setup.</p></details>
+          <details><summary>What if the customer cancels?<svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></summary><p>For Home Services, the deposit is fully refunded if the shop cancels, can't make the slot, or the customer cancels at least 24 hours ahead. If work is declined on site, it may cover the trip fee. Read the <a href="refunds.html">Home Services refund policy</a>. Braider deposit and cancellation terms must be agreed before that pilot is activated.</p></details>
+          <details><summary>Who is the pilot for?<svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></summary><p>Georgia owner-operated plumbing and HVAC businesses, plus independent braiders and qualifying loc studios. The best fit has missed new-customer phone inquiries, capacity for more work, and no effective existing call recovery. Other beauty services and industries aren't part of this initial offer.</p></details>
+          <details><summary>Does it sync with my booking app or team calendar?<svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></summary><p>Not currently. The pilot uses configured hours and bookings recorded in BuzzCall, not a live sync with Booksy, StyleSeat or another calendar. A braider's existing booking link can be included in texts. We need to agree how availability stays accurate; multi-truck dispatch and staff scheduling aren't included.</p></details>
+          <details><summary>How soon can I go live?<svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></summary><p>After the required consent process, carrier registration, number setup, availability and payment terms are confirmed. Approval times vary, so we don't promise instant activation. Joining the list is not a subscription or permission to start texting your customers.</p></details>
+          <details><summary>What about SMS consent and opting out?<svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></summary><p>SMS requires an appropriate, documented consent process; an incoming voice call should not simply be assumed to authorize automated texts. We confirm the requirements before activation. Recipients can reply STOP to opt out or HELP for help; frequency varies and message and data rates may apply. See the <a href="sms-consent.html">Home Services texting information</a>, which must be finalized with the consent process before launch.</p></details>
         </div>
       </div>
     </section>
 
     <section class="section signup" id="waitlist" aria-labelledby="signup-title">
       <div class="container signup-panel">
-        <div class="signup-copy"><p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> Now inviting Georgia shops</p><h2 id="signup-title">Keep your hands busy.<br>Not your callers waiting.</h2><p>Join the list for the founding-shop pilot. We'll reach out about getting BuzzCall working for your business.</p></div>
+        <div class="signup-copy"><p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> Home Services &amp; Braiders · Georgia</p><h2 id="signup-title">Keep your hands busy.<br>Not your callers waiting.</h2><p>Tell us which pilot fits your business. We'll follow up about the calls you're missing, your availability and the right terms—before you commit.</p></div>
         <div class="signup-form-wrap">
           <form id="waitlist-form" aria-labelledby="signup-title">
+            <label for="waitlist-business">Your business</label>
+            <select id="waitlist-business" name="businessType" aria-describedby="waitlist-privacy waitlist-status" required><option value="">Choose your business type</option><option value="home_services">Plumbing or HVAC</option><option value="braiders">Braiding or loc styling</option></select>
             <label for="waitlist-email">Your work email</label>
             <div class="email-row"><input id="waitlist-email" type="email" name="email" autocomplete="email" inputmode="email" placeholder="you@yourshop.com" maxlength="254" aria-describedby="waitlist-privacy waitlist-status" required><button class="button button-yellow" type="submit" disabled>Join the list <svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button></div>
-            <p id="waitlist-privacy" class="signup-privacy">No payment to join the list. By submitting, you agree to our <a href="privacy.html">Privacy Policy</a>. This form does not sign you up for SMS.</p>
+            <p id="waitlist-privacy" class="signup-privacy">We save your email and selected business type to follow up about the pilot. No payment to join. By submitting, you agree to our <a href="privacy.html">Privacy Policy</a>. This form does not sign you up for SMS.</p>
             <p class="form-status" id="waitlist-status" role="status" aria-live="polite" aria-atomic="true"></p>
           </form>
           <p class="signup-contact">Rather talk it through? <a href="tel:+14704828377">(470) 482-8377</a></p>
