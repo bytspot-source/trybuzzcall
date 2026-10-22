@@ -1,6 +1,6 @@
 # BuzzCall for Braiders: Outreach Scripts (Atlanta pilot)
 
-> **Placeholders:** `{first}` stylist's first name · `{studio}` studio/business name · `{you}` your name · phone (470) 482-8177 · email hello@trybuzzcall.com.
+> **Placeholders:** `{first}` stylist's first name · `{studio}` studio/business name · `{you}` your name · phone (470) 482-8377 · email hello@trybuzzcall.com.
 > **Rules:** plain words, short. No made-up numbers, results, client names, or testimonials. Prices are estimates: free 14-day pilot, then $49/mo + ~$5 per paid booking (estimate). Texts to clients come from a local BuzzCall number, not the stylist's own number. The $50 deposit is paid by the client and goes toward their service; it is not a fee to the stylist.
 > **Instagram:** send DMs by hand, one at a time, only to business accounts that list booking by phone or DM. If they say no or don't answer after one follow-up, stop.
 
@@ -34,7 +34,7 @@
 >
 > **If they ask about price:** "Free for 14 days. After that it's about $49 a month plus around $5 when a client actually books and pays a deposit. Those are estimates, and I'll confirm before you pay anything."
 >
-> **Close:** "Thanks for your time. My number and email are on the sheet: (470) 482-8177, hello@trybuzzcall.com."
+> **Close:** "Thanks for your time. My number and email are on the sheet: (470) 482-8377, hello@trybuzzcall.com."
 
 ---
 
