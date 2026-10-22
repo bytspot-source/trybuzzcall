@@ -1,32 +1,181 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<!-- TODO(legal): Entity is TryBuzzCall LLC (Georgia, owned by Bytspot Inc.); confirm filed name and its own EIN match Terms, Privacy, A2P 10DLC brand and Stripe before launch. -->
-<title>BuzzCall | TryBuzzCall — Booked, paid jobs from missed calls</title>
-<meta name="description" content="BuzzCall texts your missed callers back, books them into one of your open slots, and collects a $49 Stripe deposit credited to their bill. For Georgia plumbing and HVAC shops with 1–5 trucks.">
-<link rel="stylesheet" href="styles.css"></head><body>
-<header class="site-header"><div class="wrap"><a class="brand" href="index.html">Try<span>BuzzCall</span></a>
-<nav><a href="#pricing">Pricing</a><a href="#waitlist">Waitlist</a><a href="sms-consent.html">How texting works</a></nav></div></header>
-<section class="hero"><div class="wrap">
-<span class="tag">Local · Georgia</span>
-<h1><span>$49 deposit</span> in your account before you're off the ladder.</h1>
-<p><b>We don't sell texts. We sell booked, paid jobs.</b> For Georgia plumbing and HVAC shops with 1–5 trucks. When you're under a sink or up in an attic, BuzzCall texts the missed caller back in seconds, books them into one of your open slots, and collects a $49 Stripe deposit credited to their bill.</p>
-</div></section>
-<main><div class="wrap">
-<div class="callout"><p style="margin:0"><b>Done for you.</b> Keep your current number. Everything runs over plain text, no app. We handle setup and carrier (A2P 10DLC) registration.</p></div>
-<h2>How it works</h2>
-<div class="box"><ol><li>Customer calls, you can't pick up.</li><li>They get a friendly text from your business within seconds, asking their name and what's wrong.</li><li>They pick one of your next 3 open times and pay a $49 deposit through Stripe, credited to their bill.</li><li>You get a text like this <small>(illustration)</small>: <i>"✅ BOOKED + PAID $49: [Caller name], [job], [time]. Tap to call."</i> Urgent jobs are flagged.</li></ol></div>
-<h2 id="pricing">Pricing</h2><p><b>You only pay more when you get paid jobs.</b> A low base plan, plus a small fee only when a missed caller books and pays their deposit. A weekly recap shows calls caught, jobs booked, and deposits collected.</p>
-<p><b>Free 14-day pilot</b> for the first 10 Georgia shops. See what it books before you pay anything.<br><b>Base plan</b> starting at $49/mo: 1 line, unlimited text-backs and owner alerts.<br><b>Per paid lead</b> estimated at $12, charged only when a caller books a slot <i>and</i> pays the deposit. No paid booking, no lead fee.<br><b>Setup</b> $99 (estimate), <b>waived for our first 10 founding shops and on annual plans</b>; charged only after your free trial, never at signup. Done for you: keep your current number, everything runs over text (no app), and we handle setup and carrier (A2P 10DLC) registration.</p>
-<p><small>Prices are estimates and may vary by setup; your order confirms final pricing. The base plan and lead fees are billed to the shop. The $49 deposit is separate: it's paid by your customer through Stripe and credited to their bill, so it isn't a fee to you. Refunds: the deposit is fully refunded if the shop cancels or can't make the slot, or the customer cancels 24+ hours ahead; if work is declined on site, it may cover the trip fee. Full policy at <a href="refunds.html">trybuzzcall.com/refunds</a>.</small></p>
-<button class="cta" onclick="checkout('monthly')">Start monthly</button> <button class="cta" onclick="checkout('annual')">Start annual (setup waived)</button>
-<h2 id="waitlist">Join the waitlist</h2>
-<form id="wl"><input type="email" name="email" placeholder="you@yourshop.com" required aria-label="Email address"> <button class="cta">Join</button></form><p id="msg"></p>
-</div></main>
-<footer class="site-footer"><div class="wrap">
-<nav aria-label="Legal"><a href="privacy.html">Privacy</a><a href="terms.html">Terms</a><a href="refunds.html">Refunds</a><a href="terms.html#sms">SMS Terms</a><a href="sms-consent.html">SMS Consent</a></nav>
-<address><b>TryBuzzCall LLC</b> · 8735 Dunwoody Place #13893, Atlanta, GA 30350, USA<br><a href="mailto:hello@trybuzzcall.com">hello@trybuzzcall.com</a> · <a href="tel:+14704828377">(470) 482-8377</a></address>
-<p style="margin:.6rem 0 0"><small style="color:#9fb3cf">© 2026 TryBuzzCall LLC. BuzzCall is a product of TryBuzzCall LLC.</small></p>
-</div></footer>
-<script>
-document.getElementById('wl').onsubmit=async e=>{e.preventDefault();let ok=false;try{const r=await fetch('/api/waitlist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:e.target.email.value})});ok=r.ok}catch(_){}document.getElementById('msg').textContent=ok?"You're on the list!":'Please enter a valid email.'};
-async function checkout(plan){let j={};try{const r=await fetch('/api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({plan})});j=await r.json()}catch(_){}if(j.url)location=j.url;else alert(j.error||'Checkout unavailable — join the waitlist!')}
-</script></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- TODO(legal): Confirm filed entity name and EIN match Terms, Privacy, A2P 10DLC and Stripe before launch. -->
+  <title>BuzzCall | Turn missed calls into booked, paid jobs</title>
+  <meta name="description" content="On the job? BuzzCall texts your missed callers, books an open slot, and collects a $49 deposit. Built for Georgia plumbing and HVAC shops with 1–5 trucks.">
+  <meta name="theme-color" content="#142b32">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="BuzzCall — Missed call. Booked job.">
+  <meta property="og:description" content="You handle the job. We'll handle the missed call. Text-back, booking, and deposits for Georgia's small shops.">
+  <meta property="og:url" content="https://trybuzzcall.com/">
+  <link rel="canonical" href="https://trybuzzcall.com/">
+  <link rel="stylesheet" href="home.css">
+  <script src="site.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <svg class="icon-library" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="icon-bolt" viewBox="0 0 24 24"><path d="m13.5 2-9 12H11l-.5 8 9-12H13l.5-8Z" fill="currentColor"/></symbol>
+    <symbol id="icon-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></symbol>
+    <symbol id="icon-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="icon-phone" viewBox="0 0 24 24"><path d="m7 3 3 5-3 2c1.5 3 4 5.5 7 7l2-3 5 3-1 4C11 22 2 13 3 4l4-1Z"/></symbol>
+    <symbol id="icon-message" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 1-8 8H4l1-5a8 8 0 1 1 15-3Z"/><path d="M8 10h8m-8 4h5"/></symbol>
+    <symbol id="icon-calendar" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="3"/><path d="M7 3v4m10-4v4M3 11h18m-13 5 3 2 5-4"/></symbol>
+    <symbol id="icon-shield" viewBox="0 0 24 24"><path d="m12 3 8 3v6c0 4-4 7-8 9-4-2-8-5-8-9V6l8-3Z"/><path d="m8 12 3 3 5-6"/></symbol>
+    <symbol id="icon-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  </svg>
+
+  <header class="header">
+    <div class="container header-inner">
+      <a class="logo" href="/" aria-label="BuzzCall home"><span class="logo-mark"><svg class="icon" aria-hidden="true"><use href="#icon-bolt"/></svg></span>buzzcall<span class="logo-period">.</span></a>
+      <nav class="main-nav" aria-label="Main navigation">
+        <a href="#how-it-works">How it works</a>
+        <a href="#pricing">Pricing</a>
+        <a href="#faq">FAQs</a>
+      </nav>
+      <a class="button button-small button-dark" href="#waitlist">Join the pilot <svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></a>
+    </div>
+  </header>
+
+  <main id="main" tabindex="-1">
+    <section class="hero section" aria-labelledby="hero-title">
+      <div class="container hero-grid">
+        <div class="hero-copy">
+          <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> Georgia shops. This one's for you.</p>
+          <h1 id="hero-title">Missed call.<br>Booked job.<br><span class="highlight-text">Just like that.</span></h1>
+          <p class="hero-description">You're under a sink. Your next customer is on the phone. BuzzCall texts them back, books a time, and collects a <strong>$49 deposit</strong>—while you keep working.</p>
+          <div class="hero-actions">
+            <a class="button button-yellow" href="#waitlist">Get on the pilot list <svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></a>
+            <a class="text-link" href="#how-it-works">See how it works <span aria-hidden="true">↗</span></a>
+          </div>
+          <p class="hero-note">Free 14-day pilot for the first 10 Georgia shops.</p>
+          <div class="hero-audience"><span class="mini-rule" aria-hidden="true"></span>Built for plumbing &amp; HVAC teams with 1–5 trucks.</div>
+        </div>
+
+        <figure class="demo">
+          <div class="demo-stage">
+            <div class="demo-topline"><span class="eyebrow">Less phone tag. More paid work.</span><svg class="icon" aria-hidden="true"><use href="#icon-bolt"/></svg></div>
+            <div class="phone-frame">
+              <div class="phone-top"><span>9:41</span><span class="phone-speaker" aria-hidden="true"></span><span aria-hidden="true">▮▮▮</span></div>
+              <div class="conversation-header"><span class="shop-avatar"><svg class="icon" aria-hidden="true"><use href="#icon-phone"/></svg></span><div><strong>Your plumbing shop</strong><span>Text message · SMS</span></div><svg class="icon" aria-hidden="true"><use href="#icon-shield"/></svg></div>
+              <div class="conversation">
+                <p class="missed-call"><svg class="icon" aria-hidden="true"><use href="#icon-phone"/></svg> Missed call · 9:41 AM</p>
+                <p class="message message-shop">Sorry we missed you! What's your name, and how can we help?<span class="message-fine">Reply STOP to opt out, HELP for help. Msg &amp; data rates may apply.</span></p>
+                <p class="message message-customer">I'm Dana. My water heater is leaking.</p>
+                <div class="message message-shop">Let's get you on the schedule.<ol class="time-options"><li>Tue · 8:00 AM</li><li>Tue · 10:00 AM</li><li>Tue · 1:00 PM</li></ol><span class="message-fine">Reply 1, 2, or 3 to choose a time.</span></div>
+                <p class="message message-customer">1 works for me. Thanks!</p>
+                <div class="deposit-receipt"><span class="check-circle"><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg></span><div><strong>$49 deposit paid</strong><span>Via Stripe · credited to the job</span></div></div>
+              </div>
+              <div class="phone-bottom" aria-hidden="true"></div>
+            </div>
+            <div class="owner-alert"><span class="alert-icon"><svg class="icon" aria-hidden="true"><use href="#icon-bolt"/></svg></span><div><span class="alert-label">Meanwhile, on your phone</span><strong>Booked + paid: Dana.</strong><p>Water heater leak · Tue, 8 AM · $49 paid</p></div><span class="alert-now">now</span></div>
+          </div>
+          <figcaption>Illustrative conversation, shortened for clarity. <a href="sms-consent.html">See the full texting flow.</a></figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <div class="benefit-strip">
+      <div class="container benefit-inner">
+        <p><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg>Keep your current number</p>
+        <p><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg>No app to learn</p>
+        <p><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg>Setup handled for you</p>
+        <p><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg>Deposits through Stripe</p>
+      </div>
+    </div>
+
+    <section class="section workflow" id="how-it-works" aria-labelledby="workflow-title">
+      <div class="container">
+        <div class="section-heading"><div><p class="eyebrow">From ringing to booked</p><h2 id="workflow-title">You do the work.<br>We'll catch the next job.</h2></div><p>No new dashboard to babysit. Just a simple path from a missed call to a customer on your schedule.</p></div>
+        <ol class="workflow-grid">
+          <li class="workflow-step"><div class="step-top"><span class="step-icon"><svg class="icon" aria-hidden="true"><use href="#icon-phone"/></svg></span><span class="step-number">01</span></div><h3>You miss a call.</h3><p>You're on a job, driving between stops, or simply can't pick up. It happens.</p><span class="step-caption">Keep doing what you do best.</span></li>
+          <li class="workflow-step"><div class="step-top"><span class="step-icon"><svg class="icon" aria-hidden="true"><use href="#icon-message"/></svg></span><span class="step-number">02</span></div><h3>BuzzCall texts back.</h3><p>A friendly reply in seconds collects their name and what they need. Urgent jobs are flagged.</p><span class="step-caption">Your business. A quick response.</span></li>
+          <li class="workflow-step"><div class="step-top"><span class="step-icon"><svg class="icon" aria-hidden="true"><use href="#icon-calendar"/></svg></span><span class="step-number">03</span></div><h3>They book. They pay.</h3><p>They choose from your next three open times and confirm with a $49 Stripe deposit.</p><span class="step-caption">Applied to their final bill.</span></li>
+          <li class="workflow-step"><div class="step-top"><span class="step-icon"><svg class="icon" aria-hidden="true"><use href="#icon-bolt"/></svg></span><span class="step-number">04</span></div><h3>You get the good news.</h3><p>A text with the name, job, time, and paid deposit. Tap to call when you're ready.</p><span class="step-caption">Booked. Paid. Back to work.</span></li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="section built-for" aria-labelledby="built-title">
+      <div class="container built-grid">
+        <div class="built-copy"><p class="eyebrow">For the people doing the work</p><h2 id="built-title">Big-shop follow-up.<br>Small-shop simple.</h2><p>You don't need another app. You need your next customer taken care of. BuzzCall fits around the way your shop already works.</p><a class="text-link" href="#waitlist">Let's get your shop set up <span aria-hidden="true">↗</span></a></div>
+        <div class="feature-list">
+          <article><span class="feature-number">01 /</span><div><h3>Your number stays yours.</h3><p>Keep the number on your truck, your website, and your business cards. We help set up missed-call forwarding.</p></div></article>
+          <article><span class="feature-number">02 /</span><div><h3>Plain texts. Nothing to download.</h3><p>Customers book over SMS. You get the details on the phone you already carry.</p></div></article>
+          <article><span class="feature-number">03 /</span><div><h3>We handle the setup.</h3><p>We'll help with your schedule and carrier registration (A2P 10DLC), so you don't have to figure it out alone.</p></div></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section pricing" id="pricing" aria-labelledby="pricing-title">
+      <div class="container">
+        <div class="section-heading"><div><p class="eyebrow">Simple, job-first pricing</p><h2 id="pricing-title">A small base.<br>Then pay for paid bookings.</h2></div><p>We don't sell texts. We help you book paid jobs. No paid booking? No lead fee.</p></div>
+        <div class="pricing-grid">
+          <article class="price-card">
+            <div class="price-card-heading"><h3>Your shop, covered.</h3><span class="pill">Monthly plan</span></div>
+            <p class="price-overline">Base plan starting at</p>
+            <p class="price"><span class="price-amount">$49</span><span>/ month</span></p>
+            <p class="price-subtitle">One business line. A better way to catch the calls you miss.</p>
+            <ul class="check-list">
+              <li><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg>Unlimited text-backs and owner alerts</li>
+              <li><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg>Booking and deposit collection</li>
+              <li><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg>Weekly recap of calls, bookings, and deposits</li>
+              <li><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg>Done-for-you setup and carrier registration</li>
+            </ul>
+            <button class="button button-yellow button-full" type="button" data-checkout="monthly" aria-describedby="checkout-status checkout-terms" disabled>Start monthly <svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
+            <button class="annual-button" type="button" data-checkout="annual" aria-describedby="checkout-status checkout-terms" disabled>Prefer annual? Setup is waived <span aria-hidden="true">↗</span></button>
+            <p class="checkout-terms" id="checkout-terms">Card required at checkout. Subscription billing begins after the trial unless you cancel. Review your final price before confirming.</p>
+            <p class="form-status" id="checkout-status" role="status" aria-live="polite" aria-atomic="true"></p>
+          </article>
+          <div class="pricing-extras">
+            <article class="lead-card"><span class="eyebrow">Only when they book &amp; pay</span><p class="lead-price">+ $12 <span>/ paid lead, estimated</span></p><p>A lead fee applies only when a missed caller books a slot <strong>and</strong> pays the deposit. Not for a missed call. Not for a text.</p><div class="deposit-note"><svg class="icon" aria-hidden="true"><use href="#icon-shield"/></svg><p><strong>The $49 deposit is your customer's payment.</strong> It's credited to their job bill—not an extra subscription fee for your shop.</p></div></article>
+            <article class="pilot-card"><span class="pill pill-outline">The founding-shop offer</span><h3>Try it on real missed calls.</h3><p>Free 14-day pilot for the first 10 Georgia shops, with setup waived. See what it books before you pay.</p><a class="text-link" href="#waitlist">Join the pilot list <span aria-hidden="true">↗</span></a></article>
+          </div>
+        </div>
+        <p class="pricing-fine">Prices are estimates and may vary by setup; your order confirms final pricing. Setup is estimated at $99, waived for the first 10 founding shops and on annual plans; otherwise charged only after your free trial, never at signup. Base and lead fees are billed to the shop. Customer deposits are separate. <a href="refunds.html">View the refund policy.</a></p>
+      </div>
+    </section>
+
+    <section class="section faq" id="faq" aria-labelledby="faq-title">
+      <div class="container faq-grid">
+        <div><p class="eyebrow">Good questions</p><h2 id="faq-title">A few things<br>you might be wondering.</h2><p>Have a different question?<br><a href="mailto:hello@trybuzzcall.com">Talk to us. We're in Georgia, too.</a></p></div>
+        <div class="faq-list">
+          <details><summary>Do I have to change my business number?<svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></summary><p>No. Keep your current number. We help configure missed-call forwarding so BuzzCall can handle calls you can't answer. We'll confirm the right setup for your carrier during onboarding.</p></details>
+          <details><summary>What does my customer need to download?<svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></summary><p>Nothing. The conversation happens over regular text messages, and the deposit link opens Stripe's checkout page. You receive booking alerts by text, too.</p></details>
+          <details><summary>Where does the $49 deposit go?<svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></summary><p>Your customer pays through Stripe to confirm the booking. That $49 is credited toward their final job bill. It's separate from your shop's base plan and paid-lead fee. Payment routing and payout timing depend on your Stripe setup.</p></details>
+          <details><summary>What if the customer cancels?<svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></summary><p>The deposit is fully refunded if your shop cancels, can't make the slot, or the customer cancels at least 24 hours ahead. If work is declined on site, it may cover the trip fee. See the <a href="refunds.html">full refund policy</a> for details.</p></details>
+          <details><summary>Who is the pilot for?<svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></summary><p>Georgia plumbing and HVAC shops running 1–5 trucks. The first 10 founding shops get a free 14-day pilot and waived setup. Join the list and we'll follow up about your shop and availability.</p></details>
+          <details><summary>Can callers opt out of texts?<svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></summary><p>Yes. Callers can reply STOP to opt out or HELP for help. Message frequency varies, and message and data rates may apply. Read <a href="sms-consent.html">how texting and consent work</a>.</p></details>
+        </div>
+      </div>
+    </section>
+
+    <section class="section signup" id="waitlist" aria-labelledby="signup-title">
+      <div class="container signup-panel">
+        <div class="signup-copy"><p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> Now inviting Georgia shops</p><h2 id="signup-title">Keep your hands busy.<br>Not your callers waiting.</h2><p>Join the list for the founding-shop pilot. We'll reach out about getting BuzzCall working for your business.</p></div>
+        <div class="signup-form-wrap">
+          <form id="waitlist-form" aria-labelledby="signup-title">
+            <label for="waitlist-email">Your work email</label>
+            <div class="email-row"><input id="waitlist-email" type="email" name="email" autocomplete="email" inputmode="email" placeholder="you@yourshop.com" maxlength="254" aria-describedby="waitlist-privacy waitlist-status" required><button class="button button-yellow" type="submit" disabled>Join the list <svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button></div>
+            <p id="waitlist-privacy" class="signup-privacy">No payment to join the list. By submitting, you agree to our <a href="privacy.html">Privacy Policy</a>. This form does not sign you up for SMS.</p>
+            <p class="form-status" id="waitlist-status" role="status" aria-live="polite" aria-atomic="true"></p>
+          </form>
+          <p class="signup-contact">Rather talk it through? <a href="tel:+14704828377">(470) 482-8377</a></p>
+        </div>
+      </div>
+    </section>
+    <noscript><div class="container no-script">The signup forms need JavaScript. You can still join the pilot by emailing <a href="mailto:hello@trybuzzcall.com">hello@trybuzzcall.com</a> or calling <a href="tel:+14704828377">(470) 482-8377</a>.</div></noscript>
+  </main>
+
+  <footer class="footer">
+    <div class="container">
+      <div class="footer-top"><div><a class="logo" href="/" aria-label="BuzzCall home"><span class="logo-mark"><svg class="icon" aria-hidden="true"><use href="#icon-bolt"/></svg></span>buzzcall<span class="logo-period">.</span></a><p>Good work deserves the next call.</p></div><div class="footer-contact"><a href="mailto:hello@trybuzzcall.com">hello@trybuzzcall.com</a><a href="tel:+14704828377">(470) 482-8377</a><span>Built for local. Based in Georgia.</span></div></div>
+      <div class="footer-bottom"><address><strong>TryBuzzCall LLC</strong><br>8735 Dunwoody Place #13893<br>Atlanta, GA 30350, USA</address><nav aria-label="Legal"><a href="privacy.html">Privacy</a><a href="terms.html">Terms</a><a href="refunds.html">Refunds</a><a href="terms.html#sms">SMS Terms</a><a href="sms-consent.html">SMS Consent</a></nav></div>
+      <p class="copyright">© 2026 TryBuzzCall LLC. BuzzCall is a product of TryBuzzCall LLC.</p>
+    </div>
+  </footer>
+</body>
+</html>
