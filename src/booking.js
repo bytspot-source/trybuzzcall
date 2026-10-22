@@ -1,7 +1,7 @@
 // Optional booking + deposit. Slots computed in server-local time (set BUSINESS_TZ, applied as TZ at startup).
 const crypto = require('crypto');
 const store = require('./store');
-const env = process.env;
+const env = require('./config').env; // override > env (see config.js)
 const on = (v) => /^(1|true|yes|on)$/i.test(String(v || ''));
 // Vertical: 'home_services' (plumber/HVAC, default) or 'braiders' (service menu, variable-length appointments).
 const vertical = () => {

@@ -1,12 +1,13 @@
 // Conversation. home_services: name -> need -> slot (if BOOKING_ENABLED) or callback window.
 // braiders (VERTICAL=braiders): name -> service from SERVICES menu (+ size/length) -> preferred day -> start time or callback.
-// OpenAI phrasing if key set, else templates.
-const biz = () => process.env.BUSINESS_NAME || 'our team';
-const city = () => (process.env.BUSINESS_CITY || '').trim();
+// OpenAI phrasing if key set, else templates. Shop config reads go through config.env (override > env).
+const env = require('./config').env;
+const biz = () => env.BUSINESS_NAME || 'our team';
+const city = () => (env.BUSINESS_CITY || '').trim();
 const inCity = () => (city() ? ` in ${city()}` : '');
 const booking = require('./booking');
 const isBraiders = () => booking.vertical() === 'braiders';
-const vertical = () => (isBraiders() ? 'braiders' : (process.env.BUSINESS_VERTICAL || 'plumber').toLowerCase());
+const vertical = () => (isBraiders() ? 'braiders' : (env.BUSINESS_VERTICAL || 'plumber').toLowerCase());
 
 const TEMPLATES = {
   plumber: {
@@ -72,13 +73,13 @@ function parseDay(text, now = new Date()) {
 const URGENT = /flood|burst|gas|no heat|smoke|sewage|emergency|asap|urgent/i;
 
 async function polish(fallback, context) {
-  if (!process.env.OPENAI_API_KEY) return fallback;
+  if (!env.OPENAI_API_KEY) return fallback;
   try {
     const r = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: process.env.OPENAI_MODEL || 'gpt-4o-mini', max_tokens: 120,
+        model: env.OPENAI_MODEL || 'gpt-4o-mini', max_tokens: 120,
         messages: [
           { role: 'system', content: isBraiders()
             ? `You text missed callers for ${biz()}, a hair braiding stylist${inCity()}, writing as the stylist ("I"). Rewrite the draft as one warm, plain SMS under 300 chars. Keep the same question/intent and any numbered list or link exactly. No prices, no urgency, no promises.`
@@ -161,10 +162,10 @@ const texts = {
     : `Thanks ${name}! We're holding ${b.slotLabel} for you. We'll text you a deposit link shortly to confirm.`,
   bookedNoDeposit: (name, b) => isBraiders()
     ? `You're booked, ${name}: ${b.service ? b.service + ', ' : ''}${b.slotLabel}. See you then!`
-    : `You're booked, ${name}: ${b.slotLabel}. ${process.env.BUSINESS_NAME || 'We'} will text when the tech is on the way.`,
+    : `You're booked, ${name}: ${b.slotLabel}. ${env.BUSINESS_NAME || 'We'} will text when the tech is on the way.`,
   paid: (b) => isBraiders()
     ? `Deposit received - you're booked, ${b.name}! ${b.service ? b.service + ', ' : ''}${b.slotLabel}. Your $${b.amount} goes toward your service. See you then!`
-    : `Deposit received - you're confirmed for ${b.slotLabel}, ${b.name}! ${process.env.BUSINESS_NAME || 'We'} will text when the tech is on the way.`,
+    : `Deposit received - you're confirmed for ${b.slotLabel}, ${b.name}! ${env.BUSINESS_NAME || 'We'} will text when the tech is on the way.`,
   paidConflict: (b) => isBraiders()
     ? `Thanks ${b.name}, I got your deposit, but your hold on ${b.slotLabel} had run out and that time was taken. I'll reach out to find you a new time.`
     : `Thanks ${b.name}, we got your deposit but your hold on ${b.slotLabel} had expired and the slot was taken. We'll call you to reschedule.`,

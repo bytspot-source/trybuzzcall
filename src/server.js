@@ -1,5 +1,6 @@
 require('dotenv').config();
-if (process.env.BUSINESS_TZ) process.env.TZ = process.env.BUSINESS_TZ; // slot math uses local time
+const config = require('./config'); // shop config: stored override (admin 'Apply to this line') > env > default
+config.applyTZ(); // slot math uses local time (BUSINESS_TZ)
 const express = require('express');
 const path = require('path');
 const store = require('./store');
@@ -7,6 +8,9 @@ const { sendSms, live } = require('./sms');
 const agent = require('./agent');
 const booking = require('./booking');
 const billing = require('./billing');
+const setupRules = require('./setupRules');
+const setupPages = require('./setupPages');
+const crypto = require('crypto');
 
 const app = express();
 // Stripe webhook needs the raw body for signature verification, so it's registered before the JSON parser.
@@ -32,7 +36,7 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 // Public site. `extensions` gives clean URLs (/privacy, /terms, /refunds, /sms-consent) as well as the .html paths.
 app.use(express.static(path.join(__dirname, '..', 'public'), { extensions: ['html'] }));
-const env = process.env;
+const env = config.env;
 const BASE = env.PUBLIC_BASE_URL || `http://localhost:${env.PORT || 3000}`;
 function isAdmin(req) {
   const [, b64] = (req.headers.authorization || '').split(' ');
@@ -251,6 +255,50 @@ app.post('/billing/mock/advance', mockOnly, requireAdmin, async (req, res) => {
 app.post('/billing/mock/primary', mockOnly, requireAdmin, (req, res) => { try { res.json(billing.mockSetPrimary(req.body.sub)); } catch (e) { apiErr(res, e); } });
 app.post('/billing/mock/fail-next', mockOnly, requireAdmin, (req, res) => { try { res.json(billing.mockFailNext(/^(1|true|on|yes)$/i.test(String(req.body.on ?? '1')), req.body.sub)); } catch (e) { apiErr(res, e); } });
 
+// ---------- Shop-owner setup form ----------
+// GET /setup is public/setup.html (static). The shared balance-check rules are served to the browser from src/.
+app.get('/setup-rules.js', (req, res) => res.type('application/javascript').sendFile(path.join(__dirname, 'setupRules.js')));
+// POST /setup (JSON or form). 422 = errors, 409 = warnings not confirmed (send confirm=1), 200 = saved as 'pending'.
+// Never touches the live config: an admin reviews it and clicks 'Apply to this line'.
+const wantsJson = (req) => req.is('application/json') || /application\/json/.test(req.get('accept') || '');
+app.post('/setup', (req, res) => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const json = wantsJson(req);
+  const { values, issues, errors, warnings } = setupRules.validate(body);
+  if (String(body.website || '').trim()) { // honeypot: bots fill hidden fields; pretend success, store nothing
+    return json ? res.json({ ok: true, id: null }) : res.type('html').send(setupPages.thanksHtml({}));
+  }
+  if (errors.length) return json ? res.status(422).json({ ok: false, errors, warnings, issues }) : res.status(422).type('html').send(setupPages.errorsHtml(errors));
+  if (warnings.length && !values.confirm) return json ? res.status(409).json({ ok: false, needsConfirm: true, warnings, issues }) : res.status(409).type('html').send(setupPages.confirmHtml(warnings, body));
+  const { confirm, ...saved } = values;
+  const s = store.addSetup({ id: crypto.randomBytes(6).toString('hex'), createdAt: new Date().toISOString(), status: 'pending',
+    values: saved, warningsConfirmed: warnings, consentAt: new Date().toISOString() });
+  const message = "We'll review your setup and text you within 1 business day.";
+  return json ? res.json({ ok: true, id: s.id, message }) : res.type('html').send(setupPages.thanksHtml(saved));
+});
+// Admin POSTs: refuse cross-site form posts (basic-auth credentials ride along automatically).
+function sameOrigin(req, res, next) {
+  const o = req.get('origin');
+  if (o && o !== 'null') { try { if (new URL(o).host !== req.get('host')) return res.status(403).send('cross-origin request refused'); } catch { return res.status(403).send('bad origin'); } }
+  next();
+}
+app.post('/admin/setups/:id/apply', requireAdmin, sameOrigin, (req, res) => {
+  const s = store.findSetup(req.params.id);
+  if (!s) return res.status(404).json({ error: 'setup not found' });
+  const { values, errors } = setupRules.validate(s.values);
+  if (errors.length) return res.status(422).json({ error: 'setup has errors; fix before applying', errors });
+  const applied = config.apply(setupRules.toEnv(values), { setupId: s.id });
+  for (const x of store.db.setups) if (x.status === 'applied' && x.id !== s.id) x.status = 'replaced';
+  s.status = 'applied'; s.appliedAt = new Date().toISOString(); store.save();
+  if (wantsJson(req)) return res.json({ ok: true, id: s.id, config: applied });
+  res.redirect(303, '/admin#setups');
+});
+app.post('/admin/config/reset', requireAdmin, sameOrigin, (req, res) => {
+  config.clear();
+  if (wantsJson(req)) return res.json({ ok: true });
+  res.redirect(303, '/admin#setups');
+});
+
 // Admin (HTTP Basic auth, any username)
 app.get('/admin', requireAdmin, (req, res) => {
   const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -264,7 +312,8 @@ app.get('/admin', requireAdmin, (req, res) => {
   res.send(`<!doctype html><meta charset="utf-8"><title>Admin</title><style>body{font-family:sans-serif;margin:2rem}td,th{border:1px solid #ccc;padding:4px 8px}table{border-collapse:collapse}</style>
 ${billingHtml(esc)}<h1>Leads</h1><table><tr><th>When</th><th>Phone</th><th>Name</th><th>Need</th><th>Callback</th><th>Status</th></tr>${rows}</table>
 <h2>Lead fees</h2><p><b>Total: $${money(lf.total)}</b> from ${lf.count} paid lead(s) (fee $${money(fc.leadFee)}/paid lead${fc.leadFeeWaived ? ', WAIVED' : ''}; ${fc.connectAccount ? 'Stripe Connect ' + esc(fc.connectAccount) : 'no Connect: invoice monthly'})<br>Due (to invoice): $${money(lf.due)} · Collected via Connect: $${money(lf.collected)} · Waived (pilot): $${money(lf.waived)} · Under review (slot lost): $${money(lf.review)}</p>
-<h2>Bookings</h2><ul>${(store.db.bookings || []).slice(0, 50).map((b) => `<li>${esc(b.slotLabel)}: ${esc(b.name)} (${esc(b.phone)}) - ${esc(b.status)}${b.paid ? ' PAID $' + esc(b.amount) : ''}${b.lead_fee_status ? ` · lead fee $${money(b.lead_fee || 0)} ${esc(b.lead_fee_status)}` : ''}</li>`).join('')}</ul><h2>Owner alerts</h2><ul>${alerts}</ul><h2>Waitlist (${store.db.waitlist.length})</h2><ul>${waitlist}</ul>`);
+<h2>Bookings</h2><ul>${(store.db.bookings || []).slice(0, 50).map((b) => `<li>${esc(b.slotLabel)}: ${esc(b.name)} (${esc(b.phone)}) - ${esc(b.status)}${b.paid ? ' PAID $' + esc(b.amount) : ''}${b.lead_fee_status ? ` · lead fee $${money(b.lead_fee || 0)} ${esc(b.lead_fee_status)}` : ''}</li>`).join('')}</ul><h2>Owner alerts</h2><ul>${alerts}</ul><h2>Waitlist (${store.db.waitlist.length})</h2><ul>${waitlist}</ul>
+${setupPages.adminSetupsHtml(store.db.setups, config.effective(), config.override(), booking.cfg())}`);
 });
 
 setInterval(() => booking.expireHolds(), 60000).unref();
