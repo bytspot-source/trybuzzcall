@@ -18,6 +18,14 @@ module.exports = {
     db.leads.unshift(lead); save(); return lead;
   },
   addAlert(a) { db.alerts.unshift({ ...a, at: new Date().toISOString() }); save(); },
-  addWaitlist(email) { if (!db.waitlist.some((w) => w.email === email)) db.waitlist.push({ email, at: new Date().toISOString() }); save(); },
+  addWaitlist(email, businessType) {
+    let entry = db.waitlist.find((w) => w.email === email);
+    if (!entry) {
+      entry = { email, at: new Date().toISOString() };
+      db.waitlist.push(entry);
+    }
+    if (businessType === 'home_services' || businessType === 'braiders') entry.businessType = businessType;
+    save();
+  },
   save,
 };
