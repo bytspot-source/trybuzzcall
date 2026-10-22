@@ -13,9 +13,10 @@ const CONFIG_FILE = path.join(DIR, 'config.json');
 let override = {};
 try { override = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) || {}; } catch {}
 const MAX_SETUPS = 500;
+const WAITLIST_TYPES = ['home_services', 'braiders', 'other']; // landing-page segments (other = any other local business)
 
 module.exports = {
-  db,
+  db, WAITLIST_TYPES,
   findOpenLead: (phone) => db.leads.find((l) => l.phone === phone && l.status !== 'done'),
   findBooking: (id) => db.bookings.find((b) => b.id === id),
   createLead(phone) {
@@ -30,7 +31,7 @@ module.exports = {
       entry = { email, at: new Date().toISOString() };
       db.waitlist.push(entry);
     }
-    if (businessType === 'home_services' || businessType === 'braiders') entry.businessType = businessType;
+    if (WAITLIST_TYPES.includes(businessType)) entry.businessType = businessType;
     save();
   },
   addSetup(s) {

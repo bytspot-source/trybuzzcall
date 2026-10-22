@@ -82,7 +82,7 @@ test('setup form over HTTP', { timeout: 60000 }, async (t) => {
     const js = await s.get('/setup-rules.js');
     assert.equal(js.status, 200);
     assert.match(js.headers.get('content-type'), /javascript/);
-    assert.match(await js.text(), /root\.SetupRules = factory\(\)/);
+    assert.match(await js.text(), /root\.SetupRules = factory\(root\.BuzzTrades\)/);
   });
 
   await t.test('POST /setup with errors returns 422 and the issue list, saving nothing', async () => {
@@ -207,5 +207,63 @@ test('setup form over HTTP', { timeout: 60000 }, async (t) => {
     assert.equal(health.vertical, 'home_services');
     const page = await (await s.get('/admin', s.auth(s.pass))).text();
     assert.match(page, /<td>BUSINESS_NAME<\/td><td>Env Plumbing<\/td><td>env<\/td>/);
+  });
+
+  await t.test('a new trade (pet groomer, then "Other" jobs) submits, applies as an override and the line runs it', async () => {
+    const pet = { ...GOOD, vertical: undefined, businessType: 'pet_grooming', businessName: 'Sudsy Paws', bookingLink: '',
+      services: [{ row: 0, name: 'Full groom', hours: '2', minutes: '0' }, { row: 1, name: 'Nail trim', hours: '0', minutes: '30' }] };
+    const r = await s.json('/setup', pet);
+    assert.equal(r.status, 200);
+    const { id } = await r.json();
+    const admin = await (await s.get('/admin', s.auth(s.pass))).text();
+    assert.match(admin, /Sudsy Paws · Atlanta, GA · Pet groomer \(clients pick a service and time\)/);
+    const ap = await s.json(`/admin/setups/${id}/apply`, {}, s.auth(s.pass));
+    assert.equal(ap.status, 200);
+    const j = await ap.json();
+    assert.equal(j.config.BUSINESS_TYPE, 'pet_grooming');
+    assert.equal(j.config.BUSINESS_FLOW, 'appointments');
+    assert.equal(j.config.SERVICES, 'Full groom:120,Nail trim:30');
+    const stored = JSON.parse(fs.readFileSync(path.join(s.dir, 'config.json'), 'utf8'));
+    assert.equal(stored.values.BUSINESS_TYPE, 'pet_grooming');
+    const health = await (await s.get('/health')).json();
+    assert.equal(health.trade, 'pet_grooming');
+    assert.equal(health.flow, 'appointments');
+    assert.equal(health.vertical, 'appointments');
+    const after = await (await s.get('/admin', s.auth(s.pass))).text();
+    assert.match(after, /Running as: <b>Pet groomer<\/b> \(pet_grooming, appointments flow\)/);
+    assert.match(after, /<td>BUSINESS_TYPE<\/td><td>pet_grooming<\/td><td>override<\/td>/);
+
+    const missing = await s.json('/setup', { ...pet, businessType: 'other', tradeName: '', flow: '' });
+    assert.equal(missing.status, 422);
+    const fields = (await missing.json()).errors.map((e) => e.field);
+    assert.ok(fields.includes('tradeName') && fields.includes('flow'), JSON.stringify(fields));
+
+    const other = { ...pet, businessType: 'other', tradeName: 'Pool cleaning', flow: 'jobs', businessName: 'Blue Pools', services: [], slotMinutes: '120' };
+    const o = await s.json('/setup', other);
+    assert.equal(o.status, 200);
+    const oid = (await o.json()).id;
+    assert.equal((await s.json(`/admin/setups/${oid}/apply`, {}, s.auth(s.pass))).status, 200);
+    const h2 = await (await s.get('/health')).json();
+    assert.equal(h2.trade, 'other');
+    assert.equal(h2.flow, 'jobs');
+    assert.equal(h2.vertical, 'home_services');
+    const cfg = JSON.parse(fs.readFileSync(path.join(s.dir, 'config.json'), 'utf8')).values;
+    assert.equal(cfg.BUSINESS_TRADE_LABEL, 'Pool cleaning');
+    assert.equal(cfg.SLOT_MINUTES, '120');
+  });
+
+  await t.test('GET /setup offers a grouped business-type select with Other, a trade name and the two booking styles', async () => {
+    const html = await (await s.get('/setup')).text();
+    assert.match(html, /<select id="businessType" name="businessType">/);
+    for (const g of ['Beauty &amp; personal care', 'Home services', 'Other services']) assert.match(html, new RegExp(`<optgroup label="${g}">`));
+    for (const k of ['braiders', 'nails', 'plumbing', 'hvac', 'handyman', 'pet_grooming', 'other']) assert.match(html, new RegExp(`<option value="${k}">`));
+    assert.match(html, /id="tradeName"/);
+    assert.match(html, /name="flow" value="appointments"[^>]*>.*Clients pick a service and time/);
+    assert.match(html, /name="flow" value="jobs">.*Customers describe a job/);
+    assert.match(html, /<script src="trades.js" defer><\/script>\s*<script src="setup-rules.js" defer>/);
+    const js = await s.get('/trades.js');
+    assert.equal(js.status, 200);
+    assert.match(js.headers.get('content-type'), /javascript/);
+    assert.match(await js.text(), /root\.BuzzTrades = factory\(\)/);
   });
 });

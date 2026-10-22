@@ -9,6 +9,7 @@
   <meta name="theme-color" content="#142b32">
   <link rel="stylesheet" href="home.css">
   <link rel="stylesheet" href="setup.css">
+  <script src="trades.js" defer></script>
   <script src="setup-rules.js" defer></script>
   <script src="setup.js" defer></script>
 </head>
@@ -24,7 +25,7 @@
     <div class="setup-intro">
       <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> Shop setup · about 5 minutes</p>
       <h1>Set up your <span class="highlight-text">BuzzCall line</span>.</h1>
-      <p>Tell us how your business runs. We'll check everything with you before your line goes live. Nothing changes until then.</p>
+      <p>For any local business that books by phone. Tell us how yours runs. We'll check everything with you before your line goes live. Nothing changes until then.</p>
     </div>
 
     <div id="setup-summary" class="setup-summary" tabindex="-1" hidden></div>
@@ -34,19 +35,32 @@
         <legend><span class="step-no">1</span> Your business</legend>
         <div class="field" data-field="businessName">
           <label for="businessName">Business name</label>
-          <input id="businessName" name="businessName" autocomplete="organization" maxlength="80" placeholder="Crown &amp; Glory Braids">
+          <input id="businessName" name="businessName" autocomplete="organization" maxlength="80" placeholder="Crown &amp; Glory Studio">
           <p class="hint">The name callers know you by. It goes in the first text.</p>
         </div>
         <div class="field" data-field="city">
           <label for="city">City and state</label>
           <input id="city" name="city" autocomplete="address-level2" maxlength="80" placeholder="Atlanta, GA">
         </div>
-        <div class="field" data-field="vertical" role="radiogroup" aria-labelledby="vertical-label">
-          <p class="label" id="vertical-label">What kind of business?</p>
-          <div class="choice-row">
-            <label class="choice"><input type="radio" name="vertical" value="braiders" id="vertical"><span>Braider</span></label>
-            <label class="choice"><input type="radio" name="vertical" value="plumber"><span>Plumbing</span></label>
-            <label class="choice"><input type="radio" name="vertical" value="hvac"><span>HVAC</span></label>
+        <div class="field" data-field="businessType">
+          <label for="businessType">What kind of business?</label>
+          <select id="businessType" name="businessType">
+            <option value="">Choose your business type</option>
+            <optgroup label="Beauty &amp; personal care"><option value="braiders">Hair braider / loc stylist</option><option value="nails">Nail tech / nail salon</option><option value="lashes_brows">Lash &amp; brow artist</option><option value="barber">Barber</option><option value="hair_salon">Hair stylist / salon</option><option value="makeup">Makeup artist</option><option value="esthetician">Esthetician / skin care</option><option value="massage">Massage therapist</option></optgroup>
+            <optgroup label="Home services"><option value="plumbing">Plumbing</option><option value="hvac">HVAC (heating &amp; cooling)</option><option value="electrical">Electrician</option><option value="handyman">Handyman</option><option value="cleaning">House cleaning</option><option value="landscaping">Landscaping &amp; lawn care</option></optgroup>
+            <optgroup label="Other services"><option value="pet_grooming">Pet groomer</option><option value="mobile_detailing">Mobile detailing</option><option value="tutoring">Tutor / lessons</option><option value="photography">Photographer</option><option value="catering_bakery">Caterer / home baker</option><option value="other">Other (tell us your trade)</option></optgroup>
+          </select>
+          <p class="hint">Pick the closest fit. Your texts, hours and services start from that trade's usual setup, and you can change anything.</p>
+        </div>
+        <div class="field" data-field="tradeName" data-show="other">
+          <label for="tradeName">What's your trade?</label>
+          <input id="tradeName" name="tradeName" maxlength="60" placeholder="Mobile tailor, piano lessons, pool cleaning…">
+        </div>
+        <div class="field" data-field="flow" data-show="other" role="radiogroup" aria-labelledby="flow-label">
+          <p class="label" id="flow-label">How do callers book with you?</p>
+          <div class="choice-stack">
+            <label class="choice choice-wide"><input type="radio" name="flow" value="appointments" id="flow" checked><span><b>Clients pick a service and time</b><small>Like a salon: a short menu of services, each with about how long it takes.</small></span></label>
+            <label class="choice choice-wide"><input type="radio" name="flow" value="jobs"><span><b>Customers describe a job</b><small>Like a plumber: they tell you what they need, then pick a window or ask for a callback.</small></span></label>
           </div>
         </div>
       </fieldset>
@@ -110,33 +124,18 @@
         </div>
       </fieldset>
 
-      <fieldset class="setup-card" id="sec-services" data-show="braiders">
-        <legend><span class="step-no">4</span> Services <span class="tag">Braiders</span></legend>
-        <p class="hint">Callers pick a style by number. We only offer start times where the whole style fits before you close.</p>
+      <fieldset class="setup-card" id="sec-services" data-show="appointments">
+        <legend><span class="step-no">4</span> Services <span class="tag" id="services-tag">Your menu</span></legend>
+        <p class="hint">Callers pick a <span data-word>service</span> by number. We only offer start times where the whole <span data-word>service</span> fits before you close.</p>
         <div class="field" data-field="services">
           <div id="service-rows" class="service-rows">
             <div class="service-row" data-row="0" data-field="services.0">
-              <div class="field" data-field="services.0.name"><label for="svc-name-0">Style</label><input id="svc-name-0" name="service_name" maxlength="60" value="Knotless braids"></div>
-              <div class="field svc-dur" data-field="services.0.duration"><span class="label" id="svc-dur-0">How long?</span><div class="dur"><input id="svc-h-0" name="service_hours" type="number" inputmode="numeric" min="0" max="16" value="6" aria-labelledby="svc-dur-0 svc-hl-0"><span id="svc-hl-0">hr</span><select name="service_minutes" aria-label="minutes"><option value="0" selected>0</option><option value="15">15</option><option value="30">30</option><option value="45">45</option></select><span>min</span></div></div>
-              <button type="button" class="row-remove" aria-label="Remove this style">×</button>
-            </div>
-            <div class="service-row" data-row="1" data-field="services.1">
-              <div class="field" data-field="services.1.name"><label for="svc-name-1">Style</label><input id="svc-name-1" name="service_name" maxlength="60" value="Box braids"></div>
-              <div class="field svc-dur" data-field="services.1.duration"><span class="label" id="svc-dur-1">How long?</span><div class="dur"><input id="svc-h-1" name="service_hours" type="number" inputmode="numeric" min="0" max="16" value="5" aria-labelledby="svc-dur-1 svc-hl-1"><span id="svc-hl-1">hr</span><select name="service_minutes" aria-label="minutes"><option value="0" selected>0</option><option value="15">15</option><option value="30">30</option><option value="45">45</option></select><span>min</span></div></div>
-              <button type="button" class="row-remove" aria-label="Remove this style">×</button>
-            </div>
-            <div class="service-row" data-row="2" data-field="services.2">
-              <div class="field" data-field="services.2.name"><label for="svc-name-2">Style</label><input id="svc-name-2" name="service_name" maxlength="60" value="Locs retwist"></div>
-              <div class="field svc-dur" data-field="services.2.duration"><span class="label" id="svc-dur-2">How long?</span><div class="dur"><input id="svc-h-2" name="service_hours" type="number" inputmode="numeric" min="0" max="16" value="2" aria-labelledby="svc-dur-2 svc-hl-2"><span id="svc-hl-2">hr</span><select name="service_minutes" aria-label="minutes"><option value="0" selected>0</option><option value="15">15</option><option value="30">30</option><option value="45">45</option></select><span>min</span></div></div>
-              <button type="button" class="row-remove" aria-label="Remove this style">×</button>
-            </div>
-            <div class="service-row" data-row="3" data-field="services.3">
-              <div class="field" data-field="services.3.name"><label for="svc-name-3">Style</label><input id="svc-name-3" name="service_name" maxlength="60" value="Twists"></div>
-              <div class="field svc-dur" data-field="services.3.duration"><span class="label" id="svc-dur-3">How long?</span><div class="dur"><input id="svc-h-3" name="service_hours" type="number" inputmode="numeric" min="0" max="16" value="3" aria-labelledby="svc-dur-3 svc-hl-3"><span id="svc-hl-3">hr</span><select name="service_minutes" aria-label="minutes"><option value="0" selected>0</option><option value="15">15</option><option value="30">30</option><option value="45">45</option></select><span>min</span></div></div>
-              <button type="button" class="row-remove" aria-label="Remove this style">×</button>
+              <div class="field" data-field="services.0.name"><label for="svc-name-0" data-word-cap>Service</label><input id="svc-name-0" name="service_name" maxlength="60" placeholder="e.g. Gel manicure"></div>
+              <div class="field svc-dur" data-field="services.0.duration"><span class="label" id="svc-dur-0">How long?</span><div class="dur"><input id="svc-h-0" name="service_hours" type="number" inputmode="numeric" min="0" max="16" aria-labelledby="svc-dur-0 svc-hl-0"><span id="svc-hl-0">hr</span><select name="service_minutes" aria-label="minutes"><option value="0" selected>0</option><option value="15">15</option><option value="30">30</option><option value="45">45</option></select><span>min</span></div></div>
+              <button type="button" class="row-remove" aria-label="Remove this service">×</button>
             </div>
           </div>
-          <button type="button" id="add-service" class="button button-small add-row" hidden>+ Add another style</button>
+          <button type="button" id="add-service" class="button button-small add-row" hidden>+ Add another service</button>
         </div>
       </fieldset>
 
@@ -150,7 +149,7 @@
           </div>
         </div>
         <div class="grid-2" data-show-booking>
-          <div class="field" data-field="slotMinutes" data-show="home">
+          <div class="field" data-field="slotMinutes" data-show="jobs">
             <label for="slotMinutes">How long is each appointment window?</label>
             <select id="slotMinutes" name="slotMinutes">
               <option value="30">30 min</option><option value="60">1 hour</option><option value="90">1.5 hours</option><option value="120" selected>2 hours</option><option value="180">3 hours</option><option value="240">4 hours</option><option value="360">6 hours</option><option value="480">8 hours</option>
@@ -185,10 +184,10 @@
 
       <fieldset class="setup-card" id="sec-finish">
         <legend><span class="step-no">7</span> Last bits</legend>
-        <div class="field" data-field="bookingLink" data-show="braiders">
+        <div class="field" data-field="bookingLink" data-show="appointments">
           <label for="bookingLink">Your booking page <span class="unit-label">(optional)</span></label>
           <input id="bookingLink" name="bookingLink" type="url" inputmode="url" maxlength="300" placeholder="https://booksy.com/your-page">
-          <p class="hint">Booksy, StyleSeat or GlossGenius link. We add it to your texts so callers can book there too.</p>
+          <p class="hint">Booksy, StyleSeat, GlossGenius, Vagaro or Square link. We add it to your texts so callers can book there too.</p>
         </div>
         <div class="field" data-field="email">
           <label for="email">Your email</label>

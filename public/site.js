@@ -54,7 +54,7 @@
 
   document.querySelectorAll('[data-audience]').forEach((link) => {
     link.addEventListener('click', () => {
-      if (joining || !['home_services', 'braiders'].includes(link.dataset.audience)) return;
+      if (joining || !['home_services', 'braiders', 'other'].includes(link.dataset.audience)) return;
       business.value = link.dataset.audience;
       business.removeAttribute('aria-invalid');
       status(waitlistStatus, '');
@@ -79,7 +79,7 @@
     email.removeAttribute('aria-invalid');
     business.removeAttribute('aria-invalid');
     const businessType = business.value;
-    const pilotName = businessType === 'braiders' ? 'Braiders' : 'Home Services';
+    const pilotName = { braiders: 'Braiders', other: 'BuzzCall' }[businessType] || 'Home Services';
     status(waitlistStatus, 'Adding you to the list…');
     try {
       const { response, data } = await post('/api/waitlist', { email: email.value, businessType });

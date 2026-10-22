@@ -38,7 +38,7 @@ test('every issue has field, level error|warning and a message', () => {
 
 test('missing required fields are errors', () => {
   const list = issues({});
-  for (const f of ['businessName', 'city', 'vertical', 'ownerPhone', 'days', 'open', 'close', 'tz', 'email', 'consent']) has(list, f, 'error');
+  for (const f of ['businessName', 'city', 'businessType', 'ownerPhone', 'days', 'open', 'close', 'tz', 'email', 'consent']) has(list, f, 'error');
   has(issues(BRAIDER, { businessName: '   ' }), 'businessName', 'error');
 });
 
@@ -183,4 +183,72 @@ test('toEnv maps values onto the env keys booking.js reads', () => {
   assert.equal(h.BOOKING_ENABLED, '0');
   assert.equal(h.DEPOSIT_ENABLED, '0');
   assert.equal(h.SERVICES, undefined);
+});
+
+// ---- business types (trades) ----
+const NAILS = Object.freeze({ ...BRAIDER, vertical: undefined, businessType: 'nails', services: [{ row: 0, name: 'Gel manicure', hours: '1', minutes: '0' }] });
+const HANDY = Object.freeze({ ...HOME, vertical: undefined, businessType: 'handyman' });
+
+test('business type select: any trade key; the old vertical picker still maps to braiders/plumbing/hvac', () => {
+  assert.deepEqual(issues(NAILS), []);
+  assert.deepEqual(issues(HANDY), []);
+  assert.equal(R.normalize(BRAIDER).businessType, 'braiders');
+  assert.equal(R.normalize(HOME).businessType, 'plumbing');
+  assert.equal(R.normalize({ vertical: 'hvac' }).businessType, 'hvac');
+  assert.equal(R.normalize({ businessType: 'pet_grooming' }).flow, 'appointments');
+  assert.equal(R.normalize({ businessType: 'cleaning' }).flow, 'jobs');
+  assert.equal(R.normalize({ businessType: 'nonsense' }).businessType, '');
+  has(issues(NAILS, { businessType: 'nonsense' }), 'businessType', 'error', /Other/);
+});
+
+test('"Other" needs a trade name and a booking style', () => {
+  const other = { ...NAILS, businessType: 'other', tradeName: 'Piano lessons', flow: 'appointments', services: [{ name: '30-min lesson', minutes: '30' }] };
+  assert.deepEqual(issues(other), []);
+  has(issues(other, { tradeName: '  ' }), 'tradeName', 'error', /tell us what kind of business/i);
+  has(issues(other, { flow: '' }), 'flow', 'error', /pick a service and time, or they describe a job/);
+  assert.deepEqual(issues({ ...HANDY, businessType: 'other', tradeName: 'Pool cleaning', flow: 'jobs' }), []);
+  none(issues(NAILS, { tradeName: '' }), 'tradeName');
+});
+
+test('appointments flow with no services is an error for every appointment trade (wording follows the trade)', () => {
+  for (const key of ['nails', 'barber', 'pet_grooming', 'tutoring', 'photography']) has(issues(NAILS, { businessType: key, services: [] }), 'services', 'error', /at least one (service|session|look)/);
+  has(issues(NAILS, { businessType: 'tutoring', services: [] }), 'services', 'error', /at least one session/);
+  has(issues({ ...NAILS, businessType: 'other', tradeName: 'Piano lessons', flow: 'appointments', services: [] }), 'services', 'error', /at least one service/);
+  has(issues(NAILS, { services: [{ row: 2, name: '', hours: '1' }] }), 'services.2.name', 'error', /Gel manicure/);
+});
+
+test('balance checks follow the flow: jobs check window length, appointments check service length and booking link', () => {
+  has(issues(HANDY, { open: '09:00', close: '12:00', slotMinutes: '240' }), 'slotMinutes', 'error', /no times can be offered/);
+  none(issues(NAILS, { slotMinutes: '' }), 'slotMinutes');
+  none(issues(HANDY, { services: [] }), 'services');
+  has(issues(NAILS, { open: '10:00', close: '12:00', services: [{ name: 'Full set', hours: '3' }] }), 'services.0.duration', 'error', /never be booked/);
+  has(issues(NAILS, { bookingLink: 'vagaro.com/me' }), 'bookingLink', 'error', /https:\/\//);
+  none(issues(HANDY, { bookingLink: 'not a link' }), 'bookingLink');
+  has(issues(HANDY, { depositAmount: '250', deposit: true }), 'depositAmount', 'warning', /high/);
+});
+
+test('tradeDefaults give each trade its usual hours, days, deposit, window and menu', () => {
+  const n = R.tradeDefaults('nails');
+  assert.equal(n.flow, 'appointments'); assert.equal(n.open, '10:00'); assert.equal(n.depositAmount, 20);
+  assert.equal(n.services[0].name, 'Gel manicure');
+  const c = R.tradeDefaults('cleaning');
+  assert.equal(c.flow, 'jobs'); assert.equal(c.slotMinutes, 180); assert.deepEqual(c.services, []);
+  assert.equal(R.tradeDefaults('other', 'jobs').flow, 'jobs');
+  assert.equal(R.tradeDefaults('nope'), null);
+});
+
+test('toEnv writes the trade and flow (plus consistent legacy keys)', () => {
+  const n = R.toEnv(NAILS);
+  assert.equal(n.BUSINESS_TYPE, 'nails'); assert.equal(n.BUSINESS_FLOW, 'appointments'); assert.equal(n.BUSINESS_TRADE_LABEL, '');
+  assert.equal(n.VERTICAL, 'appointments'); assert.equal(n.SERVICES, 'Gel manicure:60'); assert.equal(n.SLOT_MINUTES, undefined);
+  const h = R.toEnv({ ...HANDY, slotMinutes: '' });
+  assert.equal(h.BUSINESS_TYPE, 'handyman'); assert.equal(h.BUSINESS_FLOW, 'jobs'); assert.equal(h.VERTICAL, 'home_services');
+  assert.equal(h.SLOT_MINUTES, '120'); assert.equal(h.SERVICES, undefined); assert.equal(h.BOOKING_LINK, '');
+  const o = R.toEnv({ ...HANDY, businessType: 'other', tradeName: 'Pool cleaning', flow: 'jobs' });
+  assert.equal(o.BUSINESS_TYPE, 'other'); assert.equal(o.BUSINESS_FLOW, 'jobs'); assert.equal(o.BUSINESS_TRADE_LABEL, 'Pool cleaning');
+  const b = R.toEnv(BRAIDER);
+  assert.equal(b.BUSINESS_TYPE, 'braiders'); assert.equal(b.VERTICAL, 'braiders'); assert.equal(b.BUSINESS_VERTICAL, 'braiders');
+  assert.equal(R.toEnv(HOME).BUSINESS_VERTICAL, 'plumber');
+  const config = require('../src/config');
+  for (const k of ['BUSINESS_TYPE', 'BUSINESS_FLOW', 'BUSINESS_TRADE_LABEL']) assert.ok(config.KEYS.includes(k), `${k} can be applied as an override`);
 });

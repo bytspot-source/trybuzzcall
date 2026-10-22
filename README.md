@@ -1,6 +1,6 @@
 # BuzzCall (TryBuzzCall) — MVP
 
-When a customer call is missed, we text the caller back, collect **name / need / callback window**, then **buzz the owner by SMS** with who/what and a tap-to-call link. Built for plumbers and HVAC shops, and (with `VERTICAL=braiders`) hair braiders, in any US state. It does not do spam filtering.
+When a customer call is missed, we text the caller back, collect **name / need / callback window**, then **buzz the owner by SMS** with who/what and a tap-to-call link. Built for any appointment-based local business that books by phone, in any US state; home services (plumbing/HVAC) and hair braiders are the featured pilots. It does not do spam filtering.
 
 ## Stack
 Node 20 + Express. Leads are stored in a JSON file (`data/db.json`), with no native dependencies. Uses the Twilio SDK, optional OpenAI (via fetch), and the Stripe SDK.
@@ -30,7 +30,14 @@ With `BOOKING_ENABLED=1`, after the *need* step the caller gets the 3 next open 
 - Bookings live in `data/db.json` → `bookings`. A slot that is `held` (and not expired) or `confirmed` is never offered or booked again, and the hold is re-checked at pick time. Expired holds release the slot. A payment that arrives after expiry, when someone else has taken the slot, is flagged `paid_conflict` and the owner is told to reschedule or refund.
 Files: `src/server.js` (routes), `src/billing.js` (shop subscription billing), `src/agent.js` (conversation; OpenAI if `OPENAI_API_KEY`, else plumber/HVAC templates), `src/sms.js` (Twilio or log-only), `src/store.js`, `public/index.html` (landing page and waitlist).
 
-### Verticals (`VERTICAL`)
+### Business types (`BUSINESS_TYPE`, see `src/trades.js`)
+Each trade maps to one of two flows plus its own wording and defaults (services, days, hours, deposit, window length, urgent words):
+- **appointments** (braiders, nails, lashes_brows, barber, hair_salon, makeup, esthetician, massage, pet_grooming, tutoring, photography): *name → service from the `SERVICES` menu (+ notes) → preferred day → start times or callback → optional deposit*. No urgent flag.
+- **jobs** (plumbing, hvac, electrical, handyman, cleaning, landscaping, mobile_detailing, catering_bakery): *name → describe the need → next `SLOT_MINUTES` windows or callback → optional deposit*. Trade-specific urgent words add 🚨 to the owner alert.
+- `other`: set `BUSINESS_FLOW=appointments|jobs` and `BUSINESS_TRADE_LABEL` (e.g. "Pool cleaning").
+The /setup form writes `BUSINESS_TYPE`/`BUSINESS_FLOW`/`BUSINESS_TRADE_LABEL` into the admin config override. When `BUSINESS_TYPE` is empty the legacy keys below behave exactly as before.
+
+### Legacy verticals (`VERTICAL`)
 - `home_services` (default): plumber/HVAC wording (`BUSINESS_VERTICAL=plumber|hvac`), flow *name → need → slot*, fixed `SLOT_MINUTES` blocks, $49 deposit, $12 lead fee, urgent-keyword flag.
 - `braiders`: warm stylist wording in first person, no urgent/emergency language. Flow: *name → style from the `SERVICES` menu (plus optional size/length notes) → preferred day → 3 start times → hold + deposit*. Each caller can also reply `call` for a callback instead.
   - `SERVICES="Knotless braids:360,Box braids:300,Locs retwist:120,Twists:180"` (name:minutes). Start times are spaced `SLOT_STEP_MINUTES` apart (default 60). The whole appointment must fit inside `BUSINESS_HOURS`, and a time is never offered if it overlaps a held or confirmed booking.

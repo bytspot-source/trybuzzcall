@@ -2,14 +2,26 @@
 const crypto = require('crypto');
 const store = require('./store');
 const env = require('./config').env; // override > env (see config.js)
+const trades = require('./trades');
 const on = (v) => /^(1|true|yes|on)$/i.test(String(v || ''));
-// Vertical: 'home_services' (plumber/HVAC, default) or 'braiders' (service menu, variable-length appointments).
-const vertical = () => {
+// Trade (see trades.js): BUSINESS_TYPE (+ BUSINESS_FLOW / BUSINESS_TRADE_LABEL for 'other') wins. Legacy env still works:
+// VERTICAL=braiders (or BUSINESS_VERTICAL=braid*) -> braiders; otherwise BUSINESS_VERTICAL plumber (default) | hvac | ...
+function trade() {
+  const bt = String(env.BUSINESS_TYPE || '').trim();
+  if (bt) { const t = trades.get(bt, { flow: env.BUSINESS_FLOW, label: env.BUSINESS_TRADE_LABEL }); if (t) return t; }
   const v = String(env.VERTICAL || '').trim().toLowerCase();
-  if (/^braid/.test(v) || (!v && /^braid/i.test(env.BUSINESS_VERTICAL || ''))) return 'braiders';
-  return 'home_services';
-};
-const DEFAULT_SERVICES = 'Knotless braids:360,Box braids:300,Locs retwist:120,Twists:180';
+  if (/^braid/.test(v) || (!v && /^braid/i.test(env.BUSINESS_VERTICAL || ''))) return trades.get('braiders');
+  if (v === 'appointments') return trades.get('other', { flow: 'appointments', label: env.BUSINESS_TRADE_LABEL });
+  const bv = String(env.BUSINESS_VERTICAL || 'plumber').trim().toLowerCase();
+  const known = trades.get(bv);
+  if (known && known.flow === 'jobs') return known;
+  const t = trades.get('plumbing'); // pre-trades behavior: plumber texts, prompt names the configured vertical
+  if (bv && !known) t.promptLabel = bv;
+  return t;
+}
+// Vertical (kept for /health and older callers): 'braiders' | 'appointments' (other appointment trades) | 'home_services' (jobs flow).
+const vertical = () => { const t = trade(); return t.key === 'braiders' ? 'braiders' : t.flow === 'jobs' ? 'home_services' : 'appointments'; };
+const DEFAULT_SERVICES = trades.servicesString(trades.get('braiders'));
 // SERVICES="Name:minutes,Name:minutes" -> [{ name, minutes }]
 function parseServices(str) {
   return String(str || '').split(',').map((x) => x.trim()).filter(Boolean).map((x) => {
@@ -20,23 +32,23 @@ function parseServices(str) {
 }
 const num = (v, d) => (String(v ?? '').trim() !== '' && Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : d);
 const cfg = () => {
-  const braid = vertical() === 'braiders';
-  const [o, c] = (env.BUSINESS_HOURS || (braid ? '09:00-19:00' : '08:00-17:00')).split('-');
+  const t = trade(), appts = t.flow === 'appointments';
+  const [o, c] = (env.BUSINESS_HOURS || t.hours).split('-');
   const hm = (s) => { const [h, m] = s.split(':').map(Number); return h * 60 + (m || 0); };
-  const slotMin = Number(env.SLOT_MINUTES || 120);
+  const slotMin = Number(env.SLOT_MINUTES || (appts ? 120 : t.slotMinutes || 120));
   return {
-    vertical: vertical(), braiders: braid,
+    vertical: vertical(), braiders: t.key === 'braiders', appointments: appts, flow: t.flow, trade: t.key, tradeLabel: t.label,
     booking: on(env.BOOKING_ENABLED), deposit: on(env.DEPOSIT_ENABLED),
     slotMin, open: hm(o), close: hm(c),
-    // Start-time grid: home_services = SLOT_MINUTES blocks; braiders = SLOT_STEP_MINUTES (default 60) start times.
-    stepMin: braid ? Number(env.SLOT_STEP_MINUTES || 60) : slotMin,
-    services: braid ? parseServices(env.SERVICES || DEFAULT_SERVICES) : [],
+    // Start-time grid: jobs = SLOT_MINUTES blocks; appointments = SLOT_STEP_MINUTES (trade default, else 60) start times.
+    stepMin: appts ? Number(env.SLOT_STEP_MINUTES || t.step || 60) : slotMin,
+    services: appts ? parseServices(env.SERVICES || trades.servicesString(t) || DEFAULT_SERVICES) : [],
     bookingLink: (env.BOOKING_LINK || '').trim() || null,
-    days: (env.BUSINESS_DAYS || (braid ? '1,2,3,4,5,6' : '1,2,3,4,5')).split(',').map(Number),
+    days: (env.BUSINESS_DAYS || t.days.join(',')).split(',').map(Number),
     leadMin: Number(env.BOOKING_LEAD_MINUTES || 60), holdMin: Number(env.HOLD_MINUTES || 30),
-    amount: num(env.DEPOSIT_AMOUNT, braid ? 50 : 49),
+    amount: num(env.DEPOSIT_AMOUNT, t.deposit),
     // Per-paid-lead fee (USD) charged to the shop only when a caller books AND pays the deposit.
-    leadFee: num(env.LEAD_FEE, braid ? 5 : 12),
+    leadFee: num(env.LEAD_FEE, appts ? 5 : 12),
     leadFeeWaived: on(env.LEAD_FEE_WAIVED), // e.g. during the free pilot: fee is recorded as 'waived', nothing charged
     connectAccount: (env.STRIPE_CONNECT_ACCOUNT_ID || '').trim() || null, // shop's Stripe Connect account (acct_...)
   };
@@ -80,7 +92,7 @@ const tm = (x) => x.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-di
 const dayLabel = (s) => s.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
 function label(s, dur) {
   const e = new Date(s.getTime() + (dur || cfg().slotMin) * 60000);
-  if (cfg().braiders) return `${dayLabel(s)}, ${tm(s)} (done ~${tm(e)})`;
+  if (cfg().appointments) return `${dayLabel(s)}, ${tm(s)} (done ~${tm(e)})`;
   return `${dayLabel(s)} ${tm(s)}-${tm(e)}`;
 }
 
@@ -139,7 +151,7 @@ async function depositLink(b, BASE) {
     const s = await stripe.checkout.sessions.create({
       mode: 'payment',
       line_items: [{ quantity: 1, price_data: { currency: 'usd', unit_amount: Math.round(b.amount * 100),
-        product_data: { name: b.service ? `Deposit: ${b.service} with ${env.BUSINESS_NAME || 'your stylist'}, ${b.slotLabel}` : `Deposit: ${env.BUSINESS_NAME || 'service'} visit ${b.slotLabel}` } } }],
+        product_data: { name: b.service ? `Deposit: ${b.service} with ${env.BUSINESS_NAME || `your ${trade().pro || 'pro'}`}, ${b.slotLabel}` : `Deposit: ${env.BUSINESS_NAME || 'service'} visit ${b.slotLabel}` } } }],
       metadata: { bookingId: b.id }, client_reference_id: b.id,
       expires_at: Math.floor(Date.now() / 1000) + Math.max(cfg().holdMin, 30) * 60, // Stripe min 30 min
       success_url: `${BASE}/?deposit=success`, cancel_url: `${BASE}/?deposit=cancel`,
@@ -163,4 +175,4 @@ function markPaid(id) {
   return { booking: b, changed: true };
 }
 
-module.exports = { cfg, vertical, parseServices, nextSlots, hold, depositLink, markPaid, expireHolds, leadFeeTotals, connectParams };
+module.exports = { cfg, vertical, trade, parseServices, nextSlots, hold, depositLink, markPaid, expireHolds, leadFeeTotals, connectParams };

@@ -1,10 +1,11 @@
 // Shop-owner setup form: normalize + "balance checks". Shared by the browser (/setup-rules.js) and the server
 // (POST /setup, admin apply). Every rule returns { field, level: 'error' | 'warning', message } in plain words.
 // Errors block submit. Warnings need the owner to confirm ("Looks off, are you sure?").
+// Business types come from the trades catalog (src/trades.js, served as /trades.js and loaded before this file).
 (function (root, factory) {
-  if (typeof module === 'object' && module.exports) module.exports = factory();
-  else root.SetupRules = factory();
-}(typeof self !== 'undefined' ? self : this, function () {
+  if (typeof module === 'object' && module.exports) module.exports = factory(require('./trades'));
+  else root.SetupRules = factory(root.BuzzTrades);
+}(typeof self !== 'undefined' ? self : this, function (T) {
   'use strict';
   var US_TIMEZONES = [
     ['America/New_York', 'Eastern (New York, Atlanta, Miami)'],
@@ -58,6 +59,7 @@
     return h + ' hr' + (h === 1 ? '' : 's') + (m ? ' ' + m + ' min' : '');
   }
   function fmtMoney(n) { return '$' + (Number.isInteger(n) ? n : n.toFixed(2)); }
+  // Legacy 3-way picker value (braiders / plumber / hvac).
   function vertical(v) {
     v = str(v).toLowerCase();
     if (/^braid/.test(v)) return 'braiders';
@@ -65,13 +67,24 @@
     if (v === 'hvac') return 'hvac';
     return '';
   }
+  var LEGACY_TYPE = { braiders: 'braiders', plumber: 'plumbing', hvac: 'hvac' };
+  var LEGACY_VERTICAL = { braiders: 'braiders', plumbing: 'plumber', hvac: 'hvac' };
+  // Trade object for normalized values (null if no business type yet).
+  function tradeOf(v) { return v && v.businessType ? T.get(v.businessType, { flow: v.flow, label: v.tradeName }) : null; }
+  // Per-trade form defaults (days, open, close, depositAmount, slotMinutes, services) for the browser prefill.
+  function tradeDefaults(key, flow) {
+    var t = T.get(key, { flow: flow }); if (!t) return null;
+    var h = t.hours.split('-');
+    return { days: t.days.slice(), open: h[0], close: h[1], depositAmount: t.deposit, slotMinutes: t.slotMinutes || DEFAULTS.slotMinutes,
+      services: t.services.map(function (x) { return { name: x.name, minutes: x.minutes }; }), flow: t.flow, serviceWord: t.serviceWord || 'service', label: t.label };
+  }
 
   // Accepts JSON from the page ({ services: [{ name, hours, minutes }] }), form posts (service_name[] ...)
   // or an already-normalized object (idempotent).
   function normalize(raw) {
     raw = raw || {};
     var v = {
-      businessName: str(raw.businessName, 80), city: str(raw.city, 80), vertical: vertical(raw.vertical),
+      businessName: str(raw.businessName, 80), city: str(raw.city, 80), vertical: '', businessType: '', tradeName: '', flow: '',
       ownerPhone: str(raw.ownerPhone, 30), forwardPhone: str(raw.forwardPhone, 30), ringSeconds: num(raw.ringSeconds),
       days: [], open: str(raw.open, 5), close: str(raw.close, 5), tz: str(raw.tz, 40),
       services: [], booking: raw.booking === undefined ? true : bool(raw.booking),
@@ -80,6 +93,13 @@
       bookingLink: str(raw.bookingLink, 300), email: str(raw.email, 254).toLowerCase(), consent: bool(raw.consent),
       confirm: bool(raw.confirm),
     };
+    // Business type: the select (any trade key), else the old 3-way picker (vertical=braiders|plumber|hvac).
+    v.businessType = T.keyOf(str(raw.businessType, 40)) || LEGACY_TYPE[vertical(raw.vertical)] || '';
+    if (v.businessType === 'other') {
+      v.tradeName = str(raw.tradeName, 60);
+      v.flow = T.flowOf(str(raw.flow, 20));
+    } else if (v.businessType) v.flow = T.get(v.businessType).flow;
+    v.vertical = LEGACY_VERTICAL[v.businessType] || '';
     if (v.ringSeconds === null) v.ringSeconds = DEFAULTS.ringSeconds;
     var days = typeof raw.days === 'string' ? raw.days.split(',') : list(raw.days);
     days.forEach(function (d) { var n = Number(String(d).trim()); if (String(d).trim() !== '' && Number.isInteger(n) && n >= 0 && n <= 6 && v.days.indexOf(n) < 0) v.days.push(n); });
@@ -102,13 +122,19 @@
     var v = normalize(raw), out = [];
     var err = function (field, message) { out.push({ field: field, level: 'error', message: message }); };
     var warn = function (field, message) { out.push({ field: field, level: 'warning', message: message }); };
-    var braid = v.vertical === 'braiders';
+    var trade = tradeOf(v), appts = v.flow === 'appointments';
+    var word = (trade && trade.serviceWord) || 'service', words = /s$/.test(word) ? word : word + 's';
+    var example = trade && trade.services.length ? trade.services[0].name : 'Standard appointment';
 
     // Your business
     if (!v.businessName) err('businessName', 'Tell us your business name, the way callers know you.');
     if (!v.city) err('city', 'Add the city and state you work in, like "Atlanta, GA".');
     else if (!hasState(v.city)) warn('city', 'Add your state too, like "' + v.city.replace(/[,\s]+$/, '') + ', GA", so your texts sound local. Is "' + v.city + '" right as is?');
-    if (!v.vertical) err('vertical', 'Pick what kind of business you run: Braider, Plumbing or HVAC.');
+    if (!v.businessType) err('businessType', 'Pick what kind of business you run. If it isn\'t listed, pick "Other" and tell us your trade.');
+    else if (v.businessType === 'other') {
+      if (!v.tradeName) err('tradeName', 'You picked "Other". Tell us what kind of business you run, like "Mobile tailor" or "Piano lessons".');
+      if (!v.flow) err('flow', 'Pick how callers book with you: they pick a service and time, or they describe a job.');
+    }
 
     // Phones
     var owner = phoneE164(v.ownerPhone), fwd = phoneE164(v.forwardPhone);
@@ -139,14 +165,14 @@
     if (!v.tz) err('tz', 'Pick your time zone.');
     else if (!US_TIMEZONES.some(function (z) { return z[0] === v.tz; })) err('tz', 'Pick a US time zone from the list.');
 
-    // Services (braiders)
-    if (braid) {
-      if (!v.services.length) err('services', 'Add at least one style you offer, with about how long it takes.');
-      if (v.services.length > MAX_SERVICES) err('services', 'That\'s a lot of styles. Please keep it to ' + MAX_SERVICES + ' or fewer so the text menu stays short.');
+    // Services (appointments flow: callers pick from this menu)
+    if (appts) {
+      if (!v.services.length) err('services', 'Add at least one ' + word + ' you offer, with about how long it takes.');
+      if (v.services.length > MAX_SERVICES) err('services', 'That\'s a lot of ' + words + '. Please keep it to ' + MAX_SERVICES + ' or fewer so the text menu stays short.');
       var seen = {};
       v.services.forEach(function (s) {
-        var f = 'services.' + s.row, label = s.name || 'This style';
-        if (!s.name) err(f + '.name', 'Give this style a name, like "Knotless braids".');
+        var f = 'services.' + s.row, label = s.name || 'This ' + word;
+        if (!s.name) err(f + '.name', 'Give this ' + word + ' a name, like "' + example + '".');
         else {
           var key = s.name.toLowerCase();
           if (seen[key]) warn(f + '.name', '"' + s.name + '" is on your list twice. Is that on purpose?');
@@ -159,8 +185,8 @@
       });
     }
 
-    // Booking
-    if (v.booking && !braid && v.vertical) {
+    // Booking (jobs flow: fixed-length windows)
+    if (v.booking && v.flow === 'jobs') {
       if (v.slotMinutes === null || isNaN(v.slotMinutes) || v.slotMinutes <= 0) err('slotMinutes', 'Pick how long each appointment window is.');
       else if (win !== null && v.slotMinutes > win) err('slotMinutes', 'Each appointment window is ' + fmtDur(v.slotMinutes) + ', but you\'re only open ' + fmtDur(win) + ' a day, so no times can be offered.');
     }
@@ -180,8 +206,8 @@
       else if (v.holdMinutes > 60) warn('holdMinutes', 'Holding a time for ' + v.holdMinutes + ' minutes keeps it blocked a long while if they never pay. Are you sure?');
     }
 
-    // Booking link (braiders)
-    if (braid && v.bookingLink) {
+    // Booking link (appointments flow)
+    if (appts && v.bookingLink) {
       var ok = false;
       try { var u = new URL(v.bookingLink); ok = u.protocol === 'https:' && /\.[a-z]{2,}$/i.test(u.hostname) && !/\s/.test(v.bookingLink); } catch (e) { ok = false; }
       if (!ok) err('bookingLink', 'Your booking link needs to be a full web address that starts with https://, like https://booksy.com/your-page.');
@@ -206,10 +232,13 @@
 
   // Submission values -> config override (same keys/formats as the env vars booking.js/agent.js/server.js read).
   function toEnv(raw) {
-    var v = normalize(raw), braid = v.vertical === 'braiders', d = braid ? DEFAULTS.braiders : DEFAULTS.home;
+    var v = normalize(raw), trade = tradeOf(v) || T.get('plumbing'), appts = trade.flow === 'appointments', braid = trade.key === 'braiders';
+    var td = tradeDefaults(trade.key, trade.flow), d = { days: td.days, open: td.open, close: td.close, depositAmount: td.depositAmount };
     var e = {
       BUSINESS_NAME: v.businessName, BUSINESS_CITY: v.city,
-      VERTICAL: braid ? 'braiders' : 'home_services', BUSINESS_VERTICAL: braid ? 'braiders' : (v.vertical || 'plumber'),
+      BUSINESS_TYPE: trade.key, BUSINESS_FLOW: trade.flow, BUSINESS_TRADE_LABEL: trade.key === 'other' ? v.tradeName : '',
+      // Legacy keys, kept consistent for older readers: VERTICAL braiders | appointments | home_services.
+      VERTICAL: braid ? 'braiders' : appts ? 'appointments' : 'home_services', BUSINESS_VERTICAL: LEGACY_VERTICAL[trade.key] || trade.key,
       OWNER_PHONE: phoneE164(v.ownerPhone) || '', FORWARD_TO_PHONE: phoneE164(v.forwardPhone) || '',
       RING_TIMEOUT_SECONDS: String(isNaN(v.ringSeconds) ? DEFAULTS.ringSeconds : v.ringSeconds),
       BUSINESS_TZ: v.tz || DEFAULTS.tz,
@@ -220,13 +249,13 @@
       DEPOSIT_ENABLED: v.deposit ? '1' : '0',
       DEPOSIT_AMOUNT: String(v.depositAmount == null || isNaN(v.depositAmount) ? d.depositAmount : v.depositAmount),
       HOLD_MINUTES: String(v.holdMinutes == null || isNaN(v.holdMinutes) ? DEFAULTS.holdMinutes : v.holdMinutes),
-      BOOKING_LINK: braid ? v.bookingLink : '',
+      BOOKING_LINK: appts ? v.bookingLink : '',
     };
-    // SERVICES is "Name:minutes,..." so commas can't live inside a style name.
-    if (braid) e.SERVICES = v.services.filter(function (s) { return s.name && s.minutes > 0; }).map(function (s) { return s.name.replace(/,/g, ' /') + ':' + s.minutes; }).join(',');
-    else e.SLOT_MINUTES = String(v.slotMinutes == null || isNaN(v.slotMinutes) ? DEFAULTS.slotMinutes : v.slotMinutes);
+    // SERVICES is "Name:minutes,..." so commas can't live inside a service name.
+    if (appts) e.SERVICES = v.services.filter(function (s) { return s.name && s.minutes > 0; }).map(function (s) { return s.name.replace(/,/g, ' /') + ':' + s.minutes; }).join(',');
+    else e.SLOT_MINUTES = String(v.slotMinutes == null || isNaN(v.slotMinutes) ? td.slotMinutes : v.slotMinutes);
     return e;
   }
 
-  return { US_TIMEZONES: US_TIMEZONES, DEFAULT_SERVICES: DEFAULT_SERVICES, DEFAULTS: DEFAULTS, normalize: normalize, check: check, validate: validate, toEnv: toEnv, phoneE164: phoneE164, hasState: hasState, fmtDur: fmtDur };
+  return { US_TIMEZONES: US_TIMEZONES, DEFAULT_SERVICES: DEFAULT_SERVICES, DEFAULTS: DEFAULTS, trades: T, tradeOf: tradeOf, tradeDefaults: tradeDefaults, normalize: normalize, check: check, validate: validate, toEnv: toEnv, phoneE164: phoneE164, hasState: hasState, fmtDur: fmtDur };
 }));

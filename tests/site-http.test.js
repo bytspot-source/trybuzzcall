@@ -18,7 +18,7 @@ const LEGAL = {
   'sms-consent': 'How text consent works',
 };
 const PAGES = ['/', '/index.html', ...Object.keys(LEGAL).flatMap((name) => [`/${name}.html`, `/${name}`]), '/setup.html', '/setup'];
-const PUBLIC_PATHS = new Set([...PAGES, '/home.css', '/site.js', '/styles.css', '/setup.css', '/setup.js', '/setup-rules.js']);
+const PUBLIC_PATHS = new Set([...PAGES, '/home.css', '/site.js', '/styles.css', '/setup.css', '/setup.js', '/setup-rules.js', '/trades.js']);
 const REQUEST_MS = 3000;
 
 // Reserve an OS-selected port, then release it immediately before spawning. A
@@ -333,8 +333,8 @@ test('public site over real local HTTP', { timeout: 60000 }, async (t) => {
     assert.equal(Object.hasOwn(waitlist[1], 'businessType'), false, 'Empty segment remains legacy');
   });
 
-  await t.test('both business types persist and duplicates preserve the segment and timestamp', async () => {
-    for (const businessType of ['home_services', 'braiders']) {
+  await t.test('all business types persist and duplicates preserve the segment and timestamp', async () => {
+    for (const businessType of ['home_services', 'braiders', 'other']) {
       const email = `${businessType}@example.com`;
       const response = await site.request('/api/waitlist', { email: ` ${email.toUpperCase()} `, businessType });
       assertResponse(response, 200, /^application\/json$/i, 'segmented signup');
@@ -407,6 +407,7 @@ test('public site over real local HTTP', { timeout: 60000 }, async (t) => {
     assertResponse(response, 200, /^text\/html$/i, '/admin');
     assert.ok(response.body.includes('<li>home_services@example.com · Business type: Home services</li>'));
     assert.ok(response.body.includes('<li>braiders@example.com · Business type: Braiders</li>'));
+    assert.ok(response.body.includes('<li>other@example.com · Business type: Other local business</li>'));
     assert.ok(response.body.includes('<li>other.shop@example.com</li>'));
     assert.ok(response.body.includes('<li>&lt;owner&amp;&quot;tag&gt;@example.com · Business type: Braiders</li>'));
     assert.ok(!response.body.includes(email), 'Raw HTML must not appear in the admin waitlist');

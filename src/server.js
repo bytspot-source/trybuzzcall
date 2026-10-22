@@ -66,7 +66,8 @@ function verifyTwilio(req, res, next) {
   return ok ? next() : res.status(403).send('bad signature');
 }
 
-const missedSay = () => (agent.isBraiders() ? 'Sorry I missed you. I just sent you a text so we can get you booked.' : 'Sorry we missed you. We just texted you and will call back shortly.');
+const missedSay = () => (!agent.isAppointments() ? 'Sorry we missed you. We just texted you and will call back shortly.'
+  : agent.solo() ? 'Sorry I missed you. I just sent you a text so we can get you booked.' : 'Sorry we missed you. We just sent you a text so we can get you booked.');
 
 // When the shop's subscription lapsed (past_due/canceled, see billing.access), callers get one polite generic text
 // (at most once per number per 24h; INACTIVE_MODE=silent sends nothing) and no booking/deposit flow.
@@ -77,7 +78,7 @@ async function inactiveText(phone) {
   if (last && Date.now() - Date.parse(last) < 86400000) return;
   store.db.inactiveTexts[phone] = new Date().toISOString(); store.save();
   const biz = env.BUSINESS_NAME || 'us';
-  const msg = env.INACTIVE_MESSAGE || (agent.isBraiders()
+  const msg = env.INACTIVE_MESSAGE || (agent.isAppointments() && agent.solo()
     ? `Hi, this is ${biz}. Sorry I missed your call! Please try calling again later. Reply STOP to opt out.`
     : `Hi, this is ${biz}. Sorry we missed your call! Please try calling again later. Reply STOP to opt out.`);
   await sendSms(phone, msg);
@@ -160,7 +161,7 @@ async function onPaid(id) {
   const msg = agent.texts.paid(b);
   if (lead.messages) { lead.messages.push({ dir: 'out', body: msg }); store.save(); }
   await sendSms(b.phone, msg);
-  if (b.service) { // braiders: 'BOOKED + PAID: <name>, <service>, <time>, $50 deposit'
+  if (b.service) { // appointment trades: 'BOOKED + PAID: <name>, <service>, <time>, $50 deposit'
     await owner(b.leadId, `BOOKED + PAID: ${b.name}, ${b.service}, ${b.slotLabel}, $${money(b.amount)} deposit${b.details ? `. Notes: ${b.details}` : ''}. tel:${b.phone}`);
   } else await owner(b.leadId, `${tag(lead)}BOOKED + PAID $${b.amount}: ${b.name}, ${b.need}, ${b.slotLabel}, ${feeNote(b)}, tel:${b.phone}`);
   return b;
@@ -176,7 +177,7 @@ app.get('/pay/mock/:id', async (req, res) => {
 });
 
 async function buzzOwner(lead) {
-  const msg = agent.isBraiders()
+  const msg = agent.isAppointments()
     ? `BUZZ ${env.BUSINESS_NAME || ''}: ${lead.name} (${lead.phone}) wants: ${lead.need}. Call back: ${lead.window}. tel:${lead.phone}`
     : `${lead.urgent ? '🚨 URGENT ' : ''}BUZZ ${env.BUSINESS_NAME || ''}: ${lead.name} (${lead.phone}) needs: ${lead.need}. Callback: ${lead.window}. Tap to call: tel:${lead.phone}`;
   store.addAlert({ leadId: lead.id, to: env.OWNER_PHONE, body: msg });
@@ -188,7 +189,7 @@ app.post('/api/waitlist', (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'invalid email' });
   const { businessType } = req.body;
-  if (businessType !== undefined && businessType !== '' && businessType !== 'home_services' && businessType !== 'braiders') {
+  if (businessType !== undefined && businessType !== '' && !store.WAITLIST_TYPES.includes(businessType)) {
     return res.status(400).json({ error: 'invalid business type' });
   }
   store.addWaitlist(email, businessType); res.json({ ok: true });
@@ -258,6 +259,7 @@ app.post('/billing/mock/fail-next', mockOnly, requireAdmin, (req, res) => { try 
 // ---------- Shop-owner setup form ----------
 // GET /setup is public/setup.html (static). The shared balance-check rules are served to the browser from src/.
 app.get('/setup-rules.js', (req, res) => res.type('application/javascript').sendFile(path.join(__dirname, 'setupRules.js')));
+app.get('/trades.js', (req, res) => res.type('application/javascript').sendFile(path.join(__dirname, 'trades.js')));
 // POST /setup (JSON or form). 422 = errors, 409 = warnings not confirmed (send confirm=1), 200 = saved as 'pending'.
 // Never touches the live config: an admin reviews it and clicks 'Apply to this line'.
 const wantsJson = (req) => req.is('application/json') || /application\/json/.test(req.get('accept') || '');
@@ -306,7 +308,7 @@ app.get('/admin', requireAdmin, (req, res) => {
   const lf = booking.leadFeeTotals(), fc = booking.cfg();
   const alerts = store.db.alerts.slice(0, 50).map((a) => `<li>${esc(a.at)} → ${esc(a.to)}: ${esc(a.body)}</li>`).join('');
   const waitlist = store.db.waitlist.map((w) => {
-    const label = w.businessType === 'home_services' ? 'Home services' : w.businessType === 'braiders' ? 'Braiders' : '';
+    const label = { home_services: 'Home services', braiders: 'Braiders', other: 'Other local business' }[w.businessType] || '';
     return `<li>${esc(w.email)}${label ? ` · Business type: ${esc(label)}` : ''}</li>`;
   }).join('');
   res.send(`<!doctype html><meta charset="utf-8"><title>Admin</title><style>body{font-family:sans-serif;margin:2rem}td,th{border:1px solid #ccc;padding:4px 8px}table{border-collapse:collapse}</style>
@@ -318,6 +320,6 @@ ${setupPages.adminSetupsHtml(store.db.setups, config.effective(), config.overrid
 
 setInterval(() => booking.expireHolds(), 60000).unref();
 billing.init({ notify: (msg) => owner(null, msg), BASE });
-app.get('/health', (_, res) => res.json({ ok: true, vertical: booking.cfg().vertical, billing: billing.summary().mode, serviceActive: billing.access().active, twilio: live, openai: !!env.OPENAI_API_KEY, booking: booking.cfg().booking, deposit: booking.cfg().deposit, stripe: !!env.STRIPE_SECRET_KEY, leadFee: booking.cfg().leadFee, leadFeeWaived: booking.cfg().leadFeeWaived, connect: !!booking.cfg().connectAccount }));
+app.get('/health', (_, res) => res.json({ ok: true, vertical: booking.cfg().vertical, trade: booking.cfg().trade, flow: booking.cfg().flow, billing: billing.summary().mode, serviceActive: billing.access().active, twilio: live, openai: !!env.OPENAI_API_KEY, booking: booking.cfg().booking, deposit: booking.cfg().deposit, stripe: !!env.STRIPE_SECRET_KEY, leadFee: booking.cfg().leadFee, leadFeeWaived: booking.cfg().leadFeeWaived, connect: !!booking.cfg().connectAccount }));
 const port = env.PORT || 3000;
-app.listen(port, () => console.log(`missedcall-buzz on :${port} (vertical ${booking.cfg().vertical}, twilio ${live ? 'LIVE' : 'LOG-ONLY'}, ai ${env.OPENAI_API_KEY ? 'openai' : 'templates'})`));
+app.listen(port, () => console.log(`missedcall-buzz on :${port} (vertical ${booking.cfg().vertical}, trade ${booking.cfg().trade}, twilio ${live ? 'LIVE' : 'LOG-ONLY'}, ai ${env.OPENAI_API_KEY ? 'openai' : 'templates'})`));

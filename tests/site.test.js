@@ -657,7 +657,7 @@ test('business select has a visible label, an empty initial choice and only supp
   const label = blocks(html, 'label').find(({ attrs }) => attrs.for === 'waitlist-business');
   assert.ok(label && text(label.content));
   const select = blocks(html, 'select').find(({ attrs }) => attrs.id === 'waitlist-business');
-  assert.deepEqual(tags(select.content, 'option').map(({ attrs }) => attrs.value), ['', 'home_services', 'braiders']);
+  assert.deepEqual(tags(select.content, 'option').map(({ attrs }) => attrs.value), ['', 'home_services', 'braiders', 'other']);
   assert.ok(tags(select.content, 'option').every(({ attrs }) => !Object.hasOwn(attrs, 'selected')));
 });
 
@@ -687,6 +687,41 @@ test('audiences have separate examples and only Home Services offers checkout', 
   for (const { content } of blocks(homePricing.content, 'button')) assert.match(text(content), /Home Services/);
   assert.doesNotMatch(text(html), /Weekly recap|1–5 trucks/);
   assert.match(text(html), /not a live sync/);
+});
+
+test('positioning: any appointment-based local business, home services then braiders featured, plus an Also built for grid', () => {
+  const all = text(html);
+  assert.match(text(blocks(html, 'title')[0].content), /local businesses that book by phone/i);
+  const meta = (name) => tags(html, 'meta').find(({ attrs }) => attrs.name === name || attrs.property === name).attrs.content;
+  for (const m of ['description', 'og:description', 'twitter:description']) {
+    assert.match(meta(m), /any appointment-based local business/i, m);
+    assert.match(meta(m), /home services/i, m);
+    assert.match(meta(m), /braiders/i, m);
+  }
+  assert.match(all, /Built in Atlanta/);
+  assert.ok(html.indexOf('id="home-services"') < html.indexOf('id="braiders"'), 'Home Services card comes first');
+  assert.ok(html.indexOf('id="braiders"') < html.indexOf('id="also-built-for"'), 'Also built for sits below the featured cards');
+  assert.equal(byId('also-built-for').tag, 'section');
+  assert.equal(byId(byId('also-built-for').attrs['aria-labelledby']).tag, 'h3');
+  const start = html.indexOf('id="also-built-for"');
+  const also = { content: html.slice(start, html.indexOf('</section>', start)) }; // nested section: slice to its own end
+  const trades = blocks(also.content, 'li').map(({ content }) => text(content));
+  assert.ok(trades.length >= 12, `at least 12 trades, got ${trades.length}`);
+  for (const t of ['Nail techs', 'Lash &amp; brow artists', 'Barbers', 'House cleaners', 'Handymen', 'Pet groomers', 'Mobile detailers', 'Tutors', 'Photographers', 'Caterers &amp; home bakers', 'Electricians', 'Landscapers']) {
+    assert.ok(trades.some((x) => x.includes(t)), t);
+  }
+  assert.ok(tags(also.content, 'a').some(({ attrs }) => attrs['data-audience'] === 'other'));
+  assert.doesNotMatch(all, /Two focused pilots|two focused pilots|aren't part of this initial offer/);
+  const faq = blocks(html, 'details').map(({ content }) => text(content)).find((x) => /Who is it for\?/.test(x));
+  assert.ok(faq, 'FAQ: Who is it for?');
+  assert.match(faq, /Any appointment-based local business/);
+  assert.match(faq, /featured/);
+  const other = byId('other-trades-pricing');
+  assert.ok(other);
+  const otherText = text(blocks(html, 'p').find(({ attrs }) => attrs.id === 'other-trades-pricing').content);
+  assert.match(otherText, /from \$49\/month/);
+  assert.match(otherText, /first 10 founding/);
+  assert.match(otherText, /confirmed before activation/);
 });
 
 test('noscript offers usable email and phone contact fallbacks', () => {

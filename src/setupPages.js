@@ -3,7 +3,13 @@ const rules = require('./setupRules');
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const DAY = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-const VERT = { braiders: 'Braider', plumber: 'Plumbing', hvac: 'HVAC' };
+const FLOW = { appointments: 'clients pick a service and time', jobs: 'customers describe a job' };
+// "Nail tech / nail salon", or "Other: Piano lessons (clients pick a service and time)".
+function tradeText(v) {
+  const t = rules.tradeOf(v);
+  if (!t) return v.vertical || '(no business type)';
+  return t.key === 'other' ? `Other: ${v.tradeName || '(no trade name)'} (${FLOW[v.flow] || 'no booking style picked'})` : `${t.label} (${FLOW[t.flow]})`;
+}
 
 function shell(title, body) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -39,13 +45,14 @@ function confirmHtml(warnings, body) {
 }
 
 function summary(v) {
-  const svc = v.vertical === 'braiders' ? (v.services || []).map((s) => `${esc(s.name)} (${esc(rules.fmtDur(s.minutes))})`).join(', ') : '';
+  const appts = v.flow === 'appointments';
+  const svc = appts ? (v.services || []).map((s) => `${esc(s.name)} (${esc(rules.fmtDur(s.minutes))})`).join(', ') : '';
   return `<dl class="kv">
-<dt>Business</dt><dd>${esc(v.businessName)} · ${esc(v.city)} · ${esc(VERT[v.vertical] || v.vertical)}</dd>
+<dt>Business</dt><dd>${esc(v.businessName)} · ${esc(v.city)} · ${esc(tradeText(v))}</dd>
 <dt>Phones</dt><dd>alert ${esc(v.ownerPhone)} · ring first ${esc(v.forwardPhone || '(none)')}${v.forwardPhone ? ` for ${esc(v.ringSeconds)}s` : ''}</dd>
 <dt>Hours</dt><dd>${esc((v.days || []).map((d) => DAY[d]).join(', '))} ${esc(v.open)}-${esc(v.close)} (${esc(v.tz)})</dd>
 ${svc ? `<dt>Services</dt><dd>${svc}</dd>` : ''}
-<dt>Booking</dt><dd>${v.booking ? `offer times${v.vertical !== 'braiders' ? `, ${esc(v.slotMinutes)} min windows` : ''}, ${esc(v.leadMinutes)} min notice` : 'callback only'}</dd>
+<dt>Booking</dt><dd>${v.booking ? `offer times${v.flow === 'jobs' ? `, ${esc(v.slotMinutes)} min windows` : ''}, ${esc(v.leadMinutes)} min notice` : 'callback only'}</dd>
 <dt>Deposit</dt><dd>${v.deposit ? `$${esc(v.depositAmount)}, hold ${esc(v.holdMinutes)} min` : 'off'}</dd>
 ${v.bookingLink ? `<dt>Link</dt><dd>${esc(v.bookingLink)}</dd>` : ''}
 <dt>Contact</dt><dd>${esc(v.email)}${v.consent ? ' · agreed to Terms/SMS consent' : ''}</dd></dl>`;
@@ -67,7 +74,7 @@ ${summary(s.values)}${issues.length ? `<p><b>Issues (${issues.length}):</b></p>$
   return `<h1 id="setups">Shop setups (${(setups || []).length})</h1><style>.setup-row{border:1px solid #ccc;padding:.5rem 1rem;margin:.5rem 0}.kv{display:grid;grid-template-columns:auto 1fr;gap:.2rem 1rem;margin:.3rem 0}.kv dt{font-weight:bold}.kv dd{margin:0}.issue-error{color:#a22b22}.issue-warning{color:#8a5a00}</style>
 ${rows || '<p>No setups submitted yet.</p>'}
 <h2>Current effective config</h2>${ov}
-<p>Running as: <b>${esc(cfg.vertical)}</b> · ${esc(days)} ${esc(hm(cfg.open))}-${esc(hm(cfg.close))} · booking ${cfg.booking ? 'on' : 'off'} · deposit ${cfg.deposit ? `$${esc(cfg.amount)} (hold ${esc(cfg.holdMin)} min)` : 'off'}${cfg.braiders ? ` · services ${esc(cfg.services.map((s) => `${s.name} ${s.minutes}m`).join(', '))}` : ` · ${esc(cfg.slotMin)} min slots`}</p>
+<p>Running as: <b>${esc(cfg.tradeLabel || cfg.vertical)}</b> (${esc(cfg.trade)}, ${esc(cfg.flow)} flow) · ${esc(days)} ${esc(hm(cfg.open))}-${esc(hm(cfg.close))} · booking ${cfg.booking ? 'on' : 'off'} · deposit ${cfg.deposit ? `$${esc(cfg.amount)} (hold ${esc(cfg.holdMin)} min)` : 'off'}${cfg.appointments ? ` · services ${esc(cfg.services.map((s) => `${s.name} ${s.minutes}m`).join(', '))}` : ` · ${esc(cfg.slotMin)} min slots`}</p>
 <table><tr><th>Key</th><th>Value</th><th>Source (override &gt; env &gt; default)</th></tr>${conf}</table>`;
 }
 

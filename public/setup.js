@@ -14,7 +14,7 @@
   function val(id) { var el = document.getElementById(id); return el ? el.value : ''; }
   function collect() {
     return {
-      businessName: val('businessName'), city: val('city'), vertical: radio('vertical'),
+      businessName: val('businessName'), city: val('city'), businessType: val('businessType'), tradeName: val('tradeName'), flow: radio('flow'),
       ownerPhone: val('ownerPhone'), forwardPhone: val('forwardPhone'), ringSeconds: val('ringSeconds'),
       days: $$('input[name="days"]:checked', form).map(function (x) { return x.value; }),
       open: val('open'), close: val('close'), tz: val('tz'),
@@ -27,22 +27,41 @@
     };
   }
 
-  // ---- conditional sections ----
+  // ---- conditional sections (by business type -> flow: appointments shows services, jobs shows window length) ----
+  function cap(x) { return x.charAt(0).toUpperCase() + x.slice(1); }
+  function current() {
+    var key = val('businessType'), t = key ? R.trades.get(key, { flow: radio('flow'), label: val('tradeName') }) : null;
+    return { key: key, trade: t, flow: !t ? '' : key === 'other' ? (radio('flow') || '') : t.flow };
+  }
   function sync() {
-    var v = radio('vertical'), braid = v === 'braiders', home = v === 'plumber' || v === 'hvac';
-    $$('[data-show="braiders"]').forEach(function (el) { el.hidden = !braid; });
-    $$('[data-show="home"]').forEach(function (el) { el.hidden = !home; });
+    var c = current(), word = (c.trade && c.trade.serviceWord) || 'service';
+    $$('[data-show="appointments"]').forEach(function (el) { el.hidden = c.flow !== 'appointments'; });
+    $$('[data-show="jobs"]').forEach(function (el) { el.hidden = c.flow !== 'jobs'; });
+    $$('[data-show="other"]').forEach(function (el) { el.hidden = c.key !== 'other'; });
     $$('[data-show-booking]').forEach(function (el) { el.hidden = radio('booking') === 'callback'; });
     $$('[data-show-deposit]').forEach(function (el) { el.hidden = !$('#deposit').checked; });
+    $$('[data-word]', form).forEach(function (el) { el.textContent = word; });
+    $$('[data-word-cap]', form).forEach(function (el) { el.textContent = cap(word); });
+    $$('.row-remove', rows).forEach(function (b) { b.setAttribute('aria-label', 'Remove this ' + word); });
+    addBtn.textContent = '+ Add another ' + word;
+    $('#services-tag').textContent = c.trade ? (c.key === 'other' ? (val('tradeName') || 'Your menu') : c.trade.short) : 'Your menu';
     var n = 0; $$('.setup-card legend .step-no', form).forEach(function (s) { if (!s.closest('fieldset').hidden) s.textContent = ++n; });
     addBtn.hidden = false;
   }
-  function applyDefaults(v) {
-    var d = v === 'braiders' ? R.DEFAULTS.braiders : R.DEFAULTS.home;
+  function servicesEdited() { return touched.services || Object.keys(dirty).some(function (k) { return /^services/.test(k); }); }
+  // Picking a trade prefills its usual days, hours, deposit, window length and service menu, unless the owner already edited them.
+  function applyDefaults() {
+    var c = current(); if (!c.trade) return;
+    var d = R.tradeDefaults(c.key, c.flow || 'appointments'); if (!d) return;
     if (!dirty.days) $$('input[name="days"]', form).forEach(function (x) { x.checked = d.days.indexOf(Number(x.value)) >= 0; });
     if (!dirty.open) $('#open').value = d.open;
     if (!dirty.close) $('#close').value = d.close;
     if (!dirty.depositAmount) $('#depositAmount').value = d.depositAmount;
+    if (!dirty.slotMinutes && $('#slotMinutes option[value="' + d.slotMinutes + '"]')) $('#slotMinutes').value = String(d.slotMinutes);
+    if (c.flow === 'appointments' && !servicesEdited()) {
+      rows.innerHTML = ''; nextRow = 0;
+      (d.services.length ? d.services : [{ name: '', minutes: 0 }]).forEach(function (x) { addRow(x.name, x.minutes); });
+    }
   }
 
   // ---- services rows ----
@@ -50,16 +69,18 @@
     var i = nextRow++, h = minutes ? Math.floor(minutes / 60) : '', m = minutes ? minutes % 60 : 0;
     var el = document.createElement('div');
     el.className = 'service-row'; el.dataset.row = i; el.dataset.field = 'services.' + i;
-    el.innerHTML = '<div class="field" data-field="services.' + i + '.name"><label for="svc-name-' + i + '">Style</label><input id="svc-name-' + i + '" name="service_name" maxlength="60" placeholder="e.g. Goddess locs"></div>'
+    el.innerHTML = '<div class="field" data-field="services.' + i + '.name"><label for="svc-name-' + i + '" data-word-cap>Service</label><input id="svc-name-' + i + '" name="service_name" maxlength="60"></div>'
       + '<div class="field svc-dur" data-field="services.' + i + '.duration"><span class="label" id="svc-dur-' + i + '">How long?</span><div class="dur"><input id="svc-h-' + i + '" name="service_hours" type="number" inputmode="numeric" min="0" max="16" aria-labelledby="svc-dur-' + i + ' svc-hl-' + i + '"><span id="svc-hl-' + i + '">hr</span><select name="service_minutes" aria-label="minutes"><option value="0">0</option><option value="15">15</option><option value="30">30</option><option value="45">45</option></select><span>min</span></div></div>'
-      + '<button type="button" class="row-remove" aria-label="Remove this style">×</button>';
+      + '<button type="button" class="row-remove" aria-label="Remove this service">×</button>';
+    var t = current().trade, ex = t && t.services[0] ? t.services[0].name : 'Standard appointment';
     $('input[name="service_name"]', el).value = name || '';
+    $('input[name="service_name"]', el).placeholder = 'e.g. ' + ex;
     $('input[name="service_hours"]', el).value = h;
     $('select[name="service_minutes"]', el).value = String(m - (m % 15));
     rows.appendChild(el);
     return el;
   }
-  addBtn.addEventListener('click', function () { var el = addRow(); $('input', el).focus(); check(); });
+  addBtn.addEventListener('click', function () { var el = addRow(); touched.services = true; $('input', el).focus(); check(); });
   rows.addEventListener('click', function (e) {
     var b = e.target.closest('.row-remove'); if (!b) return;
     var row = b.closest('.service-row'), next = row.nextElementSibling || row.previousElementSibling;
@@ -162,15 +183,21 @@
   form.addEventListener('input', function (e) { var f = e.target.closest('[data-field]'); if (f) dirty[f.dataset.field] = true; check(); });
   form.addEventListener('change', function (e) {
     var f = e.target.closest('[data-field]'); if (f) { touched[f.dataset.field] = true; dirty[f.dataset.field] = true; }
-    if (e.target.name === 'vertical') applyDefaults(e.target.value);
+    if (e.target.name === 'businessType' || e.target.name === 'flow') applyDefaults();
     check();
   });
   form.addEventListener('focusout', function (e) { var f = e.target.closest('[data-field]'); if (f && e.target.value) touched[f.dataset.field] = true; check(); });
 
-  // Optional prefill from the link (?businessName=...&vertical=braiders), and ?check=1 to show checks right away.
+  // Optional prefill from the link (?businessName=...&businessType=nails, or the old ?vertical=braiders), and ?check=1.
   var q = new URLSearchParams(location.search);
+  var LEGACY = { braiders: 'braiders', plumber: 'plumbing', hvac: 'hvac' };
   q.forEach(function (value, key) {
-    if (key === 'vertical' || key === 'booking') { var r = $('input[name="' + key + '"][value="' + CSS.escape(value) + '"]', form); if (r) { r.checked = true; if (key === 'vertical') applyDefaults(value); } return; }
+    if (key === 'vertical' || key === 'businessType') {
+      var k = R.trades.keyOf(LEGACY[value] || value), sel = $('#businessType');
+      if (k && $('option[value="' + k + '"]', sel)) { sel.value = k; applyDefaults(); }
+      return;
+    }
+    if (key === 'booking' || key === 'flow') { var r = $('input[name="' + key + '"][value="' + CSS.escape(value) + '"]', form); if (r) { r.checked = true; if (key === 'flow') applyDefaults(); } return; }
     if (key === 'days') { var ds = value.split(','); $$('input[name="days"]', form).forEach(function (x) { x.checked = ds.indexOf(x.value) >= 0; }); dirty.days = true; return; }
     if (key === 'deposit' || key === 'consent') { $('#' + key).checked = /^(1|true|on|yes)$/i.test(value); return; }
     var el = document.getElementById(key);

@@ -99,6 +99,20 @@ h1 { margin-top: 1.5rem; font-size: clamp(3.2rem, 5.8vw, 5rem); line-height: 1.0
 .audience-card > .audience-boundary { font-size: .875rem; }
 .audience-actions { margin-top: auto; padding-top: 1.5rem; display: flex; flex-direction: column; align-items: flex-start; gap: .4rem; }
 .audience-actions .button { max-width: 100%; text-align: left; }
+.also-built { margin-top: 1.5rem; padding: 2rem; background: #fff; border: 1px solid #dce1d6; border-radius: 1rem; display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); gap: 1.5rem 2.5rem; align-items: start; }
+.also-head > .eyebrow { color: var(--green); margin-bottom: .8rem; }
+.also-head h3 { font-size: 1.6rem; letter-spacing: -.04em; line-height: 1.2; overflow-wrap: anywhere; }
+.also-head > p:not(.eyebrow) { font-size: .9rem; line-height: 1.8; color: var(--muted); margin-top: .8rem; }
+.also-head strong { color: var(--ink); font-weight: 650; }
+.trade-grid { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .6rem; }
+.trade-grid li { min-width: 0; padding: .7rem .85rem; border: 1px solid var(--line); border-radius: .65rem; background: var(--paper); }
+.trade-name { display: block; font-weight: 700; font-size: .9rem; line-height: 1.35; overflow-wrap: anywhere; }
+.trade-flow { display: block; color: var(--muted); font-size: .8125rem; line-height: 1.5; margin-top: .15rem; }
+.also-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: .5rem 1.4rem; padding-top: 1.2rem; border-top: 1px solid var(--line); }
+.also-more { flex: 1 1 18rem; color: var(--muted); font-size: .875rem; line-height: 1.7; }
+.pricing-other { margin-top: 1.5rem; padding: 1.1rem 1.3rem; border: 1px solid var(--line); border-left: 4px solid var(--yellow); border-radius: .65rem; background: #fff; font-size: .9rem; line-height: 1.75; color: var(--muted); }
+.pricing-other strong { color: var(--ink); }
+.pricing-other a { color: var(--ink); font-weight: 650; white-space: nowrap; }
 .audience-fit-note { font-size: .875rem; color: var(--muted); margin-top: 1.5rem; max-width: 55rem; }
 .demo { min-width: 0; }
 .demo-stage { position: relative; isolation: isolate; background: #eeeee3; border: 1px solid #e4e5d9; border-radius: 1.5rem; padding: 1.5rem 1.6rem 4.2rem; }
@@ -277,6 +291,7 @@ h3 { font-size: 1.1rem; line-height: 1.35; letter-spacing: -.025em; }
   .hero { padding-top: 2.5rem; }
   .hero-grid { grid-template-columns: 1fr; gap: 2.5rem; }
   .audience-grid { grid-template-columns: 1fr; }
+  .also-built { grid-template-columns: 1fr; }
   .audience-overview { max-width: 35rem; }
   .audience-preview strong { font-size: 1.45rem; }
   .hero-copy { max-width: 35rem; }
@@ -313,7 +328,11 @@ h3 { font-size: 1.1rem; line-height: 1.35; letter-spacing: -.025em; }
   h1 { font-size: clamp(2.8rem, 11vw, 3.6rem); }
   .eyebrow { font-size: .8125rem; letter-spacing: .09em; }
   .hero-description { font-size: 1rem; }
-  .audience-overview, .audience-card { padding: 1.25rem; }
+  .audience-overview, .audience-card, .also-built { padding: 1.25rem; }
+  .trade-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .5rem; }
+  .trade-grid li { padding: .6rem .7rem; }
+  .also-head h3 { font-size: 1.4rem; }
+  .also-actions .button { width: 100%; justify-content: space-between; }
   .audience-preview { padding: 1rem; gap: .7rem; flex-wrap: wrap; }
   .audience-preview > .icon { display: none; }
   .audience-preview strong { font-size: 1.25rem; }
