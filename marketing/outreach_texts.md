@@ -9,7 +9,7 @@
 >
 > **Who to target (internal only):** Georgia plumbing + HVAC shops with **1–5 trucks** that run on phone, paper, or a calendar, not a field-service software platform. Ask "How do you schedule jobs right now?" If they're already on a full field-service platform, they likely aren't a fit. **Never name competitors to prospects.**
 >
-> **Placeholders:** `{first}` owner first name · `{shop}` business name · `{city}` their town · `{you}` your name · `[Your phone]` · `hello@trybuzzcall.com` · `[booking link]` · `[refund policy]`.
+> **Placeholders:** `{first}` owner first name · `{shop}` business name · `{city}` their town · `{you}` your name · `(470) 482-8177` · `hello@trybuzzcall.com` · `[booking link]` · `[refund policy]`.
 > **Proof placeholders** stay in brackets until we have real numbers. Do **not** fill with guesses: `[X calls caught]`, `[X jobs booked]`, `[$X deposits collected]`, `[X pilot shops]`, `[testimonial: name, shop, city]`.
 >
 > **Compliance:** Every text carries opt-out wording ("Reply STOP to opt out"). Only text numbers you have a lawful basis to text (TCPA, A2P 10DLC). For pure cold outreach, calling, walking in, or emailing first is safer than texting. Honor STOP right away and log it.
@@ -73,7 +73,7 @@
 >
 > Thanks,
 > {you}
-> TryBuzzCall · [Your phone] · hello@trybuzzcall.com · trybuzzcall.com
+> TryBuzzCall · (470) 482-8177 · hello@trybuzzcall.com · trybuzzcall.com
 >
 > *Not interested? Reply "no thanks" and I won't email again.*
 
@@ -105,7 +105,7 @@
 **Close**
 > "Want me to set it up this week? I just need your cell and your usual hours."
 
-**If it's a walk-in:** leave the pitch sheet with [Your phone] and hello@trybuzzcall.com filled in. Write the owner's name on top if you got it.
+**If it's a walk-in:** leave the pitch sheet with (470) 482-8177 and hello@trybuzzcall.com filled in. Write the owner's name on top if you got it.
 
 ---
 
