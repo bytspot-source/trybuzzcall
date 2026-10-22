@@ -1,6 +1,6 @@
 # BuzzCall (TryBuzzCall) — MVP
 
-When a customer call is missed, we text the caller back, collect **name / need / callback window**, then **buzz the owner by SMS** with who/what and a tap-to-call link. Built for Georgia plumbers and HVAC shops, and (with `VERTICAL=braiders`) Atlanta hair braiders. It does not do spam filtering.
+When a customer call is missed, we text the caller back, collect **name / need / callback window**, then **buzz the owner by SMS** with who/what and a tap-to-call link. Built for plumbers and HVAC shops, and (with `VERTICAL=braiders`) hair braiders, in any US state. It does not do spam filtering.
 
 ## Stack
 Node 20 + Express. Leads are stored in a JSON file (`data/db.json`), with no native dependencies. Uses the Twilio SDK, optional OpenAI (via fetch), and the Stripe SDK.
