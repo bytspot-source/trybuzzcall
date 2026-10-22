@@ -679,7 +679,11 @@ test('audiences have separate examples and only Home Services offers checkout', 
   assert.equal(tags(braiderPricing.content, 'button').length, 0);
   assert.match(text(braiderPricing.content), /Home Services rates do not automatically apply/);
   assert.match(text(braiderPricing.content), /No card or payment/);
-  assert.doesNotMatch(text(braiderPricing.content), /\$\d/);
+  assert.match(text(braiderPricing.content), /\$49\s*\/\s*month/);
+  assert.match(text(braiderPricing.content), /First 10 founding studios: \$99 setup waived/);
+  assert.match(text(braiderPricing.content), /Typically \$50, set by your studio/);
+  assert.match(text(braiderPricing.content), /confirmed before activation/);
+  assert.match(text(braiderPricing.content), /estimate/i);
   for (const { content } of blocks(homePricing.content, 'button')) assert.match(text(content), /Home Services/);
   assert.doesNotMatch(text(html), /Weekly recap|1–5 trucks/);
   assert.match(text(html), /not a live sync/);
