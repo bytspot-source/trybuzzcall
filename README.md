@@ -1,24 +1,39 @@
 # BuzzCall (TryBuzzCall) — MVP
 
-When a customer call is missed, we text the caller back, collect **name / need / callback window**, then **buzz the owner by SMS** with who/what and a tap-to-call link. Built for Georgia plumbers and HVAC shops, and (with `VERTICAL=braiders`) Atlanta hair braiders. It does not do spam filtering.
+BuzzCall helps Georgia plumbers and HVAC shops (**Home Services**) and, with `VERTICAL=braiders`, Atlanta hair braiders (**Braiders**) handle missed calls and bookings. **A missed call is not SMS consent. SMS_ENABLED defaults off.** Automatic text-back is available only for a recipient with a recorded, active `customer_service` grant for the configured business and sender. Owner texts separately require an `owner_alerts` grant. It does not do spam filtering.
+
+## SMS permission and launch boundary
+This branch documents a conservative recorded-permission implementation, **not a compliance certification or carrier approval**. Verify the implementation and deployed version against [SMS Operations](docs/SMS_OPERATIONS.md) and the [Pilot Checklist](docs/PILOT_CHECKLIST.md) before enabling live SMS. The public [consent page](public/sms-consent.html), [SMS Terms](public/terms.html#sms), and [Privacy Policy](public/privacy.html) remain legal drafts pending counsel review.
+
+- Obtain and retain actual written opt-in evidence outside the application in secured storage. An authenticated operator records the recipient, purpose, consent timestamp, disclosure version, and a non-secret evidence reference; the reference alone is not proof of consent.
+- Grants are scoped to one stable `SMS_CONSENT_BUSINESS_ID`, the configured E.164 `TWILIO_PHONE_NUMBER`, and either `customer_service` or `owner_alerts`. Do not transfer consent between businesses or senders. Review changed identities before collecting new permission.
+- **No automatic grants** from missed calls, inbound messages, START, payments, waitlist signup, or merely providing a number. Do not send an unsolicited SMS to request initial opt-in. Twilio permits a limited response to an inbound message within its scope; this application deliberately requires recorded written permission even for that exchange and does not infer recurring consent.
+- Every application SMS uses the central permission gate, including booking/deposit confirmations, owner alerts, billing reminders, HELP replies, and inactive-service messages. The feature descriptions below are conditional on that gate; a booking or payment does not guarantee a text. Provider-generated opt-out/help replies are separate.
+- STOP keywords and natural-language requests revoke **all purposes** locally. START only clears a delivery block; it never restores grants. UNSTOP and YES have the same limited behavior. After opt-out, obtain fresh evidence and record a fresh grant. If Twilio has blocked delivery, the recipient must explicitly opt back in with the provider first; operators must not bypass that block.
+- Voice fallback must not claim that a text was sent; it advises the caller to call again. Automatic text-back is only for an already permissioned recipient. Customers may use the business's phone service without agreeing to SMS; consent is not a condition of purchase.
+- Messages are nonmarketing. Message frequency varies; message and data rates may apply. Reply STOP to opt out or HELP for help.
+
+### Official sources versus application safeguards
+The following official sources describe provider requirements, not approval of BuzzCall or any particular customer. Legal, customer-identity, campaign, sender, and evidence review remain external launch prerequisites.
+
+- [Twilio Messaging Policy](https://www.twilio.com/en-us/legal/messaging-policy) (April 13, 2026 version): prior express consent and proof; written consent for downstream software customers; inbound SMS permits a scoped exchange, not general recurring messages; consent cannot be transferred.
+- [A2P 10DLC ISV onboarding](https://www.twilio.com/docs/messaging/compliance/a2p-10dlc/onboarding-isv): register the actual customer identities, not every shop under a blanket platform brand.
+- [A2P 10DLC quickstart](https://www.twilio.com/docs/messaging/compliance/a2p-10dlc/quickstart): verify the campaign and associate its sending number; do not solicit initial opt-in by unsolicited SMS.
+- [Advanced Opt-Out](https://www.twilio.com/docs/messaging/tutorials/advanced-opt-out): standard keyword filtering is distinct from Advanced Opt-Out, which is disabled by default. When Twilio sends `OptOutType` START, STOP, or HELP, the provider has already replied; the application must not duplicate that reply.
 
 ## Stack
-Node 20 + Express. Leads are stored in a JSON file (`data/db.json`), with no native dependencies. Uses the Twilio SDK, optional OpenAI (via fetch), and the Stripe SDK.
+Node 20 + Express. Leads, bookings, and consent records use a JSON store under `DATA_DIR` (default `data/db.json`), with no native dependencies. Uses the Twilio SDK, optional OpenAI (via fetch), and the Stripe SDK. Protect the data directory and logs; on Render, use a persistent disk for `DATA_DIR` and verify grants and revocations survive a restart.
 
-```
-Caller ──call──▶ Twilio number ──POST /twilio/voice──▶ <Dial FORWARD_TO_PHONE>
-                                   │ no-answer/busy ──▶ POST /twilio/voice/status
-                                   ▼
-                       text-back SMS to caller (agent.firstMessage)
-Caller ──SMS──▶ POST /twilio/sms ──▶ agent.handleReply (name → need → window)
-                                   └─ when complete ──▶ BUZZ SMS to OWNER_PHONE
-```
+1. Twilio sends a validated call webhook to `/twilio/voice` and forwards the call when configured.
+2. On a missed call, `/twilio/voice/status` may start text-back **only after the central gate permits `customer_service`**. Otherwise there is no automatic SMS.
+3. Validated inbound SMS reaches `/twilio/sms`; incoming content does not itself grant permission. Permitted conversations collect name, need, and callback window or booking choice.
+4. Owner notifications separately pass the gate for `owner_alerts`; being the owner or setting `OWNER_PHONE` does not grant permission.
 
 ### Optional booking + deposit
-With `BOOKING_ENABLED=1`, after the *need* step the caller gets the 3 next open slots (from `BUSINESS_HOURS`, `BUSINESS_DAYS`, `SLOT_MINUTES`, `BUSINESS_TZ`) and replies `1`/`2`/`3`, or `callback` to fall back to the classic callback-window flow.
+All texts in this flow require the recipient's active grant and pass the central gate, including messages triggered by a later payment. With `BOOKING_ENABLED=1`, after the *need* step a permissioned caller can receive the 3 next open slots (from `BUSINESS_HOURS`, `BUSINESS_DAYS`, `SLOT_MINUTES`, `BUSINESS_TZ`) and replies `1`/`2`/`3`, or `callback` to fall back to the classic callback-window flow.
 - **No deposit** (`DEPOSIT_ENABLED` off): the slot is booked at once, the caller gets a confirmation, and the owner gets `BOOKED (no deposit)`.
 - **Deposit** (`DEPOSIT_ENABLED=1`, `DEPOSIT_AMOUNT` default 49): the slot is *held* for `HOLD_MINUTES` and the caller gets a pay link. The owner gets `slot held, deposit pending`.
-  - With `STRIPE_SECRET_KEY`, the link is a Stripe Checkout Session (mode `payment`, `metadata.bookingId`). Point a Stripe webhook at `{PUBLIC_BASE_URL}/stripe/webhook` (event `checkout.session.completed`). When `STRIPE_WEBHOOK_SECRET` is set, signatures are verified; if it is unset, the JSON is trusted (dev only).
+  - With `STRIPE_SECRET_KEY`, the link is a Stripe Checkout Session (mode `payment`, `metadata.bookingId`). Point a Stripe webhook at `{PUBLIC_BASE_URL}/stripe/webhook` (event `checkout.session.completed`). `STRIPE_WEBHOOK_SECRET` and a valid signature are mandatory; unsigned events are rejected. Only a verified event with `payment_status=paid` confirms the deposit. Local simulations use the explicit mock routes, not unsigned webhooks.
   - Without a key, the link is `{PUBLIC_BASE_URL}/pay/mock/:id`, and visiting it marks the deposit paid.
   - On payment the booking becomes `confirmed`, the caller gets a confirmation text, and the owner gets `BOOKED + PAID $49: name, need, slot, lead fee $12, tel:…`.
 - **Per-paid-lead fee** (`LEAD_FEE`, default 12 USD): charged to the shop only when a caller books *and* pays the deposit. Recorded on the booking as `lead_fee` + `lead_fee_status` when it is marked paid:
@@ -38,36 +53,33 @@ Files: `src/server.js` (routes), `src/billing.js` (shop subscription billing), `
   - Preferred day understands `today`, `tomorrow`, weekday names, `10/24`, `Oct 24`. Anything else (like `soonest`) means the earliest opening. If that day is full, the caller gets the closest openings after it.
   - `BOOKING_LINK` (optional): the stylist's own Booksy/StyleSeat/GlossGenius link, added to the time-offer and callback texts.
   - Owner texts: `BUZZ …: time held, deposit pending …`, then `BOOKED + PAID: <name>, <service>, <time>, $50 deposit. Notes: <size/length>. tel:…`.
-  - Demo: `bash scripts/demo_braiders.sh`. If nothing is listening on `PORT` (default 3000), it starts a temporary braider server with Twilio/Stripe blanked, runs a booking + mock deposit and a callback, prints the SMS log, and stops the server. Only run one server against `data/` at a time.
+  - Legacy demo: `bash scripts/demo_braiders.sh` attempts a booking + mock deposit and callback using a temporary server if needed. It has not been established as compatible with the new webhook and consent requirements; do not expect SMS or the old transcript without manual permission setup or a later script update. Only run one server against a data directory at a time.
 
-## Run locally (demo, no keys needed)
-```bash
-cp .env.example .env
-npm install
-npm start                      # http://localhost:3000
-bash scripts/demo_simulate.sh  # in a second terminal: booking + mock deposit, then the classic callback path
-bash scripts/demo_billing.sh   # shop subscription lifecycle (mock Stripe; own temp server on :3077)
-bash scripts/demo_braiders.sh  # braider flow (stop the server above first, or it will refuse if that server isn't VERTICAL=braiders)
-```
-SMS output goes to the console and `data/sms.log`. Admin page: http://localhost:3000/admin (any username, password `ADMIN_PASSWORD`).
+## Run locally (SMS off by default)
+Install declared dependencies with `npm install`, configure local settings from `.env.example`, and run `npm start` for http://localhost:3000. Admin page: http://localhost:3000/admin (Basic authentication using `ADMIN_PASSWORD`; keep credentials out of URLs, examples, and logs).
+
+Unsigned **local-only** Twilio simulations require `ALLOW_UNSIGNED_TWILIO_WEBHOOKS=1`, no live credentials, and `NODE_ENV` other than `production`. This exception never authorizes an unsigned live Twilio request. `SKIP_TWILIO_VALIDATION` no longer bypasses live validation. Do not expose an unsigned-demo server through a public tunnel.
+
+Legacy scripts `scripts/demo_simulate.sh`, `scripts/demo_billing.sh`, and `scripts/demo_braiders.sh` may need manual consent setup or later updates. They no longer text by default, and their previous booking/SMS transcripts are not guaranteed. To exercise SMS locally, use isolated test data, an explicit local configuration, and the authenticated consent workflow in [SMS Operations](docs/SMS_OPERATIONS.md). Log-only SMS still passes the permission gate. Protect `DATA_DIR` and its SMS logs; do not treat a log entry as live delivery or carrier approval.
 
 ## Env vars
-See `.env.example`. Key ones: `BUSINESS_NAME`, `VERTICAL` (home_services|braiders), `BUSINESS_VERTICAL` (plumber|hvac), braiders: `SERVICES`, `SLOT_STEP_MINUTES`, `BOOKING_LINK`; `OWNER_PHONE`, `FORWARD_TO_PHONE`, `TWILIO_*`, `OPENAI_API_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_PRICE_ID_BASE_MONTHLY/_ANNUAL`, `STRIPE_PRICE_ID_SETUP`, `TRIAL_DAYS`, `ANNUAL_UPGRADE_PRORATION`, `MONTHLY_DOWNGRADE_PRORATION`, `BILLING_PORTAL_RETURN_URL`, `BILLING_ENFORCE`, `BILLING_REQUIRE_SUBSCRIPTION`, `PAST_DUE_GRACE_DAYS`, `INACTIVE_MODE`, `INACTIVE_MESSAGE`, `MOCK_PRICE_*`, `DATA_DIR`, `LEAD_FEE`, `LEAD_FEE_WAIVED`, `STRIPE_CONNECT_ACCOUNT_ID`, `ADMIN_PASSWORD`, `PUBLIC_BASE_URL`; booking: `BOOKING_ENABLED`, `BUSINESS_TZ`, `BUSINESS_HOURS`, `BUSINESS_DAYS`, `SLOT_MINUTES`, `BOOKING_LEAD_MINUTES`, `DEPOSIT_ENABLED`, `DEPOSIT_AMOUNT`, `HOLD_MINUTES`, `STRIPE_WEBHOOK_SECRET`.
+See `.env.example`. For SMS, explicitly configure `SMS_ENABLED` (default off), `SMS_CONSENT_BUSINESS_ID` (stable per-business slug), and `TWILIO_PHONE_NUMBER` (E.164 sender); neither display names nor request-supplied identities replace these. Keep SMS disabled until the reviewed launch checks pass. Other key ones: `BUSINESS_NAME`, `VERTICAL` (home_services|braiders), `BUSINESS_VERTICAL` (plumber|hvac), braiders: `SERVICES`, `SLOT_STEP_MINUTES`, `BOOKING_LINK`; `OWNER_PHONE`, `FORWARD_TO_PHONE`, `TWILIO_*`, `OPENAI_API_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_PRICE_ID_BASE_MONTHLY/_ANNUAL`, `STRIPE_PRICE_ID_SETUP`, `TRIAL_DAYS`, `ANNUAL_UPGRADE_PRORATION`, `MONTHLY_DOWNGRADE_PRORATION`, `BILLING_PORTAL_RETURN_URL`, `BILLING_ENFORCE`, `BILLING_REQUIRE_SUBSCRIPTION`, `PAST_DUE_GRACE_DAYS`, `INACTIVE_MODE`, `INACTIVE_MESSAGE`, `MOCK_PRICE_*`, `DATA_DIR`, `LEAD_FEE`, `LEAD_FEE_WAIVED`, `STRIPE_CONNECT_ACCOUNT_ID`, `ADMIN_PASSWORD`, `PUBLIC_BASE_URL`; booking: `BOOKING_ENABLED`, `BUSINESS_TZ`, `BUSINESS_HOURS`, `BUSINESS_DAYS`, `SLOT_MINUTES`, `BOOKING_LEAD_MINUTES`, `DEPOSIT_ENABLED`, `DEPOSIT_AMOUNT`, `HOLD_MINUTES`, `STRIPE_WEBHOOK_SECRET`.
 
-## Twilio setup
-1. Buy a local GA number (404/470/678/770/706/912/229/478/762).
-2. **A2P 10DLC**: register a brand and campaign (required for US SMS deliverability).
-3. Number → Voice "A call comes in": `POST {PUBLIC_BASE_URL}/twilio/voice`
-4. Number → Messaging "A message comes in": `POST {PUBLIC_BASE_URL}/twilio/sms`
-5. Set `FORWARD_TO_PHONE` to the owner's cell. Calls ring there for `RING_TIMEOUT_SECONDS`, and if unanswered the text-back starts. Alternative: keep the shop's existing number and set *conditional call forwarding (no-answer)* on the carrier to the Twilio number, leaving `FORWARD_TO_PHONE` empty.
-6. When Twilio keys are set, webhook signatures are validated against `PUBLIC_BASE_URL`, so it must match the public URL exactly.
+## Twilio setup (operator review required; no approval implied)
+1. Keep `SMS_ENABLED` off while reviewing the actual customer's identity and opt-in process. Any number purchase, carrier submission, fee, or deployment needs separate authorization; this document performs none of them.
+2. For US A2P 10DLC, use the actual business's customer profile and brand, not a blanket TryBuzzCall platform brand. Verify external brand/campaign approval and associate the approved E.164 sender with that campaign/Messaging Service. Registration alone is not consent or guaranteed delivery.
+3. Number → Voice "A call comes in": `POST {PUBLIC_BASE_URL}/twilio/voice`.
+4. Number → Messaging "A message comes in": `POST {PUBLIC_BASE_URL}/twilio/sms`. Verify status/callback routing and opt-out configuration as well.
+5. Set `FORWARD_TO_PHONE` to the owner's cell, or review conditional no-answer forwarding from the shop's existing number. Calls ring for `RING_TIMEOUT_SECONDS`; unanswered calls do **not** grant SMS permission.
+6. Every live Twilio request requires a valid signature, matching account, and matching routing for the configured sender. `PUBLIC_BASE_URL` must match the public webhook URL exactly. Neither a demo flag nor `SKIP_TWILIO_VALIDATION` bypasses live checks.
+7. Collect written client and owner opt-ins, record the separate grants, test blocks and restart persistence, then enable SMS only after documented review. See the [Pilot Checklist](docs/PILOT_CHECKLIST.md).
 
 ## Public tunnel
 ```bash
 ngrok http 3000                                  # or:
 cloudflared tunnel --url http://localhost:3000
 ```
-Put the https URL in `PUBLIC_BASE_URL`, restart, and paste the webhook URLs into Twilio.
+For separately authorized signed-webhook testing only, put the HTTPS URL in `PUBLIC_BASE_URL`, restart, and review the webhook routing in Twilio. Do not expose unsigned local-demo mode. A tunnel does not satisfy registration or permission requirements.
 
 ## Stripe
 Pricing: base plan starting at $49/mo, plus a per-paid-lead fee (default $12, `LEAD_FEE`) only when a caller books and pays the deposit; free 14-day trial; setup $99 (estimate), waived for the first 10 founding shops and on annual plans, charged only after the free trial. Deposits for bookings use one-off Checkout Sessions plus `/stripe/webhook` (see above). For automatic lead-fee collection, onboard the shop as a Stripe Connect account and set `STRIPE_CONNECT_ACCOUNT_ID`.
@@ -85,16 +97,16 @@ Built on the installed `stripe` npm package **16.12.0** (API version `2024-06-20
 - **Cancel / resume** (admin): `POST /api/billing/cancel` sets `cancel_at_period_end: true`. Access continues to `current_period_end` and there are no partial refunds. `POST /api/billing/resume` undoes it.
 - **Self-service:** `GET /billing/portal` (admin) redirects to a Stripe Billing Portal session (`return_url` = `BILLING_PORTAL_RETURN_URL` or `{PUBLIC_BASE_URL}/`).
 - **Webhooks** (`/stripe/webhook`, verified with `STRIPE_WEBHOOK_SECRET`): `checkout.session.completed` (subscription mode), `customer.subscription.created|updated|deleted`, `invoice.paid`, `invoice.payment_failed`, and `customer.subscription.trial_will_end`. Events are de-duplicated by id. In live mode the subscription is **re-fetched from Stripe** on each event, so out-of-order events can't store a stale status. The store keeps `db.billing.subscription` = status, plan, price, amount, `current_period_end`, `trial_end`, `cancel_at_period_end`, and `past_due_since`, plus invoices.
-  - The owner gets a text on `invoice.payment_failed` (with the portal link) and on `trial_will_end` (Stripe sends it 3 days before the trial ends).
+  - Owner SMS on `invoice.payment_failed` (with the portal link) and `trial_will_end` (Stripe sends the event 3 days before the trial ends) requires an active `owner_alerts` grant and passes the same central gate. Subscription or payment activity never grants SMS permission.
 - **Service gating** (`billing.access()`): `trialing`/`active` means full service. `past_due` (after `PAST_DUE_GRACE_DAYS`), `canceled`, `unpaid`, `incomplete*` and `paused` mean inactive.
-  - When inactive, a missed call or text gets one polite generic text per number per 24h (`INACTIVE_MODE=generic`, or `INACTIVE_MESSAGE`), with no conversation, booking, or deposit. `silent` sends nothing.
+  - When inactive, the generic fallback (`INACTIVE_MODE=generic`, or `INACTIVE_MESSAGE`) is limited to one text per number per 24h and still requires an active `customer_service` grant, with no conversation, booking, or deposit. Unconsented or opted-out recipients get no application SMS; `silent` sends nothing.
   - Deposits already in progress still complete.
-  - With no subscription on file, service stays active unless `BILLING_REQUIRE_SUBSCRIPTION=1`, so manual pilots keep working. `BILLING_ENFORCE=0` turns gating off.
+  - With no subscription on file, billing access stays active unless `BILLING_REQUIRE_SUBSCRIPTION=1`. `BILLING_ENFORCE=0` disables only billing-access enforcement, never the SMS permission gate; manual pilots still require recorded grants.
 - **Status:** `/admin` shows a Subscription section at the top. `GET /billing/status` (admin) returns JSON, and `/health` shows `billing` and `serviceActive`.
 - **Mock mode** (no `STRIPE_SECRET_KEY`): `/api/checkout` returns `/billing/mock/checkout/:id`. Its form posts to `/billing/mock/checkout/:id/complete`, which starts the trial, charges the mock setup fee on monthly, and fires the same events through the same handler.
   - Admin-only controls: `POST /billing/mock/advance {days}` moves a mock clock and fires `trial_will_end`, renewals, and period-end cancellation. `POST /billing/mock/fail-next {on}` makes the next renewal fail. `POST /billing/mock/update-card` pays the open invoice. `GET /billing/mock/portal` is the mock portal.
   - Mock proration credits unused time on the old plan and charges the new plan for a full new period; any negative remainder becomes account credit. Amounts come from `MOCK_PRICE_*`.
-  - Demo: `bash scripts/demo_billing.sh` starts its own server on `:3077` with a throwaway `DATA_DIR`, so `data/` and `:3000` are untouched. It shows founding shop #1 (no setup fee), shop #11 monthly ($49 + $99 on the first post-trial invoice), shop #12 cancelling in its trial (setup voided, $0), and shop #13 annual (waived). Then it runs the full lifecycle on shop #11 (`/billing/mock/primary` picks which mock shop drives gating; the billing APIs accept an optional `sub`).
+  - Legacy demo: `bash scripts/demo_billing.sh` is designed to use its own server on `:3077` and throwaway `DATA_DIR` for founding-shop, monthly/annual, cancellation, and lifecycle examples. It needs manual consent setup or a later update for SMS-dependent checks; old transcripts and successful completion are not guaranteed. `/billing/mock/primary` picks which mock shop drives billing access; the billing APIs accept an optional `sub`.
 - **Stripe dashboard setup (live):**
   1. Create a Product with a monthly and a yearly recurring Price, plus an optional one-time setup Price, and put their ids in the env.
   2. Turn on the Customer Portal (Settings → Billing → Customer portal): allow payment-method updates, invoice history, and cancel *at end of billing period*. If you want switching in the portal, add both Prices to its plan-switching list.
@@ -102,5 +114,13 @@ Built on the installed `stripe` npm package **16.12.0** (API version `2024-06-20
   4. Under Billing → Subscriptions and emails, pick the retry schedule and what happens after all retries fail (cancel or mark unpaid). Both count as inactive here.
   5. Optionally enable the trial-ending reminder email.
 
+## Storage failures and crash recovery
+
+The single-process JSON store persists `smsSessionClean=false` before accepting traffic. A graceful SIGTERM/SIGINT drains requests and marks a healthy session clean. After a crash, forced exit, or failed consent write, SMS and new grants remain blocked on restart until reviewed recovery; old on-disk grants cannot silently reactivate. Failed revocations are retained in memory for suppression-only persistence retries. Startup fails if it cannot persist the safety marker.
+
+Keep `SMS_ENABLED=0`, reconcile missing opt-outs against provider records and external evidence, record missing revocations, then use the authenticated JSON `POST /api/consent` recovery action with `acknowledgment: suppression_history_reviewed`. Review `recoveryRequired` and `persistenceFailed` in authenticated `GET /api/consent`. Recovery grants no permission and must not clear recipient revocations or provider blocks. See [the recovery procedure](docs/SMS_OPERATIONS.md#crash-and-storage-error-recovery). Never run multiple processes against the same `DATA_DIR` or edit safety markers to bypass review.
+
 ## Limits / next steps
-Single-tenant (one business per deploy, one subscription), JSON store, no retry queue for SMS. STOP/HELP opt-out is handled by Twilio's default Advanced Opt-Out.
+Single-tenant (one business per deploy, one subscription), JSON store, no retry queue for SMS. Evidence custody, retention/deletion review, customer registration checks, and approval to enable SMS are operator responsibilities, not automated compliance checks. The application records grants/revocations and gates sends; Twilio standard filtering and optional Advanced Opt-Out are additional delivery controls, not substitutes for local revocation. Advanced Opt-Out is disabled by default. An `OptOutType` notification must not trigger a duplicate application reply.
+
+Documentation checks: `node --test tests/consent-docs.test.js`. These test static claims only, not runtime enforcement, legal sufficiency, or carrier status. Run the source regression tests and pilot checks separately before launch.

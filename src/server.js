@@ -3,30 +3,33 @@ if (process.env.BUSINESS_TZ) process.env.TZ = process.env.BUSINESS_TZ; // slot m
 const express = require('express');
 const path = require('path');
 const store = require('./store');
-const { sendSms, live } = require('./sms');
+const { sendSms, canSend, hasPendingSends, live } = require('./sms');
+const consent = require('./consent');
+const { timingSafeEqual } = require('crypto');
 const agent = require('./agent');
 const booking = require('./booking');
 const billing = require('./billing');
 
 const app = express();
 // Stripe webhook needs the raw body for signature verification, so it's registered before the JSON parser.
-app.post('/stripe/webhook', express.raw({ type: '*/*' }), async (req, res) => {
+app.post('/stripe/webhook', express.raw({ type: '*/*' }), async (req, res, next) => {
+  // Mock payments use the explicit mock routes; unsigned public payment events are never trusted.
+  if (!process.env.STRIPE_WEBHOOK_SECRET) return res.status(503).send('Stripe webhook not configured');
   let event;
   try {
-    if (process.env.STRIPE_WEBHOOK_SECRET) {
-      const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY || 'sk_unused');
-      event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'] || '', process.env.STRIPE_WEBHOOK_SECRET);
-    } else event = JSON.parse(req.body.toString('utf8'));
-  } catch (e) { return res.status(400).send(`Webhook error: ${e.message}`); }
-  // Shop subscription events (and subscription-mode checkout) -> billing.js. Deposit checkouts fall through.
-  try { if (await billing.handleEvent(event)) return res.json({ received: true }); }
-  catch (e) { console.error('billing webhook error:', e.message); return res.status(500).send('billing handler error'); }
-  if (['checkout.session.completed', 'checkout.session.async_payment_succeeded'].includes(event.type)) {
-    const s = event.data.object;
-    const id = s.metadata?.bookingId || s.client_reference_id;
-    if (id && s.payment_status !== 'unpaid') await onPaid(id);
-  }
-  res.json({ received: true });
+    const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY || 'sk_unused');
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'] || '', process.env.STRIPE_WEBHOOK_SECRET);
+  } catch { return res.status(400).send('Invalid Stripe webhook'); }
+  try {
+    // Shop subscription events go to billing.js. Deposit checkouts fall through.
+    if (await billing.handleEvent(event)) return res.json({ received: true });
+    if (['checkout.session.completed', 'checkout.session.async_payment_succeeded'].includes(event.type)) {
+      const s = event.data.object;
+      const id = s.metadata?.bookingId || s.client_reference_id;
+      if (id && s.payment_status === 'paid') await onPaid(id);
+    }
+    res.json({ received: true });
+  } catch (error) { next(error); }
 });
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
@@ -35,9 +38,14 @@ app.use(express.static(path.join(__dirname, '..', 'public'), { extensions: ['htm
 const env = process.env;
 const BASE = env.PUBLIC_BASE_URL || `http://localhost:${env.PORT || 3000}`;
 function isAdmin(req) {
-  const [, b64] = (req.headers.authorization || '').split(' ');
-  const pass = b64 ? Buffer.from(b64, 'base64').toString().split(':').slice(1).join(':') : '';
-  return !!env.ADMIN_PASSWORD && pass === env.ADMIN_PASSWORD;
+  const match = /^Basic ([A-Za-z0-9+/]+=*)$/i.exec(req.headers.authorization || '');
+  if (!match || !env.ADMIN_PASSWORD) return false;
+  const decoded = Buffer.from(match[1], 'base64').toString();
+  const separator = decoded.indexOf(':');
+  if (separator < 0) return false;
+  const supplied = Buffer.from(decoded.slice(separator + 1));
+  const expected = Buffer.from(env.ADMIN_PASSWORD);
+  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
 }
 function requireAdmin(req, res, next) {
   if (!isAdmin(req)) return res.set('WWW-Authenticate', 'Basic realm="admin"').status(401).send('auth required');
@@ -55,76 +63,148 @@ function billingHtml(esc) {
 }
 const twiml = (res, xml) => res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?><Response>${xml}</Response>`);
 
-// Optional Twilio signature check when live
+// Never let unsigned webhooks fabricate consent state in live deployments.
 function verifyTwilio(req, res, next) {
-  if (!live || env.SKIP_TWILIO_VALIDATION === '1') return next();
-  const ok = require('twilio').validateRequest(env.TWILIO_AUTH_TOKEN, req.headers['x-twilio-signature'] || '', BASE + req.originalUrl, req.body);
-  return ok ? next() : res.status(403).send('bad signature');
+  if (!req.is('application/x-www-form-urlencoded')) return res.status(415).send('form webhook required');
+  if (env.TWILIO_ACCOUNT_SID || env.TWILIO_AUTH_TOKEN) {
+    if (!live || req.body.AccountSid !== env.TWILIO_ACCOUNT_SID) return res.status(403).send('invalid Twilio account');
+    const ok = require('twilio').validateRequest(env.TWILIO_AUTH_TOKEN,
+      req.headers['x-twilio-signature'] || '', BASE + req.originalUrl, req.body);
+    if (!ok) return res.status(403).send('bad signature');
+  } else {
+    const localAddresses = ['127.0.0.1', '::1', '::ffff:127.0.0.1'];
+    let localBase = false;
+    try { localBase = ['127.0.0.1', 'localhost', '[::1]'].includes(new URL(BASE).hostname); } catch {}
+    if (env.ALLOW_UNSIGNED_TWILIO_WEBHOOKS !== '1' || env.NODE_ENV === 'production' ||
+        !localBase || !localAddresses.includes(req.socket.remoteAddress)) {
+      return res.status(403).send('verified Twilio webhook required');
+    }
+  }
+  const config = consent.configuration();
+  if (!config || req.body.To !== config.sender) return res.status(403).send('invalid Twilio recipient');
+  if (req.path === '/twilio/sms' && (!consent.validPhone(req.body.From) ||
+      typeof req.body.MessageSid !== 'string' || !/^(SM|MM)[a-fA-F0-9]{32}$/.test(req.body.MessageSid))) {
+    return res.status(400).send('valid sender and message ID required');
+  }
+  next();
 }
 
-const missedSay = () => (agent.isBraiders() ? 'Sorry I missed you. I just sent you a text so we can get you booked.' : 'Sorry we missed you. We just texted you and will call back shortly.');
+const missedSay = () => 'Sorry we missed you. Please call again later. Text messages are sent only when written permission is on file.';
 
 // When the shop's subscription lapsed (past_due/canceled, see billing.access), callers get one polite generic text
 // (at most once per number per 24h; INACTIVE_MODE=silent sends nothing) and no booking/deposit flow.
 async function inactiveText(phone) {
-  if (!phone || billing.cfg().inactiveMode === 'silent') return;
+  if (!canSend(phone).allowed || billing.cfg().inactiveMode === 'silent') return;
   store.db.inactiveTexts = store.db.inactiveTexts || {};
   const last = store.db.inactiveTexts[phone];
   if (last && Date.now() - Date.parse(last) < 86400000) return;
-  store.db.inactiveTexts[phone] = new Date().toISOString(); store.save();
   const biz = env.BUSINESS_NAME || 'us';
   const msg = env.INACTIVE_MESSAGE || (agent.isBraiders()
     ? `Hi, this is ${biz}. Sorry I missed your call! Please try calling again later. Reply STOP to opt out.`
     : `Hi, this is ${biz}. Sorry we missed your call! Please try calling again later. Reply STOP to opt out.`);
-  await sendSms(phone, msg);
+  const result = await sendSms(phone, msg);
+  if (result.sent) { store.db.inactiveTexts[phone] = new Date().toISOString(); store.save(); }
+}
+
+// Record outcomes honestly: a suppressed message is not an outgoing conversation message.
+async function sendLeadMessage(lead, body) {
+  const result = await sendSms(lead.phone, body);
+  if (lead.messages) {
+    lead.messages.push({ dir: result.sent ? 'out' : 'blocked', body,
+      delivery: result.sent ? result.mode : result.reason, at: new Date().toISOString() });
+    store.save();
+  }
+  return result;
 }
 
 async function startTextBack(phone) {
-  if (!phone) return;
+  if (!canSend(phone).allowed) return;
   if (!billing.access().active) return inactiveText(phone);
   let lead = store.findOpenLead(phone);
   if (!lead) lead = store.createLead(phone);
-  const msg = agent.firstMessage();
-  lead.messages.push({ dir: 'out', body: msg }); store.save();
-  await sendSms(phone, msg);
+  await sendLeadMessage(lead, agent.firstMessage());
 }
 
 // 1) Incoming call: forward to owner if configured, else treat as missed
-app.post('/twilio/voice', verifyTwilio, async (req, res) => {
-  if (env.FORWARD_TO_PHONE) {
-    return twiml(res, `<Dial timeout="${env.RING_TIMEOUT_SECONDS || 20}" action="${BASE}/twilio/voice/status">${env.FORWARD_TO_PHONE}</Dial>`);
-  }
-  await startTextBack(req.body.From);
-  twiml(res, `<Say>${missedSay()}</Say><Hangup/>`);
+app.post('/twilio/voice', verifyTwilio, async (req, res, next) => {
+  try {
+    if (env.FORWARD_TO_PHONE) {
+      return twiml(res, `<Dial timeout="${env.RING_TIMEOUT_SECONDS || 20}" action="${BASE}/twilio/voice/status">${env.FORWARD_TO_PHONE}</Dial>`);
+    }
+    await startTextBack(req.body.From);
+    twiml(res, `<Say>${missedSay()}</Say><Hangup/>`);
+  } catch (error) { next(error); }
 });
 
 // 2) Dial result: no-answer/busy/failed => missed call
-app.post('/twilio/voice/status', verifyTwilio, async (req, res) => {
-  const s = req.body.DialCallStatus;
-  if (['no-answer', 'busy', 'failed', 'canceled'].includes(s)) {
-    await startTextBack(req.body.From);
-    return twiml(res, `<Say>${missedSay()}</Say><Hangup/>`);
-  }
-  twiml(res, '<Hangup/>');
+app.post('/twilio/voice/status', verifyTwilio, async (req, res, next) => {
+  try {
+    const s = req.body.DialCallStatus;
+    if (['no-answer', 'busy', 'failed', 'canceled'].includes(s)) {
+      await startTextBack(req.body.From);
+      return twiml(res, `<Say>${missedSay()}</Say><Hangup/>`);
+    }
+    twiml(res, '<Hangup/>');
+  } catch (error) { next(error); }
 });
 
-// 3) Caller SMS replies
-app.post('/twilio/sms', verifyTwilio, async (req, res) => {
-  const from = req.body.From, body = req.body.Body || '';
-  if (/^(stop|unsubscribe|cancel|end|quit)$/i.test(body.trim())) return twiml(res, ''); // Twilio handles opt-out
-  if (!billing.access().active) { await inactiveText(from); return twiml(res, ''); }
-  let lead = store.findOpenLead(from) || store.createLead(from);
-  lead.messages.push({ dir: 'in', body });
-  const { reply, completed, booking: b } = await agent.handleReply(lead, body);
-  if (b) { await onBooked(lead, b); return twiml(res, ''); }
-  lead.messages.push({ dir: 'out', body: reply }); store.save();
-  await sendSms(from, reply);
-  if (completed) await buzzOwner(lead);
-  twiml(res, '');
+const stopKeyword = (body) => /^(stop|stopall|unsubscribe|cancel|end|quit|revoke|optout)[.!?]*$/i.test(body.trim());
+const stopRequest = (body) => stopKeyword(body) ||
+  /\b(stop|quit|cease)\s+(texting|messaging|sending)|\b(?:do not|don't|don’t)\s+(text|message|contact)|\bremove me\b|\bunsubscribe\b|\bopt\s+(?:me\s+)?out\b|\bno more\s+(texts|messages)\b/i.test(body);
+
+// 3) Process suppression before billing, AI, lead creation, or any send.
+app.post('/twilio/sms', verifyTwilio, async (req, res, next) => {
+  try {
+    const from = req.body.From, body = typeof req.body.Body === 'string' ? req.body.Body : '';
+    const optOutType = req.body.OptOutType;
+    if (optOutType !== undefined && !['STOP', 'START', 'HELP'].includes(optOutType)) {
+      return res.status(400).send('invalid opt-out event');
+    }
+    if (optOutType === 'STOP' || stopRequest(body)) {
+      consent.revoke(from, { method: optOutType === 'STOP' ? 'twilio_stop' : 'inbound_stop',
+        messageSid: req.body.MessageSid, providerBlocked: optOutType === 'STOP' || stopKeyword(body) });
+      return twiml(res, '');
+    }
+    if (optOutType === 'START' || /^(START|UNSTOP|YES)$/i.test(body.trim())) {
+      // Unblocking transport is not a new consent grant; old grants remain revoked.
+      consent.providerOptIn(from, { messageSid: req.body.MessageSid });
+      return twiml(res, '');
+    }
+    if (optOutType === 'HELP') return twiml(res, ''); // Twilio already replied.
+    if (/^(HELP|INFO)$/i.test(body.trim())) {
+      await sendSms(from, 'For help with BuzzCall, call (470) 482-8377 or email hello@trybuzzcall.com.');
+      return twiml(res, '');
+    }
+    if (!canSend(from).allowed || !body.trim()) return twiml(res, '');
+    if (!billing.access().active) { await inactiveText(from); return twiml(res, ''); }
+    // Include completed leads: a retry must not open a fresh conversation.
+    if (store.db.leads.some((lead) => lead.phone === from &&
+        lead.messages.some((message) => message.messageSid === req.body.MessageSid))) return twiml(res, '');
+    let lead = store.findOpenLead(from);
+    const newLead = !lead;
+    if (!lead) lead = store.createLead(from);
+    lead.messages.push({ dir: 'in', body, messageSid: req.body.MessageSid });
+    store.save();
+    if (newLead) {
+      await sendLeadMessage(lead, 'Thanks for contacting us. What is your name?');
+      return twiml(res, '');
+    }
+    const { reply, completed, booking: b } = await agent.handleReply(lead, body);
+    // AI or other asynchronous work may have overlapped a STOP request.
+    if (!canSend(from).allowed) { store.save(); return twiml(res, ''); }
+    if (b) { await onBooked(lead, b); return twiml(res, ''); }
+    await sendLeadMessage(lead, reply);
+    if (completed) await buzzOwner(lead);
+    twiml(res, '');
+  } catch (error) { next(error); }
 });
 
 const tag = (lead) => `${lead.urgent ? '🚨 URGENT ' : ''}`;
-const owner = async (leadId, msg) => { store.addAlert({ leadId, to: env.OWNER_PHONE, body: msg }); await sendSms(env.OWNER_PHONE || '+10000000000', msg); };
+const owner = async (leadId, msg) => {
+  const result = await sendSms(env.OWNER_PHONE, msg, { purpose: 'owner_alerts' });
+  store.addAlert({ leadId, to: env.OWNER_PHONE, body: msg,
+    delivery: result.sent ? result.mode : result.reason, sent: result.sent });
+};
 
 async function onBooked(lead, b) {
   let msg;
@@ -134,8 +214,7 @@ async function onBooked(lead, b) {
     const c = booking.cfg();
     msg = url ? agent.texts.held(lead.name, b, c.holdMin, url) : agent.texts.heldNoLink(lead.name, b);
   } else msg = agent.texts.bookedNoDeposit(lead.name, b);
-  lead.messages.push({ dir: 'out', body: msg }); store.save();
-  await sendSms(lead.phone, msg);
+  await sendLeadMessage(lead, msg);
   const status = b.status === 'held' ? `slot held, deposit pending ($${b.amount}, hold expires ${new Date(b.holdExpiresAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })})` : 'BOOKED (no deposit)';
   if (b.service) await owner(lead.id, `BUZZ ${env.BUSINESS_NAME || ''}: ${status.replace('slot held', 'time held')}: ${lead.name}, ${lead.need}, ${b.slotLabel}. tel:${lead.phone}`);
   else await owner(lead.id, `${tag(lead)}BUZZ ${env.BUSINESS_NAME || ''}: ${status}: ${lead.name}, ${lead.need}, ${b.slotLabel}. Tap to call: tel:${lead.phone}`);
@@ -154,8 +233,7 @@ async function onPaid(id) {
     return b;
   }
   const msg = agent.texts.paid(b);
-  if (lead.messages) { lead.messages.push({ dir: 'out', body: msg }); store.save(); }
-  await sendSms(b.phone, msg);
+  await sendLeadMessage(lead, msg);
   if (b.service) { // braiders: 'BOOKED + PAID: <name>, <service>, <time>, $50 deposit'
     await owner(b.leadId, `BOOKED + PAID: ${b.name}, ${b.service}, ${b.slotLabel}, $${money(b.amount)} deposit${b.details ? `. Notes: ${b.details}` : ''}. tel:${b.phone}`);
   } else await owner(b.leadId, `${tag(lead)}BOOKED + PAID $${b.amount}: ${b.name}, ${b.need}, ${b.slotLabel}, ${feeNote(b)}, tel:${b.phone}`);
@@ -175,9 +253,37 @@ async function buzzOwner(lead) {
   const msg = agent.isBraiders()
     ? `BUZZ ${env.BUSINESS_NAME || ''}: ${lead.name} (${lead.phone}) wants: ${lead.need}. Call back: ${lead.window}. tel:${lead.phone}`
     : `${lead.urgent ? '🚨 URGENT ' : ''}BUZZ ${env.BUSINESS_NAME || ''}: ${lead.name} (${lead.phone}) needs: ${lead.need}. Callback: ${lead.window}. Tap to call: tel:${lead.phone}`;
-  store.addAlert({ leadId: lead.id, to: env.OWNER_PHONE, body: msg });
-  await sendSms(env.OWNER_PHONE || '+10000000000', msg);
+  await owner(lead.id, msg);
 }
+
+// Operator attestation only: this endpoint records evidence, it does not collect opt-in.
+app.get('/api/consent', requireAdmin, (req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  try { res.json({ records: consent.snapshot(), ...consent.status() }); } catch (error) { next(error); }
+});
+app.post('/api/consent', requireAdmin, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!req.is('application/json')) return res.status(415).json({ error: 'application/json required' });
+  try {
+    if (req.headers.origin !== undefined && req.headers.origin !== new URL(BASE).origin) {
+      return res.status(403).json({ error: 'same-origin request required' });
+    }
+    if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+      return res.status(400).json({ error: 'consent object required' });
+    }
+    const { action, ...input } = req.body;
+    let record;
+    if (action === 'grant') record = consent.grant(input);
+    else if (action === 'revoke' && Object.keys(input).length === 1 && Object.hasOwn(input, 'phone')) {
+      record = consent.revoke(input.phone);
+    } else if (action === 'recover' && Object.keys(input).length === 1 && Object.hasOwn(input, 'acknowledgment')) {
+      return res.json({ ok: true, ...consent.recover(input.acknowledgment) });
+    } else return res.status(400).json({ error: 'documented grant, revoke or recovery fields required' });
+    res.json({ ok: true, record });
+  } catch (error) {
+    res.status(error.status === 400 ? 400 : 409).json({ error: error.status ? error.message : 'unable to record permission' });
+  }
+});
 
 // Waitlist
 app.post('/api/waitlist', (req, res) => {
@@ -256,7 +362,7 @@ app.get('/admin', requireAdmin, (req, res) => {
   const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   const rows = store.db.leads.slice(0, 100).map((l) => `<tr><td>${esc(l.createdAt)}</td><td>${esc(l.phone)}</td><td>${esc(l.name)}</td><td>${l.urgent ? '🚨 ' : ''}${esc(l.need)}</td><td>${esc(l.window)}</td><td>${esc(l.status)}</td></tr>`).join('');
   const lf = booking.leadFeeTotals(), fc = booking.cfg();
-  const alerts = store.db.alerts.slice(0, 50).map((a) => `<li>${esc(a.at)} → ${esc(a.to)}: ${esc(a.body)}</li>`).join('');
+  const alerts = store.db.alerts.slice(0, 50).map((a) => `<li>${esc(a.at)} → ${esc(a.to)}: ${esc(a.body)}${a.delivery ? ` [${esc(a.delivery)}]` : ''}</li>`).join('');
   const waitlist = store.db.waitlist.map((w) => {
     const label = w.businessType === 'home_services' ? 'Home services' : w.businessType === 'braiders' ? 'Braiders' : '';
     return `<li>${esc(w.email)}${label ? ` · Business type: ${esc(label)}` : ''}</li>`;
@@ -269,6 +375,28 @@ ${billingHtml(esc)}<h1>Leads</h1><table><tr><th>When</th><th>Phone</th><th>Name<
 
 setInterval(() => booking.expireHolds(), 60000).unref();
 billing.init({ notify: (msg) => owner(null, msg), BASE });
-app.get('/health', (_, res) => res.json({ ok: true, vertical: booking.cfg().vertical, billing: billing.summary().mode, serviceActive: billing.access().active, twilio: live, openai: !!env.OPENAI_API_KEY, booking: booking.cfg().booking, deposit: booking.cfg().deposit, stripe: !!env.STRIPE_SECRET_KEY, leadFee: booking.cfg().leadFee, leadFeeWaived: booking.cfg().leadFeeWaived, connect: !!booking.cfg().connectAccount }));
+app.get('/health', (_, res) => res.json({ ok: true, vertical: booking.cfg().vertical, billing: billing.summary().mode, serviceActive: billing.access().active, twilio: live, smsEnabled: env.SMS_ENABLED === '1', openai: !!env.OPENAI_API_KEY, booking: booking.cfg().booking, deposit: booking.cfg().deposit, stripe: !!env.STRIPE_SECRET_KEY, leadFee: booking.cfg().leadFee, leadFeeWaived: booking.cfg().leadFeeWaived, connect: !!booking.cfg().connectAccount }));
+// Express 4 needs an explicit handler for forwarded asynchronous route failures.
+app.use((error, req, res, next) => {
+  if (res.headersSent) return next(error);
+  res.status(500).json({ error: 'request could not be completed' });
+});
 const port = env.PORT || 3000;
-app.listen(port, () => console.log(`missedcall-buzz on :${port} (vertical ${booking.cfg().vertical}, twilio ${live ? 'LIVE' : 'LOG-ONLY'}, ai ${env.OPENAI_API_KEY ? 'openai' : 'templates'})`));
+const server = app.listen(port, () => console.log(`missedcall-buzz on :${port} (vertical ${booking.cfg().vertical}, twilio ${live ? 'LIVE' : 'LOG-ONLY'}, ai ${env.OPENAI_API_KEY ? 'openai' : 'templates'})`));
+let shuttingDown = false;
+function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  // Drain requests before marking a clean session. Forced exits retain the recovery marker.
+  const timeout = setTimeout(() => process.exit(1), 10000);
+  timeout.unref();
+  server.close(() => {
+    // server.close alone does not wait for handlers whose clients disconnected.
+    const clean = !hasPendingSends() && consent.close();
+    clearTimeout(timeout);
+    process.exit(clean ? 0 : 1);
+  });
+  server.closeIdleConnections?.();
+}
+process.once('SIGTERM', shutdown);
+process.once('SIGINT', shutdown);

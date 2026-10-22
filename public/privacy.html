@@ -7,11 +7,11 @@
 <nav><a href="privacy.html">Privacy</a><a href="terms.html">Terms</a><a href="refunds.html">Refunds</a><a href="sms-consent.html">SMS Consent</a></nav></div></header>
 <main class="doc"><div class="wrap">
 <h1>Privacy Policy</h1>
-<p class="meta">Last updated Oct 19, 2026</p>
+<p class="meta">Last updated Oct 22, 2026</p>
 <p class="review-note">Note: this document is a plain-English draft and is pending review by legal counsel. It is not legal advice.</p>
 
 <p>This Privacy Policy explains how <b>TryBuzzCall LLC</b> ("we," "us") collects, uses, shares, and protects information through <b>BuzzCall</b>, our missed-call text-back service, and through this website, trybuzzcall.com.</p>
-<p>BuzzCall is used by local plumbing and HVAC businesses ("Shops"). When you call a Shop that uses BuzzCall and the call is missed, BuzzCall texts you back on that Shop's behalf to collect your name and what you need, offer appointment times, take an optional booking deposit, and alert the Shop. In that role we process your information on behalf of the Shop you contacted.</p>
+<p>BuzzCall supports Home Services businesses (plumbing and HVAC) and Braiders ("Shops"). A missed call is not SMS consent. SMS is off by default; automatic text-back requires a recorded, active customer-service permission grant for the specific business and sender. Separately permissioned owners may receive alerts. Permitted conversations can collect your name and service need, offer appointments, and provide optional deposit links. In that role we process information on behalf of the Shop you contacted. These draft requirements are not a compliance certification or evidence of carrier approval.</p>
 
 <p class="highlight">No mobile information will be shared with third parties or affiliates for marketing or promotional purposes. Mobile numbers and SMS opt-in data and consent are not shared with or sold to third parties or affiliates for marketing purposes. Text messaging originator opt-in data and consent will not be shared with any third parties, except the service providers that help us deliver the messaging service (such as our SMS carrier provider).</p>
 
@@ -22,8 +22,9 @@
 <h3>From callers and customers of Shops</h3>
 <ul>
 <li><b>Phone number and call details:</b> the number you called from, the Shop number you called, the time of the call, and whether it was answered or missed.</li>
-<li><b>Name and job details</b> you give us by text, such as your name, the problem you need help with (for example "water heater leak" or "AC out"), your address if you share it, whether the job is urgent, and your preferred appointment time or callback window.</li>
-<li><b>Message content:</b> the text messages you send to and receive from the Shop's BuzzCall number.</li>
+<li><b>Name and service details</b> you give us by text, such as your name, a plumbing/HVAC problem or requested braid style, your address if you share it, urgency where relevant to Home Services, and your preferred appointment time or callback window.</li>
+<li><b>Message content:</b> the text messages you send to and receive from the Shop's BuzzCall number. An incoming message does not itself create permission to send application texts.</li>
+<li><b>Permission and revocation records:</b> recipient number, configured business identifier and sending number, separate customer-service (<code>customer_service</code>) or owner-alert (<code>owner_alerts</code>) purpose, consent and recording timestamps, source of the record, disclosure version, and a non-secret evidence reference. Records also include revocation/opt-out timestamps and source and delivery-block status as applicable, so an opt-out can be honored. The Shop or authorized operator retains the actual written opt-in evidence in separate secured storage; an application reference is not the evidence itself. Evidence references must not contain passwords, authentication tokens, or URLs.</li>
 <li><b>Booking and deposit records:</b> the time slot you picked, booking status, deposit amount, and whether the deposit was paid or refunded.</li>
 <li><b>Payment information:</b> deposits are paid on a secure checkout page hosted by <b>Stripe</b>. Your card number and other card details go directly to Stripe. <b>We do not receive or store your full card number or card security code.</b> We receive limited information from Stripe, such as payment status, amount, and a transaction reference.</li>
 </ul>
@@ -41,13 +42,13 @@
 
 <h2 id="use">2. How we use information</h2>
 <ul>
-<li>To text you back after a missed call, collect your name and job details, and continue the conversation you started.</li>
-<li>To offer appointment times, hold a slot, send a deposit link, and send booking confirmations and related service updates.</li>
-<li>To alert the Shop you called with your name, phone number, job details, and booking status so they can call you back or do the job.</li>
+<li>To provide nonmarketing customer-service texts only while the recorded permission for that business, sender, and purpose is active, including eligible missed-call follow-ups.</li>
+<li>To offer appointment times, hold a slot, and, when permission allows, send deposit links and booking confirmations. Payment does not grant SMS permission or override revocation.</li>
+<li>To make service details and booking status available to the Shop so it can serve you. Owner SMS alerts require their own active owner-alert permission.</li>
 <li>To process deposits and refunds through Stripe.</li>
-<li>To honor opt-out (STOP) and help (HELP) requests.</li>
+<li>To check permission before every application SMS, honor keyword and natural-language opt-outs, and handle help requests without duplicating provider replies.</li>
 <li>To provide, maintain, secure, and improve BuzzCall, including preventing fraud, abuse, and spam.</li>
-<li>To bill Shops, provide support, and send Shops service and account messages.</li>
+<li>To bill Shops and provide support. Service and account SMS, including billing reminders, require the separate owner-alert permission.</li>
 <li>To comply with law, carrier rules, and valid legal requests.</li>
 </ul>
 <p>We do not sell personal information, and we do not use callers' information to send marketing messages.</p>
@@ -64,23 +65,25 @@
  <li>Our website and server hosting provider.</li>
  </ul></li>
 <li><b>For legal reasons</b>, if required by law, subpoena, or other legal process, or to protect the rights, safety, and property of you, a Shop, TryBuzzCall, or others.</li>
-<li><b>In a business transfer</b>, such as a merger, acquisition, or sale of assets, subject to this policy.</li>
+<li><b>In a business transfer</b>, such as a merger, acquisition, or sale of assets, subject to this policy. This does not transfer SMS consent to another business or sender; new permission must be reviewed and recorded before that business sends texts.</li>
 </ul>
 <p>As stated above, mobile numbers and SMS opt-in data and consent are never shared with or sold to third parties or affiliates for their marketing or promotional purposes.</p>
 
 <h2 id="sms">4. Text messages and opt-out</h2>
-<p>BuzzCall texts are conversational replies to a call you placed to a Shop. See <a href="sms-consent.html">How text consent works</a> and our <a href="terms.html#sms">SMS Terms</a>. Message frequency varies. Message and data rates may apply. Reply <b>STOP</b> at any time to stop messages from that Shop's number, or <b>HELP</b> for help. After you reply STOP you will receive one confirmation message and no further texts unless you opt back in (for example by replying START).</p>
+<p>BuzzCall requires recorded written permission before application texts. Missed calls, inbound messages, START, payments, waitlist signup, and merely providing a number do not automatically grant permission. Customer-service and owner-alert permissions are separate and not transferred between businesses or senders. We do not send an unsolicited SMS to obtain initial opt-in. See <a href="sms-consent.html">How text consent works</a> and our <a href="terms.html#sms">SMS Terms</a>. Message frequency varies. Message and data rates may apply. Consent is not a condition of purchase; you may call the business instead.</p>
+<p>Reply <b>STOP</b> to opt out or <b>HELP</b> for help. STOPALL, UNSUBSCRIBE, CANCEL, END, QUIT, REVOKE, OPTOUT, and natural-language requests such as "please stop texting me" revoke all purposes locally, including future confirmations and owner/billing alerts. Twilio may send a provider-managed response; an <code>OptOutType</code> START, STOP, or HELP notification does not cause a duplicate application reply. Its optional Advanced Opt-Out is disabled by default and differs from standard keyword filtering.</p>
+<p><b>START only clears a delivery block; it never restores grants.</b> After opt-out, fresh written evidence and a fresh operator-recorded grant are required. If Twilio has blocked delivery, the recipient must first explicitly opt back in with the provider. For help without receiving SMS, contact the Shop or <a href="mailto:hello@trybuzzcall.com">hello@trybuzzcall.com</a>. See the <a href="https://www.twilio.com/en-us/legal/messaging-policy">Twilio Messaging Policy</a> and <a href="https://www.twilio.com/docs/messaging/tutorials/advanced-opt-out">Advanced Opt-Out documentation</a> for provider requirements; these are not approval of this program.</p>
 
 <h2 id="retention">5. How long we keep information</h2>
 <ul>
-<li><b>Caller, message, and booking records</b> are kept while the Shop's BuzzCall account is active so the Shop can follow up on jobs, and are deleted or de-identified within 90 days after the Shop's account ends, unless a longer period is required by law or to resolve a dispute.</li>
-<li><b>Opt-out records</b> (the fact that a number replied STOP) are kept as long as needed to keep honoring the opt-out.</li>
+<li><b>Caller, message, booking, and permission records</b> are stored in the application's protected data directory (<code>DATA_DIR</code>) and associated logs. The current implementation has no automatic retention-based deletion or de-identification schedule; ending an account does not automatically erase these records. Operators must review retention and handle deletion requests manually, including logs and any backups, subject to applicable obligations.</li>
+<li><b>Consent evidence and revocation history</b> are retained to substantiate permission and keep honoring opt-outs. Actual written evidence is held separately in secured storage; the application retains references, purposes, sources, disclosure versions, and timestamps. The appropriate retention period and access controls must be reviewed with the Shop and counsel; no fixed automatic deletion deadline is promised. Deletion must not silently remove suppression records and cause messaging to resume.</li>
 <li><b>Payment and billing records</b> are kept as long as needed for tax, accounting, and chargeback purposes. Stripe keeps its own records under its own policies.</li>
 <li><b>Waitlist emails</b> are kept until you ask us to remove them or we stop the waitlist.</li>
 </ul>
 
 <h2 id="security">6. Security</h2>
-<p>We use reasonable administrative, technical, and physical safeguards, such as encrypted (HTTPS) connections, access controls, and password-protected admin tools. Payment card details are handled by Stripe, not stored by us. No method of transmission or storage is completely secure, so we cannot guarantee absolute security.</p>
+<p>The application uses authenticated admin tools for permission records. Operators must use HTTPS for live service, restrict access to <code>DATA_DIR</code>, logs, backups, and external written evidence, and keep credentials out of evidence references. On Render, <code>DATA_DIR</code> must be on a persistent disk; operators must verify that consent and revocation records survive restarts. A persistent disk is not by itself an access-control or encryption guarantee. These are deployment responsibilities, not a claim that every installation has been audited. Payment card details are handled by Stripe, not stored by us. No method of transmission or storage is completely secure, so we cannot guarantee absolute security.</p>
 
 <h2 id="rights">7. Your choices and rights</h2>
 <ul>
