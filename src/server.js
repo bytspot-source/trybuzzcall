@@ -320,6 +320,12 @@ ${setupPages.adminSetupsHtml(store.db.setups, config.effective(), config.overrid
 
 setInterval(() => booking.expireHolds(), 60000).unref();
 billing.init({ notify: (msg) => owner(null, msg), BASE });
-app.get('/health', (_, res) => res.json({ ok: true, vertical: booking.cfg().vertical, trade: booking.cfg().trade, flow: booking.cfg().flow, billing: billing.summary().mode, serviceActive: billing.access().active, twilio: live, openai: !!env.OPENAI_API_KEY, booking: booking.cfg().booking, deposit: booking.cfg().deposit, stripe: !!env.STRIPE_SECRET_KEY, leadFee: booking.cfg().leadFee, leadFeeWaived: booking.cfg().leadFeeWaived, connect: !!booking.cfg().connectAccount }));
+app.get('/health', (_, res) => res.json({ ok: true, vertical: booking.cfg().vertical, trade: booking.cfg().trade, flow: booking.cfg().flow, billing: billing.summary().mode, serviceActive: billing.access().active, twilio: live, openai: !!env.OPENAI_API_KEY, booking: booking.cfg().booking, deposit: booking.cfg().deposit, stripe: !!env.STRIPE_SECRET_KEY, leadFee: booking.cfg().leadFee, leadFeeWaived: booking.cfg().leadFeeWaived, connect: !!booking.cfg().connectAccount, storage: store.backend() }));
 const port = env.PORT || 3000;
-app.listen(port, () => console.log(`missedcall-buzz on :${port} (vertical ${booking.cfg().vertical}, trade ${booking.cfg().trade}, twilio ${live ? 'LIVE' : 'LOG-ONLY'}, ai ${env.OPENAI_API_KEY ? 'openai' : 'templates'})`));
+// Load persisted state first (Postgres when DATABASE_URL is set; no-op for file storage), then accept traffic.
+store.init().then(() => {
+config.applyTZ(); // the stored override may have just been loaded from Postgres
+const server = app.listen(port, () => console.log(`missedcall-buzz on :${port} (vertical ${booking.cfg().vertical}, trade ${booking.cfg().trade}, twilio ${live ? 'LIVE' : 'LOG-ONLY'}, ai ${env.OPENAI_API_KEY ? 'openai' : 'templates'}, storage ${store.backend()})`));
+// Render sends SIGTERM on restart/redeploy: flush pending writes to Postgres before exiting.
+for (const sig of ['SIGTERM', 'SIGINT']) process.once(sig, () => { server.close(); store.close().finally(() => process.exit(0)); });
+});

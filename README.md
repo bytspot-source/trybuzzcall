@@ -111,3 +111,7 @@ Built on the installed `stripe` npm package **16.12.0** (API version `2024-06-20
 
 ## Limits / next steps
 Single-tenant (one business per deploy, one subscription), JSON store, no retry queue for SMS. STOP/HELP opt-out is handled by Twilio's default Advanced Opt-Out.
+
+## Persistence (restart-proof setups and config)
+
+By default state lives in files under `DATA_DIR` (`db.json`, `config.json`). On hosts with an ephemeral filesystem (Render free plan) those are wiped on every restart/redeploy/spin-down. Set `DATABASE_URL` to a Postgres connection string and the same two JSON documents are stored in a `buzz_kv` table instead (created automatically; the first boot seeds it from any existing files). Writes are debounced (~200 ms) and flushed on SIGTERM. If `DATABASE_URL` is set but Postgres is unreachable at boot, the app logs the error and falls back to file storage so the line keeps answering. `/health` reports `storage: "file"|"postgres"`. Note `sms.log` is a log only and stays file-based. Tests: `tests/storage.test.js` (set `TEST_DATABASE_URL` to also exercise a real database).
