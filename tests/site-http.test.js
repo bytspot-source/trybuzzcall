@@ -288,6 +288,26 @@ test('public site over real local HTTP', { timeout: 60000 }, async (t) => {
     }
   });
 
+  await t.test('refund policy is trade-agnostic: job trades and appointment trades, no plumbing/HVAC/braider-only wording', async () => {
+    const html = await site.publicResource('/refunds');
+    const intro = html.slice(html.indexOf('<p>This policy covers'));
+    assert.match(intro, /appointment or a job/i);
+    assert.match(html, /<b>Job trades<\/b>/);
+    assert.match(html, /<b>Appointment trades<\/b>/);
+    assert.ok(html.includes('id="appointment-trades"'), 'appointment trades section anchor');
+    assert.ok(html.includes('href="#appointment-trades"'), 'intro links to appointment trades section');
+    assert.ok(!/a participating plumbing or HVAC business/i.test(html), 'scope must not be plumbing/HVAC-only');
+    assert.ok(!/\bstylist\b[^.]*\("the stylist"\)/i.test(html), 'defined term must not be "the stylist"');
+    // existing rules are unchanged
+    for (const rule of [/100% of your deposit back/, /cancel at least 24 hours before/, /within 30 days/, /within 15 minutes/, /original card/, /5\u201310 business days/]) assert.match(html, rule);
+    assert.match(html, /no partial refunds/);
+    assert.match(html, /hello@trybuzzcall\.com/);
+    assert.match(html, /\(470\) 482-8377/);
+    const home = await site.publicResource('/');
+    assert.match(home, /job trades like Home Services/);
+    assert.match(home, /appointment trades like braiding/);
+  });
+
   await t.test('expected local page links and assets resolve, including cross-page and SVG fragments', async () => {
     const home = await site.publicResource('/');
     const homeLinks = new Set(localReferences(home, '/', site.origin).map((url) => url.pathname + url.hash));
