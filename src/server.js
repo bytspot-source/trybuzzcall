@@ -8,6 +8,7 @@ const { sendSms, live } = require('./sms');
 const agent = require('./agent');
 const booking = require('./booking');
 const billing = require('./billing');
+const connect = require('./connect');
 const setupRules = require('./setupRules');
 const setupPages = require('./setupPages');
 const crypto = require('crypto');
@@ -30,6 +31,49 @@ app.post('/stripe/webhook', express.raw({ type: '*/*' }), async (req, res) => {
     const id = s.metadata?.bookingId || s.client_reference_id;
     if (id && s.payment_status !== 'unpaid') await onPaid(id);
   }
+  res.json({ received: true });
+});
+// Stripe Connect webhook (endpoint scope "Connected accounts", its own signing secret STRIPE_CONNECT_WEBHOOK_SECRET).
+// Deposits are direct charges on the shop's account, so their checkout events arrive here with a top-level `account`.
+// Only events for THIS shop's connected account are acted on (every Connect endpoint of a platform receives every
+// connected account's events); others are acknowledged and ignored so Stripe doesn't retry them.
+app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, res) => {
+  let event;
+  try {
+    const secret = process.env.STRIPE_CONNECT_WEBHOOK_SECRET;
+    if (secret) event = require('stripe').webhooks.constructEvent(req.body, req.headers['stripe-signature'] || '', secret);
+    else if (connect.mode() === 'mock') event = JSON.parse(req.body.toString('utf8')); // dev/mock only
+    else return res.status(503).send('Connect webhook not configured (STRIPE_CONNECT_WEBHOOK_SECRET)');
+  } catch (e) { return res.status(400).send(`Webhook error: ${e.message}`); }
+  const ignore = (why) => res.json({ received: true, ignored: why });
+  const acct = connect.accountId();
+  if (!event || !event.account || !acct || event.account !== acct) return ignore('account mismatch');
+  if (!connect.livemodeOk(event)) return ignore('livemode mismatch');
+  const o = event.data?.object || {};
+  try {
+    switch (event.type) {
+      case 'checkout.session.completed': case 'checkout.session.async_payment_succeeded': {
+        if (o.mode && o.mode !== 'payment') return ignore('not a deposit');
+        const id = o.metadata?.bookingId || o.client_reference_id;
+        const b = id && store.findBooking(id);
+        if (!b) return ignore('unknown booking');
+        if (b.connectAccount && b.connectAccount !== event.account) return ignore('booking account mismatch');
+        if (o.payment_status === 'paid' || o.payment_status === 'no_payment_required') await onPaid(id);
+        break;
+      }
+      case 'checkout.session.async_payment_failed': {
+        const b = store.findBooking(o.metadata?.bookingId || o.client_reference_id);
+        if (b && !b.paid) { b.paymentFailed = true; store.save(); }
+        break;
+      }
+      case 'account.updated': connect.applyAccount(o); break;
+      case 'account.application.deauthorized':
+        connect.deauthorize();
+        await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: Stripe was disconnected from BuzzCall. Deposits are off until you reconnect Stripe.`);
+        break;
+      default: return ignore('unhandled type');
+    }
+  } catch (e) { console.error('connect webhook error:', e.message); return res.status(500).send('connect handler error'); }
   res.json({ received: true });
 });
 app.use(express.urlencoded({ extended: false }));
@@ -136,12 +180,17 @@ async function onBooked(lead, b) {
   if (b.status === 'held') {
     let url;
     try { url = await booking.depositLink(b, BASE); } catch (e) { console.error('deposit link failed:', e.message); }
+    // Fail closed: null = Stripe live/test but the shop's connected account isn't ready. No deposit, plain booking.
+    if (url === null) booking.skipDeposit(b, 'stripe_not_connected');
+  }
+  if (b.status === 'held') {
     const c = booking.cfg();
-    msg = url ? agent.texts.held(lead.name, b, c.holdMin, url) : agent.texts.heldNoLink(lead.name, b);
+    msg = b.payUrl ? agent.texts.held(lead.name, b, c.holdMin, b.payUrl) : agent.texts.heldNoLink(lead.name, b);
   } else msg = agent.texts.bookedNoDeposit(lead.name, b);
   lead.messages.push({ dir: 'out', body: msg }); store.save();
   await sendSms(lead.phone, msg);
-  const status = b.status === 'held' ? `slot held, deposit pending ($${b.amount}, hold expires ${new Date(b.holdExpiresAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })})` : 'BOOKED (no deposit)';
+  const status = b.status === 'held' ? `slot held, deposit pending ($${b.amount}, hold expires ${new Date(b.holdExpiresAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })})`
+    : b.depositSkipped ? 'BOOKED (no deposit; deposit off: Stripe not connected)' : 'BOOKED (no deposit)';
   if (b.service) await owner(lead.id, `BUZZ ${env.BUSINESS_NAME || ''}: ${status.replace('slot held', 'time held')}: ${lead.name}, ${lead.need}, ${b.slotLabel}. tel:${lead.phone}`);
   else await owner(lead.id, `${tag(lead)}BUZZ ${env.BUSINESS_NAME || ''}: ${status}: ${lead.name}, ${lead.need}, ${b.slotLabel}. Tap to call: tel:${lead.phone}`);
 }
@@ -149,6 +198,8 @@ async function onBooked(lead, b) {
 const money = (n) => (Number.isInteger(n) ? String(n) : Number(n).toFixed(2));
 const feeNote = (b) => b.lead_fee_status === 'waived' ? 'lead fee waived (pilot)' : `lead fee $${money(b.lead_fee || 0)}${b.lead_fee_status === 'collected' ? ' (auto-deducted)' : ''}`;
 
+// Deposits are paid into the shop's own Stripe account: refunds are issued by the owner there (no in-app refund tool).
+const refundNote = (b) => (b.connectAccount ? '. Deposit is in your Stripe account; refunds from your Stripe Dashboard.' : '');
 async function onPaid(id) {
   const { booking: b, changed, conflict } = booking.markPaid(id);
   if (!b || !changed) return b;
@@ -162,8 +213,8 @@ async function onPaid(id) {
   if (lead.messages) { lead.messages.push({ dir: 'out', body: msg }); store.save(); }
   await sendSms(b.phone, msg);
   if (b.service) { // appointment trades: 'BOOKED + PAID: <name>, <service>, <time>, $50 deposit'
-    await owner(b.leadId, `BOOKED + PAID: ${b.name}, ${b.service}, ${b.slotLabel}, $${money(b.amount)} deposit${b.details ? `. Notes: ${b.details}` : ''}. tel:${b.phone}`);
-  } else await owner(b.leadId, `${tag(lead)}BOOKED + PAID $${b.amount}: ${b.name}, ${b.need}, ${b.slotLabel}, ${feeNote(b)}, tel:${b.phone}`);
+    await owner(b.leadId, `BOOKED + PAID: ${b.name}, ${b.service}, ${b.slotLabel}, $${money(b.amount)} deposit${b.details ? `. Notes: ${b.details}` : ''}. tel:${b.phone}${refundNote(b)}`);
+  } else await owner(b.leadId, `${tag(lead)}BOOKED + PAID $${b.amount}: ${b.name}, ${b.need}, ${b.slotLabel}, ${feeNote(b)}, tel:${b.phone}${refundNote(b)}`);
   return b;
 }
 
@@ -301,6 +352,53 @@ app.post('/admin/config/reset', requireAdmin, sameOrigin, (req, res) => {
   res.redirect(303, '/admin#setups');
 });
 
+// ---------- Stripe Connect onboarding (deposits go to the shop owner's own Stripe account) ----------
+// Account Links are single-use and must only be given to the authenticated account holder: always a redirect from
+// an admin-authenticated request, never texted or emailed.
+const connectPrefill = () => ({ name: env.BUSINESS_NAME || '', url: /^https:\/\//.test(BASE) ? BASE : '' });
+async function startOnboarding(req, res) {
+  try {
+    const r = await connect.onboard(BASE, connectPrefill());
+    if (wantsJson(req)) return res.json({ ok: true, url: r.url, accountId: r.accountId, created: r.created });
+    res.redirect(303, r.url);
+  } catch (e) { console.error('connect onboarding failed:', e.message); res.status(502).type('text').send('Could not start Stripe onboarding. Check the server logs and try again.'); }
+}
+app.post('/admin/connect/onboard', requireAdmin, sameOrigin, startOnboarding);
+app.get('/admin/connect/refresh', requireAdmin, startOnboarding); // Stripe sends the owner here when a link expired
+app.get('/admin/connect/return', requireAdmin, async (req, res) => { // returning does NOT mean onboarding is complete
+  try { await connect.refresh(); } catch (e) { console.error('connect status refresh failed:', e.message); }
+  if (wantsJson(req)) return res.json(connect.summary());
+  res.redirect(303, '/admin#connect');
+});
+app.post('/admin/connect/sync', requireAdmin, sameOrigin, async (req, res) => {
+  try { await connect.refresh(); } catch (e) { console.error('connect status refresh failed:', e.message); }
+  if (wantsJson(req)) return res.json(connect.summary());
+  res.redirect(303, '/admin#connect');
+});
+app.get('/admin/connect/status', requireAdmin, (req, res) => res.json(connect.summary()));
+// Mock mode only (no STRIPE_SECRET_KEY): simulated Stripe onboarding.
+const connectMockOnly = (req, res, next) => (connect.mode() !== 'mock' ? res.status(404).send('mock onboarding disabled (Stripe configured)') : next());
+app.get('/admin/connect/mock', connectMockOnly, requireAdmin, (req, res) => {
+  const x = connect.summary();
+  res.type('html').send(`<!doctype html><meta charset="utf-8"><title>MOCK Stripe onboarding</title><body style="font-family:sans-serif;margin:2rem;max-width:40rem">
+<h1>MOCK Stripe onboarding</h1><p>No Stripe key is configured, so this simulates the Stripe-hosted onboarding for account <code>${escH(x.accountId || '-')}</code>. No real money moves.</p>
+<form method="post" action="/admin/connect/mock/complete"><button>Finish mock onboarding (charges enabled)</button></form><p><a href="/admin#connect">Back to admin</a></p>`);
+});
+app.post('/admin/connect/mock/complete', connectMockOnly, requireAdmin, sameOrigin, (req, res) => {
+  const s = connect.mockComplete();
+  if (!s) return res.status(409).json({ error: 'start onboarding first' });
+  if (wantsJson(req)) return res.json(connect.summary());
+  res.redirect(303, '/admin#connect');
+});
+function connectHtml(esc) {
+  const x = connect.summary();
+  const btn = x.status === 'charges_enabled' ? '' : `<form method="post" action="/admin/connect/onboard" style="display:inline"><button>${x.accountId ? 'Continue Stripe onboarding' : 'Connect Stripe to receive deposits'}</button></form> `;
+  const sync = x.accountId && x.mode !== 'mock' ? '<form method="post" action="/admin/connect/sync" style="display:inline"><button>Refresh status</button></form>' : '';
+  return `<h1 id="connect">Deposit payouts (Stripe Connect)</h1><p>Status: <b>${esc(x.label)}</b> (${esc(x.mode)})${x.accountId ? ` · account <code>${esc(x.accountId)}</code>${x.source === 'env' ? ' (from STRIPE_CONNECT_ACCOUNT_ID)' : ''}` : ''}${x.accountId ? ` · details submitted: ${x.detailsSubmitted ? 'yes' : 'no'} · payouts: ${x.payoutsEnabled ? 'on' : 'off'}` : ''}${x.requirementsDue.length ? ` · Stripe still needs: ${esc(x.requirementsDue.join(', '))}` : ''}</p>
+<p>Deposits are paid straight into the shop's own Stripe account (the shop is the seller); refunds are issued by the owner from their Stripe Dashboard. ${x.depositsReady ? 'Deposits: <b>ON</b>.' : 'Deposits: <b>OFF</b> until charges are enabled; callers are booked without a deposit.'}</p>
+<p>${btn}${sync}</p>`;
+}
+
 // Admin (HTTP Basic auth, any username)
 app.get('/admin', requireAdmin, (req, res) => {
   const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -312,15 +410,17 @@ app.get('/admin', requireAdmin, (req, res) => {
     return `<li>${esc(w.email)}${label ? ` · Business type: ${esc(label)}` : ''}</li>`;
   }).join('');
   res.send(`<!doctype html><meta charset="utf-8"><title>Admin</title><style>body{font-family:sans-serif;margin:2rem}td,th{border:1px solid #ccc;padding:4px 8px}table{border-collapse:collapse}</style>
-${billingHtml(esc)}<h1>Leads</h1><table><tr><th>When</th><th>Phone</th><th>Name</th><th>Need</th><th>Callback</th><th>Status</th></tr>${rows}</table>
-<h2>Lead fees</h2><p><b>Total: $${money(lf.total)}</b> from ${lf.count} paid lead(s) (fee $${money(fc.leadFee)}/paid lead${fc.leadFeeWaived ? ', WAIVED' : ''}; ${fc.connectAccount ? 'Stripe Connect ' + esc(fc.connectAccount) : 'no Connect: invoice monthly'})<br>Due (to invoice): $${money(lf.due)} · Collected via Connect: $${money(lf.collected)} · Waived (pilot): $${money(lf.waived)} · Under review (slot lost): $${money(lf.review)}</p>
-<h2>Bookings</h2><ul>${(store.db.bookings || []).slice(0, 50).map((b) => `<li>${esc(b.slotLabel)}: ${esc(b.name)} (${esc(b.phone)}) - ${esc(b.status)}${b.paid ? ' PAID $' + esc(b.amount) : ''}${b.lead_fee_status ? ` · lead fee $${money(b.lead_fee || 0)} ${esc(b.lead_fee_status)}` : ''}</li>`).join('')}</ul><h2>Owner alerts</h2><ul>${alerts}</ul><h2>Waitlist (${store.db.waitlist.length})</h2><ul>${waitlist}</ul>
+${billingHtml(esc)}${connectHtml(esc)}<h1>Leads</h1><table><tr><th>When</th><th>Phone</th><th>Name</th><th>Need</th><th>Callback</th><th>Status</th></tr>${rows}</table>
+<h2>Lead fees</h2><p><b>Total: $${money(lf.total)}</b> from ${lf.count} paid lead(s) (fee $${money(fc.leadFee)}/paid lead${fc.leadFeeWaived ? ', WAIVED' : ''}; ${fc.connectAccount ? 'Stripe Connect ' + esc(fc.connectAccount) + ' (application fee, capped at 1/3 of the deposit)' : 'no Stripe connected'})<br>Due (to invoice): $${money(lf.due)} · Collected via Connect: $${money(lf.collected)} · Waived (pilot): $${money(lf.waived)} · Under review (slot lost): $${money(lf.review)}</p>
+<h2>Bookings</h2><ul>${(store.db.bookings || []).slice(0, 50).map((b) => `<li>${esc(b.slotLabel)}: ${esc(b.name)} (${esc(b.phone)}) - ${esc(b.status)}${b.paid ? ' PAID $' + esc(b.amount) : ''}${b.depositSkipped ? ' · deposit off: Stripe not connected' : ''}${b.lead_fee_status ? ` · lead fee $${money(b.lead_fee || 0)} ${esc(b.lead_fee_status)}` : ''}</li>`).join('')}</ul><h2>Owner alerts</h2><ul>${alerts}</ul><h2>Waitlist (${store.db.waitlist.length})</h2><ul>${waitlist}</ul>
 ${setupPages.adminSetupsHtml(store.db.setups, config.effective(), config.override(), booking.cfg())}`);
 });
 
 setInterval(() => booking.expireHolds(), 60000).unref();
 billing.init({ notify: (msg) => owner(null, msg), BASE });
-app.get('/health', (_, res) => res.json({ ok: true, vertical: booking.cfg().vertical, trade: booking.cfg().trade, flow: booking.cfg().flow, billing: billing.summary().mode, serviceActive: billing.access().active, twilio: live, openai: !!env.OPENAI_API_KEY, booking: booking.cfg().booking, deposit: booking.cfg().deposit, stripe: !!env.STRIPE_SECRET_KEY, leadFee: booking.cfg().leadFee, leadFeeWaived: booking.cfg().leadFeeWaived, connect: !!booking.cfg().connectAccount, storage: store.backend() }));
+app.get('/health', (_, res) => res.json({ ok: true, vertical: booking.cfg().vertical, trade: booking.cfg().trade, flow: booking.cfg().flow, billing: billing.summary().mode, serviceActive: billing.access().active, twilio: live, openai: !!env.OPENAI_API_KEY, booking: booking.cfg().booking, deposit: booking.cfg().deposit, stripe: !!env.STRIPE_SECRET_KEY, leadFee: booking.cfg().leadFee, leadFeeWaived: booking.cfg().leadFeeWaived, connect: connect.mode() !== 'mock' && connect.depositsReady(), connectStatus: connect.status(), storage: store.backend() }));
+module.exports = { app, onPaid, onBooked };
+if (require.main !== module) return; // required by tests: no listener, no signal handlers
 const port = env.PORT || 3000;
 // Load persisted state first (Postgres when DATABASE_URL is set; no-op for file storage), then accept traffic.
 store.init().then(() => {

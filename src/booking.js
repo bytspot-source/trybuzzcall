@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const store = require('./store');
 const env = require('./config').env; // override > env (see config.js)
 const trades = require('./trades');
+const connect = require('./connect');
 const on = (v) => /^(1|true|yes|on)$/i.test(String(v || ''));
 // Trade (see trades.js): BUSINESS_TYPE (+ BUSINESS_FLOW / BUSINESS_TRADE_LABEL for 'other') wins. Legacy env still works:
 // VERTICAL=braiders (or BUSINESS_VERTICAL=braid*) -> braiders; otherwise BUSINESS_VERTICAL plumber (default) | hvac | ...
@@ -49,8 +50,9 @@ const cfg = () => {
     amount: num(env.DEPOSIT_AMOUNT, t.deposit),
     // Per-paid-lead fee (USD) charged to the shop only when a caller books AND pays the deposit.
     leadFee: num(env.LEAD_FEE, appts ? 5 : 12),
-    leadFeeWaived: on(env.LEAD_FEE_WAIVED), // e.g. during the free pilot: fee is recorded as 'waived', nothing charged
-    connectAccount: (env.STRIPE_CONNECT_ACCOUNT_ID || '').trim() || null, // shop's Stripe Connect account (acct_...)
+    // Pilot default: waived unless LEAD_FEE_WAIVED is explicitly 0/false/off. Fee is recorded as 'waived', nothing charged.
+    leadFeeWaived: String(env.LEAD_FEE_WAIVED ?? '').trim() === '' ? true : on(env.LEAD_FEE_WAIVED),
+    connectAccount: connect.accountId(), // shop's Stripe connected account (acct_...): config override, else env fallback
   };
 };
 
@@ -109,15 +111,21 @@ function hold(lead, slot) {
   store.db.bookings.unshift(b); store.save(); return b;
 }
 
-// Stripe Connect destination charge: the deposit goes to the shop's connected account and the
-// per-paid-lead fee is kept by the platform as the application fee. Fee is capped at the deposit.
-function connectParams(b) {
+// Stripe Connect DIRECT charge params (the Checkout Session itself is created on the shop's account via the
+// stripeAccount option, see depositLink). The lead fee, when not waived, is the application fee, capped at
+// deposit - 1 cent and at 1/3 of the deposit. Never transfer_data: funds never sit in BuzzCall's balance.
+function connectParams(b, acct) {
   const c = cfg();
-  if (!c.connectAccount) return {};
-  const feeCents = c.leadFeeWaived ? 0 : Math.min(Math.round(c.leadFee * 100), Math.round(b.amount * 100));
-  b.connectAccount = c.connectAccount; b.applicationFeeCents = feeCents;
-  return { payment_intent_data: { transfer_data: { destination: c.connectAccount },
-    ...(feeCents > 0 ? { application_fee_amount: feeCents } : {}), metadata: { bookingId: b.id } } };
+  const feeCents = connect.applicationFeeCents(Math.round(b.amount * 100), c.leadFee, c.leadFeeWaived);
+  b.connectAccount = acct; b.applicationFeeCents = feeCents;
+  return { payment_intent_data: { ...(feeCents > 0 ? { application_fee_amount: feeCents } : {}), metadata: { bookingId: b.id } } };
+}
+
+// Fail closed: no ready connected account (live/test Stripe) => no deposit. The held booking becomes a plain booking
+// (no deposit) and the owner is told why. Returns the booking.
+function skipDeposit(b, reason = 'stripe_not_connected') {
+  b.status = 'confirmed'; b.amount = 0; b.depositSkipped = reason; b.holdExpiresAt = null; store.save();
+  return b;
 }
 
 // Records the lead fee on a paid booking (once). Status:
@@ -145,20 +153,27 @@ function leadFeeTotals() {
   return t;
 }
 
+// Returns the pay URL, or null when deposits can't be taken (fail closed: never a platform-account charge).
 async function depositLink(b, BASE) {
   if (env.STRIPE_SECRET_KEY) {
-    const stripe = require('stripe')(env.STRIPE_SECRET_KEY);
-    const s = await stripe.checkout.sessions.create({
+    await connect.ensureFresh();
+    const acct = connect.chargeAccount();
+    if (!acct) return null;
+    const s = await connect.stripe().checkout.sessions.create({
       mode: 'payment',
       line_items: [{ quantity: 1, price_data: { currency: 'usd', unit_amount: Math.round(b.amount * 100),
         product_data: { name: b.service ? `Deposit: ${b.service} with ${env.BUSINESS_NAME || `your ${trade().pro || 'pro'}`}, ${b.slotLabel}` : `Deposit: ${env.BUSINESS_NAME || 'service'} visit ${b.slotLabel}` } } }],
       metadata: { bookingId: b.id }, client_reference_id: b.id,
       expires_at: Math.floor(Date.now() / 1000) + Math.max(cfg().holdMin, 30) * 60, // Stripe min 30 min
       success_url: `${BASE}/?deposit=success`, cancel_url: `${BASE}/?deposit=cancel`,
-      ...connectParams(b),
-    });
+      ...connectParams(b, acct),
+    }, { stripeAccount: acct });
     b.stripeSessionId = s.id; b.payUrl = s.url;
-  } else b.payUrl = `${BASE}/pay/mock/${b.id}`;
+  } else {
+    b.payUrl = `${BASE}/pay/mock/${b.id}`;
+    const mockAcct = connect.chargeAccount(); // mock: tag with the simulated connected account, if onboarded
+    if (mockAcct) connectParams(b, mockAcct);
+  }
   store.save(); return b.payUrl;
 }
 
@@ -175,4 +190,4 @@ function markPaid(id) {
   return { booking: b, changed: true };
 }
 
-module.exports = { cfg, vertical, trade, parseServices, nextSlots, hold, depositLink, markPaid, expireHolds, leadFeeTotals, connectParams };
+module.exports = { cfg, vertical, trade, parseServices, nextSlots, hold, depositLink, markPaid, expireHolds, leadFeeTotals, connectParams, skipDeposit };

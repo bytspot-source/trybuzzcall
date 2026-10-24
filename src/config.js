@@ -36,10 +36,11 @@ function applyTZ() {
 function apply(map, meta = {}) {
   const clean = {};
   for (const k of KEYS) if (map && map[k] !== undefined && map[k] !== null) clean[k] = String(map[k]);
-  store.setOverride({ values: clean, ...meta, appliedAt: new Date().toISOString() });
+  const keep = store.getOverride().stripeConnect; // Stripe Connect state (src/connect.js) survives re-applying the setup
+  store.setOverride({ values: clean, ...meta, appliedAt: new Date().toISOString(), ...(keep ? { stripeConnect: keep } : {}) });
   applyTZ();
   return clean;
 }
-function clear() { store.setOverride({}); applyTZ(); }
+function clear() { const keep = store.getOverride().stripeConnect; store.setOverride(keep ? { stripeConnect: keep } : {}); applyTZ(); }
 
 module.exports = { env, KEYS, effective, apply, clear, applyTZ, override: () => store.getOverride() };
