@@ -674,7 +674,8 @@ test('audiences have separate examples and only Home Services offers checkout', 
   const homePricing = articles.find(({ attrs }) => attrs.id === 'home-services-pricing');
   const braiderPricing = articles.find(({ attrs }) => attrs.id === 'braider-pricing');
   assert.match(text(homePricing.content), /\$49/);
-  assert.match(text(homePricing.content), /\$12 per paid booking/);
+  assert.match(text(homePricing.content), /Per-booking fee: waived for founding shops \(pilot\)/);
+  assert.doesNotMatch(text(homePricing.content), /\$12/);
   assert.equal(tags(homePricing.content, 'button').filter(({ attrs }) => attrs['data-checkout']).length, 2);
   assert.equal(tags(braiderPricing.content, 'button').length, 0);
   assert.match(text(braiderPricing.content), /Home Services rates do not automatically apply/);
