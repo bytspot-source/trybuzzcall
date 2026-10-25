@@ -2,7 +2,10 @@
 // sendSms NEVER throws: it resolves { ok, sid?, skipped?, code?, error? } so one failed send (Twilio outage, 21610
 // "unsubscribed recipient", a bad number) can't take the process down.
 // Before every send: the persisted opt-out list (store.optOuts), the production placeholder-owner guard, and the
-// hourly cap on caller-facing texts (OUTBOUND_MAX_PER_HOUR, default 200; 0 = off; owner alerts don't count).
+// caps on caller-facing texts: OUTBOUND_MAX_PER_HOUR (default 200) and OUTBOUND_MAX_PER_DAY (default 500, rolling
+// 24h window); 0 = off; owner alerts don't count. The daily cap bounds a slow SMS-pumping drip that stays under the
+// hourly cap (200/h would otherwise allow 4,800/day). 500/day is ~10x a busy single-location shop's real volume
+// (~20-40 missed calls/day x a few texts each) while capping worst-case spend at roughly $4-5/day in US SMS fees.
 // Logs: stdout gets metadata only (masked number, kind, length, result), never the body. data/sms.log is the local
 // demo "outbox" and keeps bodies outside production (the demo scripts read it); in production it is metadata only
 // unless SMS_LOG_BODIES=1. Phone numbers are masked in production unless LOG_FULL_PHONES=1.
@@ -15,14 +18,18 @@ const { TWILIO_ACCOUNT_SID: sid, TWILIO_AUTH_TOKEN: tok, TWILIO_PHONE_NUMBER: fr
 let client = sid && tok && from ? require('twilio')(sid, tok) : null;
 const OPTED_OUT_CODES = new Set([21610]); // Twilio: "Attempt to send to unsubscribed recipient"
 
-const capWindowMs = 3600000;
-let cap = null, capKey = null, capAlerted = 0;
-const capLimit = () => num(process.env.OUTBOUND_MAX_PER_HOUR, 200);
-function capHit() {
-  const max = capLimit();
-  if (!max) return { ok: true };
-  if (!cap || capKey !== max) { cap = limiter({ windowMs: capWindowMs, max }); capKey = max; }
-  return cap.hit('all');
+const CAPS = {
+  hour: { windowMs: 3600000, env: 'OUTBOUND_MAX_PER_HOUR', def: 200, lim: null, key: null, alerted: 0 },
+  day: { windowMs: 86400000, env: 'OUTBOUND_MAX_PER_DAY', def: 500, lim: null, key: null, alerted: 0 },
+};
+const capMax = (c) => num(process.env[c.env], c.def);
+const capLim = (c) => { const max = capMax(c); if (!c.lim || c.key !== max) { c.lim = limiter({ windowMs: c.windowMs, max }); c.key = max; } return c.lim; };
+// Returns the name of the cap that blocks this send ('hour' | 'day'), or null after counting the send against both.
+function capCheck() {
+  const active = Object.entries(CAPS).filter(([, c]) => capMax(c) > 0);
+  for (const [name, c] of active) if (capLim(c).blocked('all')) return name;
+  for (const [, c] of active) capLim(c).hit('all');
+  return null;
 }
 let onCap = async () => {};
 const setCapAlert = (fn) => { onCap = fn || (async () => {}); };
@@ -39,7 +46,7 @@ function writeLog(to, body, kind, result) {
   try { fs.appendFileSync(LOG, (full ? line : maskPhone(line)) + '\n'); } catch (e) { console.error('sms.log write failed:', e.message); }
 }
 
-// opts.kind: 'caller' (default; counts toward the hourly cap) | 'owner' (alerts to the shop owner)
+// opts.kind: 'caller' (default; counts toward the hourly/daily caps) | 'owner' (alerts to the shop owner)
 // opts.force: send even to an opted-out number (only for the one confirmation of a plain-language opt-out, and HELP).
 async function sendSms(to, body, opts = {}) {
   const kind = opts.kind || 'caller';
@@ -51,14 +58,15 @@ async function sendSms(to, body, opts = {}) {
     }
     if (!opts.force && store.isOptedOut(to)) { console.log(`[sms] skipped ${maskPhone(to)}: opted out`); return { ok: false, skipped: 'opted_out' }; }
     if (kind === 'caller') {
-      const c = capHit();
-      if (!c.ok) {
-        console.error(`[security] outbound SMS cap reached (${capLimit()}/hour): not texting ${maskPhone(to)}`);
-        if (Date.now() - capAlerted > capWindowMs) {
-          capAlerted = Date.now();
-          Promise.resolve().then(() => onCap(capLimit())).catch((e) => console.error('cap alert failed:', e.message));
+      const name = capCheck();
+      if (name) {
+        const c = CAPS[name];
+        console.error(`[security] outbound SMS cap reached (${capMax(c)}/${name}): not texting ${maskPhone(to)}`);
+        if (Date.now() - c.alerted > c.windowMs) {
+          c.alerted = Date.now();
+          Promise.resolve().then(() => onCap(capMax(c), name)).catch((e) => console.error('cap alert failed:', e.message));
         }
-        return { ok: false, skipped: 'cap' };
+        return { ok: false, skipped: name === 'day' ? 'cap_day' : 'cap' };
       }
     }
     if (!client) { writeLog(to, body, kind, 'log-only'); return { ok: true, logOnly: true }; }
@@ -79,5 +87,5 @@ async function sendSms(to, body, opts = {}) {
 }
 // Tests inject a fake Twilio client (never hits the network).
 const setClient = (c) => { client = c; };
-const resetCap = () => { cap = null; capAlerted = 0; };
+const resetCap = () => { for (const c of Object.values(CAPS)) { c.lim = null; c.key = null; c.alerted = 0; } };
 module.exports = { sendSms, live: !!client, setClient, setCapAlert, resetCap, OPTED_OUT_CODES };

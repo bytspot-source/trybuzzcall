@@ -120,9 +120,9 @@ test('production: placeholder OWNER_PHONE is never texted (warning, no crash); b
 });
 
 // ---------- (2) opt-outs ----------
-test('opt-out keywords (Twilio list, any case/punctuation) stop all texts; START/UNSTOP resubscribe', async (t) => {
+test('opt-out keywords (Twilio list, any case) stop all texts; START/UNSTOP resubscribe', async (t) => {
   quiet(t);
-  for (const kw of ['STOP', 'stopall', 'Unsubscribe', 'cancel', 'END', 'quit', 'OptOut', 'revoke', 'Stop!']) {
+  for (const kw of ['STOP', 'stopall', 'Unsubscribe', 'cancel', 'END', 'quit', 'OptOut', 'revoke', ' Stop ']) {
     const p = num();
     await call(p);
     const before = sentTo(p).length;
@@ -272,13 +272,16 @@ test('service names with regex characters do not throw', (t) => {
 });
 
 // ---------- (10) retention ----------
-test('retention purge drops old leads/alerts only; off by default', (t) => {
+test('retention purge drops old leads/alerts only; 0 = off, default 365', (t) => {
   quiet(t);
   const old = new Date(Date.now() - 100 * 86400000).toISOString();
   store.db.leads.push({ id: 'oldlead', phone: '+14045550001', createdAt: old, messages: [{ dir: 'in', body: 'x' }], status: 'done' });
   store.db.alerts.push({ to: 'x', body: 'old alert', at: old });
   store.optOut('+14045550002', 'keyword');
-  assert.equal(app.locals.runRetention(), null, 'RETENTION_DAYS unset = off');
+  withEnv(t, { RETENTION_DAYS: '0' });
+  assert.equal(app.locals.runRetention().leads, 0, 'RETENTION_DAYS=0 = off');
+  withEnv(t, { RETENTION_DAYS: undefined });
+  assert.equal(app.locals.runRetention().leads, 0, 'default 365 days keeps a 100-day-old lead');
   withEnv(t, { RETENTION_DAYS: '90' });
   const r = app.locals.runRetention();
   assert.equal(r.leads, 1); assert.equal(r.alerts, 1);

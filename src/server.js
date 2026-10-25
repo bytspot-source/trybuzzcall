@@ -100,6 +100,11 @@ app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, re
 });
 app.use(express.urlencoded({ extended: false, limit: '100kb' }));
 app.use(express.json({ limit: '100kb' }));
+// Central CSRF guard: every state-changing request (anything but GET/HEAD/OPTIONS) to an admin or billing endpoint
+// (/admin/*, /api/billing/*, /billing/*, including the mock billing routes) must come from this site. Registered once,
+// before every such route, so a new route can't forget it. Case-insensitive because Express routing is.
+const ORIGIN_GUARDED = /^\/(admin|api\/billing|billing)(\/|$)/i;
+app.use((req, res, next) => (['GET', 'HEAD', 'OPTIONS'].includes(req.method) || !ORIGIN_GUARDED.test(req.path) ? next() : sameOrigin(req, res, next)));
 // Never serve editor/backup leftovers (e.g. public/terms.html.bak-*) or dotfiles from public/.
 app.use((req, res, next) => (/\.(bak|orig|swp)\b|~$|\/\./i.test(req.path) ? res.status(404).send('Not found') : next()));
 // Public site. `extensions` gives clean URLs (/privacy, /terms, /refunds, /sms-consent) as well as the .html paths.
@@ -190,6 +195,7 @@ const missedSay = () => (!agent.isAppointments() ? 'Sorry we missed you. We just
 async function inactiveText(phone) {
   if (!sec.isNanp(phone) || store.isOptedOut(phone) || billing.cfg().inactiveMode === 'silent') return;
   store.db.inactiveTexts = store.db.inactiveTexts || {};
+  pruneInactiveTexts();
   const last = store.db.inactiveTexts[phone];
   if (last && Date.now() - Date.parse(last) < 86400000) return;
   store.db.inactiveTexts[phone] = new Date().toISOString(); store.save();
@@ -216,7 +222,7 @@ function textBackAllowed(phone) {
 // Only valid US/Canada numbers get a text-back: anonymous/restricted/blank caller IDs and international or premium
 // numbers are skipped (SMS pumping / toll fraud). Returns true when a text was sent.
 async function startTextBack(phone) {
-  if (!sec.isNanp(phone)) { console.log(`[textback] skipped caller id ${phone ? sec.maskPhone(String(phone).slice(0, 20)) : '(blank)'}: not a US/Canada number`); return false; }
+  if (!sec.isNanp(phone)) { console.log(`[textback] skipped caller id ${phone ? sec.maskPhone(String(phone).slice(0, 20)) : '(blank)'}: ${sec.nanpReason(phone)}`); return false; }
   if (store.isOptedOut(phone)) { console.log(`[textback] skipped ${sec.maskPhone(phone)}: opted out`); return false; }
   if (!billing.access().active) { await inactiveText(phone); return false; }
   if (!textBackAllowed(phone)) { console.log(`[textback] throttled ${sec.maskPhone(phone)} (already texted recently)`); return false; }
@@ -246,25 +252,28 @@ app.post('/twilio/voice/status', verifyTwilio, async (req, res) => {
   twiml(res, '<Hangup/>');
 });
 
+// Record an opt-out durably before answering (Postgres write-through), but never hold the webhook past 5s.
+const optOutNow = (phone, source) => Promise.race([store.optOut(phone, source), sec.sleep(5000)]);
+
 // 3) Caller SMS replies
 app.post('/twilio/sms', verifyTwilio, async (req, res) => {
   const from = req.body.From, body = String(req.body.Body || '');
   if (!sec.isNanp(from)) return twiml(res, ''); // never text non-US/CA or anonymous senders
   const kw = optout.classify(body);
   const biz = env.BUSINESS_NAME || 'us';
-  if (kw === 'optout') { // Twilio's own opt-out handling sends the confirmation; we just stop texting this number
-    store.optOut(from, 'keyword'); await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: ${from} replied ${body.trim().slice(0, 20)} and is opted out of texts.`);
+  if (kw === 'optout') { // exact Twilio keyword: Twilio's opt-out handling sends the confirmation; we just record it
+    await optOutNow(from, 'keyword'); await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: ${from} replied ${body.trim().slice(0, 20)} and is opted out of texts.`);
     return twiml(res, '');
   }
-  if (kw === 'revoke') { // plain-language opt-out Twilio doesn't recognise: one confirmation, then silence
+  if (kw === 'revoke') { // any other opt-out (keyword variant or plain language): exactly one confirmation, then silence
     if (!store.isOptedOut(from)) {
-      store.optOut(from, 'message');
+      await optOutNow(from, 'message');
       await sendSms(from, `${biz}: You're unsubscribed and won't get more texts from us. Reply START to resubscribe.`, { force: true });
       await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: ${from} asked not to be texted ("${body.trim().slice(0, 60)}") and is opted out.`);
     }
     return twiml(res, '');
   }
-  if (kw === 'optin' && (store.isOptedOut(from) || !/^yes$/i.test(body.replace(/[^a-z]/gi, '')))) {
+  if (kw === 'optin' && (store.isOptedOut(from) || optout.letters(body) !== 'YES')) {
     store.optIn(from); return twiml(res, ''); // Twilio sends the re-subscribe confirmation
   }
   if (kw === 'help') {
@@ -286,7 +295,7 @@ app.post('/twilio/sms', verifyTwilio, async (req, res) => {
 
 const tag = (lead) => `${lead.urgent ? '🚨 URGENT ' : ''}`;
 const owner = async (leadId, msg) => { store.addAlert({ leadId, to: env.OWNER_PHONE, body: msg }); await sendSms(env.OWNER_PHONE || sec.PLACEHOLDER_PHONE, msg, { kind: 'owner' }); };
-sms.setCapAlert((max) => owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: outbound text limit reached (${max}/hour). Text-backs are paused until the hour resets. If this wasn't a real rush, it may be SMS pumping: check Twilio logs. Raise OUTBOUND_MAX_PER_HOUR if needed.`));
+sms.setCapAlert((max, per = 'hour') => owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: outbound text limit reached (${max}/${per}). Text-backs are paused until the ${per === 'day' ? '24-hour window' : 'hour'} resets. If this wasn't a real rush, it may be SMS pumping: check Twilio logs. Raise ${per === 'day' ? 'OUTBOUND_MAX_PER_DAY' : 'OUTBOUND_MAX_PER_HOUR'} if needed.`));
 
 async function onBooked(lead, b) {
   let msg;
@@ -381,7 +390,7 @@ app.post('/api/checkout', checkoutLimit, async (req, res) => {
   // Per-shop setup-fee override: a matching SETUP_WAIVER_CODE, or setup_waived=1 from an admin-authenticated request.
   const code = billing.cfg().setupWaiverCode;
   const given = String(req.body.setup_waiver_code || '');
-  const setupWaived = (!!code && !!given && sec.safeEqual(given, code)) || (/^(1|true|yes)$/i.test(String(req.body.setup_waived || '')) && isAdmin(req));
+  const setupWaived = (!!code && !!given && sec.safeEqual(given, code)) || (/^(1|true|yes)$/i.test(String(req.body.setup_waived || '')) && isAdmin(req) && originCheck(req) === 'ok');
   try { res.json(await billing.createCheckout({ plan, email, BASE, setupWaived })); } catch (e) { apiErr(res, e); }
 });
 // Shop-owner billing actions: admin auth (single-tenant: the shop owner is the admin).
@@ -455,19 +464,23 @@ app.post('/setup', setupLimit, (req, res) => {
   const message = "We'll review your setup and text you within 1 business day.";
   return json ? res.json({ ok: true, id: s.id, message }) : res.type('html').send(setupPages.thanksHtml(saved));
 });
-// Admin POSTs: refuse cross-site form posts (basic-auth credentials ride along automatically). Browsers send Origin on
+// Admin/billing POSTs (central guard above): refuse cross-site form posts (basic-auth credentials ride along automatically). Browsers send Origin on
 // every POST; a missing or "null" Origin falls back to Referer, and with neither the request is refused.
 // Scripts calling admin POSTs must send an Origin header matching the host.
-function sameOrigin(req, res, next) {
+function originCheck(req) {
   const host = req.get('host');
   const same = (u) => { try { return new URL(u).host === host; } catch { return false; } };
   const o = req.get('origin');
-  if (o && o !== 'null') return same(o) ? next() : res.status(403).send('cross-origin request refused');
+  if (o && o !== 'null') return same(o) ? 'ok' : 'cross';
   const ref = req.get('referer');
-  if (ref && same(ref)) return next();
-  return res.status(403).send('cross-origin request refused (missing Origin)');
+  return ref && same(ref) ? 'ok' : 'missing';
 }
-app.post('/admin/setups/:id/apply', requireAdmin, sameOrigin, (req, res) => {
+function sameOrigin(req, res, next) {
+  const r = originCheck(req);
+  if (r === 'ok') return next();
+  return res.status(403).send(r === 'cross' ? 'cross-origin request refused' : 'cross-origin request refused (missing Origin)');
+}
+app.post('/admin/setups/:id/apply', requireAdmin, (req, res) => {
   const s = store.findSetup(req.params.id);
   if (!s) return res.status(404).json({ error: 'setup not found' });
   const { values, errors } = setupRules.validate(s.values);
@@ -489,7 +502,7 @@ app.post('/admin/setups/:id/apply', requireAdmin, sameOrigin, (req, res) => {
   if (wantsJson(req)) return res.json({ ok: true, id: s.id, config: applied });
   res.redirect(303, '/admin#setups');
 });
-app.post('/admin/config/reset', requireAdmin, sameOrigin, (req, res) => {
+app.post('/admin/config/reset', requireAdmin, (req, res) => {
   config.clear();
   if (wantsJson(req)) return res.json({ ok: true });
   res.redirect(303, '/admin#setups');
@@ -506,7 +519,7 @@ async function startOnboarding(req, res) {
     res.redirect(303, r.url);
   } catch (e) { console.error('connect onboarding failed:', e.message); res.status(502).type('text').send('Could not start Stripe onboarding. Check the server logs and try again.'); }
 }
-app.post('/admin/connect/onboard', requireAdmin, sameOrigin, startOnboarding);
+app.post('/admin/connect/onboard', requireAdmin, startOnboarding);
 // Stripe sends the owner here when an onboarding link expired. GET must not create anything: with an existing account
 // it only mints a fresh onboarding link for it; with none it goes back to the admin page (creating is POST onboard).
 app.get('/admin/connect/refresh', requireAdmin, async (req, res) => {
@@ -518,7 +531,7 @@ app.get('/admin/connect/return', requireAdmin, async (req, res) => { // returnin
   if (wantsJson(req)) return res.json(connect.summary());
   res.redirect(303, '/admin#connect');
 });
-app.post('/admin/connect/sync', requireAdmin, sameOrigin, async (req, res) => {
+app.post('/admin/connect/sync', requireAdmin, async (req, res) => {
   try { await connect.refresh(); } catch (e) { console.error('connect status refresh failed:', e.message); }
   if (wantsJson(req)) return res.json(connect.summary());
   res.redirect(303, '/admin#connect');
@@ -533,7 +546,7 @@ app.get('/admin/connect/mock', connectMockOnly, requireAdmin, (req, res) => {
 <h1>MOCK Stripe onboarding</h1><p>No Stripe key is configured, so this simulates the Stripe-hosted onboarding for account <code>${escH(x.accountId || '-')}</code>. No real money moves.</p>
 <form method="post" action="/admin/connect/mock/complete"><button>Finish mock onboarding (charges enabled)</button></form><p><a href="/admin#connect">Back to admin</a></p>`);
 });
-app.post('/admin/connect/mock/complete', connectMockOnly, requireAdmin, sameOrigin, (req, res) => {
+app.post('/admin/connect/mock/complete', connectMockOnly, requireAdmin, (req, res) => {
   const s = connect.mockComplete();
   if (!s) return res.status(409).json({ error: 'start onboarding first' });
   if (wantsJson(req)) return res.json(connect.summary());
@@ -575,16 +588,30 @@ app.get('/health', (req, res) => {
   if (req.headers.authorization && isAdmin(req)) Object.assign(h, { openai: !!env.OPENAI_API_KEY, leadFee: c.leadFee, leadFeeWaived: c.leadFeeWaived, demoMode: sec.demoAllowed() });
   res.json(h);
 });
-// Retention (off by default): RETENTION_DAYS=N drops leads (with their message threads) and owner alerts older than N
-// days, at boot and daily. Bookings and opt-outs are kept.
+// Retention, at boot and daily. RETENTION_DAYS (default 365; 0 = keep forever) drops leads (with their message threads,
+// i.e. caller names/numbers/job details) and owner alerts older than N days. Why 365: a lead is only actionable for
+// days or weeks, but a year covers seasonal repeat customers (annual service, "same as last spring"), payment disputes
+// on deposits (card chargeback windows run up to ~120 days) and a full year of the shop's own records, while not
+// keeping caller PII indefinitely. Bookings (payment records) and opt-outs (needed to keep honouring STOP) are kept.
+// Always: inactive-shop text dedupe stamps (db.inactiveTexts) older than 24h are dropped (they only matter for 24h).
+const INACTIVE_TEXT_MS = 86400000;
+function pruneInactiveTexts(now = Date.now()) {
+  const t = store.db.inactiveTexts;
+  if (!t) return 0;
+  let n = 0;
+  for (const [k, v] of Object.entries(t)) if (!(now - Date.parse(v) < INACTIVE_TEXT_MS)) { delete t[k]; n++; }
+  if (n) store.save();
+  return n;
+}
 function runRetention() {
-  const days = sec.num(process.env.RETENTION_DAYS, 0);
-  if (!days) return null;
-  const r = store.purgeOlderThan(days);
+  const stamps = pruneInactiveTexts();
+  const days = sec.num(process.env.RETENTION_DAYS, 365);
+  const r = days ? store.purgeOlderThan(days) : { leads: 0, alerts: 0 };
   if (r.leads || r.alerts) console.log(`[retention] purged ${r.leads} lead(s) and ${r.alerts} alert(s) older than ${days} days`);
-  return r;
+  return { ...r, inactiveTexts: stamps, days };
 }
 app.locals.runRetention = runRetention;
+app.locals.pruneInactiveTexts = pruneInactiveTexts;
 
 // Last-resort error handler: log, generic reply, never echo internals. Twilio webhooks get empty TwiML so Twilio
 // doesn't play an error to the caller.
@@ -617,7 +644,41 @@ function bootChecks() {
 }
 app.locals.bootChecks = bootChecks;
 
-module.exports = { app, onPaid, onBooked, bootChecks, runRetention };
+// Storage durability check after store.init(). In production, file storage means opt-outs (and leads/settings) live on
+// Render's ephemeral disk and vanish on the next restart/deploy, so we log a loud warning and alert the owner once.
+// REQUIRE_POSTGRES=1 makes it fatal instead (retrying a few times first, so a brief Postgres blip at boot doesn't
+// crash-loop): Render then keeps the previous deploy live / restarts the service, rather than running without
+// durable opt-outs. Returns { ok, fatal, message }.
+async function initStorage({ retries, retryDelayMs = 3000 } = {}) {
+  const requirePg = sec.on(process.env.REQUIRE_POSTGRES);
+  const tries = requirePg ? Math.max(1, retries ?? sec.num(process.env.REQUIRE_POSTGRES_RETRIES, 5)) : 1;
+  for (let i = 1; ; i++) {
+    await store.init();
+    if (store.backend() === 'postgres' || i >= tries || !env.DATABASE_URL) break;
+    console.error(`[store] postgres not reachable (attempt ${i}/${tries}); retrying in ${Math.round(retryDelayMs / 1000)}s (REQUIRE_POSTGRES=1)`);
+    await sec.sleep(retryDelayMs);
+  }
+  return storageCheck();
+}
+async function storageCheck() {
+  const st = store.status();
+  if (st.backend === 'postgres') return { ok: true };
+  const requirePg = sec.on(process.env.REQUIRE_POSTGRES);
+  const why = st.configured ? `DATABASE_URL is set but Postgres is unreachable${st.lastError ? ` (${String(st.lastError).slice(0, 120)})` : ''}` : 'DATABASE_URL is not set';
+  if (requirePg) {
+    const message = `REQUIRE_POSTGRES=1 and ${why}: refusing to start on file storage.`;
+    console.error(`[store] FATAL: ${message}`);
+    return { ok: false, fatal: true, message };
+  }
+  if (!sec.isProduction()) return { ok: true, message: 'file storage (development)' };
+  const message = `${why}: running on FILE storage. Opt-outs, leads and settings are NOT durable (lost on the next restart/deploy).`;
+  console.error(`[store] !!!!!!!!!! WARNING: ${message} Fix the database, then restart. Set REQUIRE_POSTGRES=1 to refuse to start instead.`);
+  await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: storage warning: ${why}. BuzzCall is running on temporary file storage, so opt-outs and leads may be lost on restart. Check the database and restart the service.`).catch(() => {});
+  return { ok: false, fatal: false, message };
+}
+app.locals.initStorage = initStorage;
+
+module.exports = { app, onPaid, onBooked, bootChecks, runRetention, initStorage };
 if (require.main !== module) return; // required by tests: no listener, no signal handlers
 // Never let one stray rejection kill the line: log it and keep serving. An uncaught exception leaves the process in an
 // unknown state, so it is logged and the process exits (Render restarts it).
@@ -628,8 +689,9 @@ process.on('uncaughtException', (e) => { console.error('[uncaughtException]', e 
   if (problems.length && sec.isProduction() && sec.on(process.env.ADMIN_PASSWORD_STRICT)) { console.error('[security] ADMIN_PASSWORD_STRICT=1: refusing to start.'); process.exit(1); }
 }
 const port = env.PORT || 3000;
-// Load persisted state first (Postgres when DATABASE_URL is set; no-op for file storage), then accept traffic.
-store.init().then(() => {
+// Load persisted state first (Postgres when DATABASE_URL is set; no-op for file storage), check durability, then accept traffic.
+initStorage().then((st) => {
+if (st.fatal) process.exit(1);
 config.applyTZ(); // the stored override may have just been loaded from Postgres
 runRetention(); setInterval(runRetention, 86400000).unref();
 const server = app.listen(port, () => console.log(`missedcall-buzz on :${port} (vertical ${booking.cfg().vertical}, trade ${booking.cfg().trade}, twilio ${live ? 'LIVE' : 'LOG-ONLY'}, ai ${env.OPENAI_API_KEY ? 'openai' : 'templates'}, storage ${store.backend()})`));

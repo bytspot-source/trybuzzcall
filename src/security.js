@@ -89,11 +89,28 @@ function securityHeaders(base) {
   };
 }
 
-// US/Canada (NANP) E.164 only: +1, area code and exchange starting 2-9. Rejects anonymous/restricted placeholders
-// Twilio sends (e.g. +266696687, +7378742833, 'anonymous') and international/premium numbers.
-const isNanp = (p) => /^\+1[2-9]\d{2}[2-9]\d{6}$/.test(String(p || ''));
+// Textable caller numbers: US (50 states + DC) and Canada only. E.164 +1 NPA NXX XXXX where the area code is an
+// in-service US/CA geographic code (src/areaCodes.js, from NANPA) and the exchange is valid. That rejects the
+// anonymous/restricted placeholders Twilio sends (+266696687, +7378742833, 'anonymous'), international numbers, the
+// other NANP countries (Jamaica 876, Dominican Republic 809/829/849, Bahamas 242, ...), US territories, toll-free
+// and premium 900, plus the 976 premium exchange and N11 service exchanges (211/411/911...): SMS pumping / toll fraud.
+// TEXT_EXTRA_AREA_CODES="787,939" adds codes (a new overlay, or territories if the shop really serves them).
+const AREA_CODES = require('./areaCodes');
+const BLOCKED_AREA_CODES = new Set(['900']);
+const extraAreaCodes = () => new Set(String(process.env.TEXT_EXTRA_AREA_CODES || '').split(/[\s,]+/).filter((x) => /^[2-9]\d{2}$/.test(x)));
+function nanpReason(p) {
+  const m = /^\+1([2-9]\d{2})([2-9]\d{2})\d{4}$/.exec(String(p || ''));
+  if (!m) return 'not a +1 number';
+  const [, npa, nxx] = m;
+  if (BLOCKED_AREA_CODES.has(npa)) return 'premium area code';
+  if (!AREA_CODES.US.has(npa) && !AREA_CODES.CA.has(npa) && !extraAreaCodes().has(npa)) return AREA_CODES.NON_US_CA.has(npa) ? 'non-US/Canada NANP area code' : 'not a US/Canada area code';
+  if (nxx === '976') return 'premium exchange 976';
+  if (/^[2-9]11$/.test(nxx)) return 'service exchange';
+  return null;
+}
+const isNanp = (p) => nanpReason(p) === null;
 const PLACEHOLDER_PHONE = '+10000000000';
 const escapeRe = (x) => String(x).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-module.exports = { modeInfo, onRender, isNanp, PLACEHOLDER_PHONE, escapeRe, sleep, clientIp, on, num, isProduction, demoAllowed, safeEqual, limiter, rateLimit, maskPhone, securityHeaders };
+module.exports = { modeInfo, onRender, isNanp, nanpReason, PLACEHOLDER_PHONE, escapeRe, sleep, clientIp, on, num, isProduction, demoAllowed, safeEqual, limiter, rateLimit, maskPhone, securityHeaders };

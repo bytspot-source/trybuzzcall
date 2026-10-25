@@ -3,7 +3,9 @@
 //   - postgres (when DATABASE_URL is set): the same two JSON documents are kept in table buzz_kv and written
 //     through from memory (debounced, serialized). Call `await store.init()` once at boot to load them.
 // If DATABASE_URL is set but Postgres is unreachable at boot, we log loudly and fall back to the file backend
-// so the missed-call line keeps answering (data is then only as durable as the file).
+// so the missed-call line keeps answering (data is then only as durable as the file). The server adds an owner alert,
+// and REQUIRE_POSTGRES=1 makes that fatal instead (see src/server.js initStorage).
+// Opt-outs/opt-ins are written through immediately (no debounce): optOut()/optIn() return the flush promise.
 const fs = require('fs');
 const path = require('path');
 
@@ -106,9 +108,9 @@ function createStore(opts = {}) {
     if (backend === 'postgres') { dbDirty = true; schedule(); } else writeFiles();
   };
 
-  // Load state from Postgres (if configured). Safe to call once at boot; always resolves.
+  // Load state from Postgres (if configured). Always resolves; may be called again to retry after a failed attempt.
   async function init() {
-    if (!databaseUrl) return { backend };
+    if (!databaseUrl || backend === 'postgres') return { backend };
     try {
       pool = poolFactory(databaseUrl);
       await pool.query(`CREATE TABLE IF NOT EXISTS ${TABLE} (key text PRIMARY KEY, value jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`);
@@ -126,7 +128,7 @@ function createStore(opts = {}) {
       await flush();
       console.log(`[store] postgres backend ready (${byKey.db ? 'loaded existing data' : 'seeded new database'})`);
     } catch (e) {
-      console.error('[store] DATABASE_URL set but postgres unavailable; falling back to file storage in DATA_DIR:', e.message);
+      console.error('[store] !!! DATABASE_URL set but postgres unavailable; falling back to FILE storage in DATA_DIR (opt-outs, leads and settings are NOT durable on Render):', e.message);
       backend = 'file';
       lastError = e.message;
       try { await pool?.end(); } catch {}
@@ -139,7 +141,8 @@ function createStore(opts = {}) {
   return {
     db, WAITLIST_TYPES, init, flush, close, createStore,
     backend: () => backend,
-    status: () => ({ backend, lastError }),
+    // fallback = DATABASE_URL is configured but we are running on the file backend (Postgres was unreachable at boot).
+    status: () => ({ backend, lastError, configured: !!databaseUrl, fallback: !!databaseUrl && backend !== 'postgres' }),
     findOpenLead: (phone) => db.leads.find((l) => l.phone === phone && l.status !== 'done' && l.status !== 'opted_out'),
     findBooking: (id) => db.bookings.find((b) => b.id === id),
     createLead(phone) {
@@ -167,13 +170,23 @@ function createStore(opts = {}) {
     findSetup: (id) => (db.setups || []).find((s) => s.id === id),
     // SMS opt-outs (STOP keywords, plain-language revocations, Twilio 21610). Persisted; never purged by retention.
     isOptedOut: (phone) => !!(phone && db.optOuts && db.optOuts[phone]),
+    // Durable now: with Postgres the write is flushed immediately (not debounced) and the returned promise resolves once
+    // it is stored (or the write failed and is being retried; the failure is logged). File backend writes synchronously.
     optOut(phone, source) {
-      if (!phone) return;
+      if (!phone) return Promise.resolve();
       db.optOuts = db.optOuts || {};
-      if (!db.optOuts[phone]) { db.optOuts[phone] = { at: new Date().toISOString(), source: String(source || 'unknown').slice(0, 40) }; save(); }
-      for (const l of db.leads) if (l.phone === phone && l.status !== 'done') l.status = 'opted_out';
+      let changed = false;
+      if (!db.optOuts[phone]) { db.optOuts[phone] = { at: new Date().toISOString(), source: String(source || 'unknown').slice(0, 40) }; changed = true; }
+      for (const l of db.leads) if (l.phone === phone && l.status !== 'done' && l.status !== 'opted_out') { l.status = 'opted_out'; changed = true; }
+      if (!changed) return Promise.resolve();
+      save();
+      return flush().catch(() => {});
     },
-    optIn(phone) { if (db.optOuts && db.optOuts[phone]) { delete db.optOuts[phone]; save(); return true; } return false; },
+    optIn(phone) {
+      if (!(db.optOuts && db.optOuts[phone])) return false;
+      delete db.optOuts[phone]; save(); flush().catch(() => {});
+      return true;
+    },
     // Retention: drop leads (with their message threads) and owner alerts older than `days`. Bookings (payment records)
     // and opt-outs are kept. Returns counts.
     purgeOlderThan(days, now = Date.now()) {

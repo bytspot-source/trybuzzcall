@@ -105,24 +105,24 @@ test('connect webhook: unsigned mock events refused in production without DEMO_M
 const call = (from, headers) => form('/twilio/voice/status', { From: from, DialCallStatus: 'no-answer' }, headers);
 test('twilio: no token -> allowed locally, 503 in production unless DEMO_MODE=1', async (t) => {
   quiet(t);
-  assert.equal((await call('+15557770001')).status, 200);
+  assert.equal((await call('+14707770001')).status, 200);
   withEnv(t, { NODE_ENV: 'production' });
-  assert.equal((await call('+15557770002')).status, 503);
+  assert.equal((await call('+14707770002')).status, 503);
   process.env.DEMO_MODE = '1';
-  assert.equal((await call('+15557770003')).status, 200);
+  assert.equal((await call('+14707770003')).status, 200);
   delete process.env.DEMO_MODE;
 });
 test('twilio: with a token, unsigned posts are 403; SKIP_TWILIO_VALIDATION only works outside production; valid signature passes', async (t) => {
   quiet(t);
   const token = 'tok_' + 'z'.repeat(28);
   withEnv(t, { TWILIO_AUTH_TOKEN: token, NODE_ENV: 'test', DEMO_MODE: undefined, SKIP_TWILIO_VALIDATION: undefined });
-  assert.equal((await call('+15557770010')).status, 403);
+  assert.equal((await call('+14707770010')).status, 403);
   process.env.SKIP_TWILIO_VALIDATION = '1';
-  assert.equal((await call('+15557770011')).status, 200);
+  assert.equal((await call('+14707770011')).status, 200);
   process.env.NODE_ENV = 'production'; process.env.DEMO_MODE = '1';
-  assert.equal((await call('+15557770012')).status, 403, 'skip flag and demo mode are ignored when a token is set in production');
+  assert.equal((await call('+14707770012')).status, 403, 'skip flag and demo mode are ignored when a token is set in production');
   delete process.env.SKIP_TWILIO_VALIDATION; delete process.env.DEMO_MODE;
-  const params = { From: '+15557770013', DialCallStatus: 'no-answer' };
+  const params = { From: '+14707770013', DialCallStatus: 'no-answer' };
   const sig = twilio.getExpectedTwilioSignature(token, 'https://shop.example/twilio/voice/status', params);
   assert.equal((await form('/twilio/voice/status', params, { 'x-twilio-signature': sig })).status, 200);
 });
@@ -131,13 +131,13 @@ test('twilio: with a token, unsigned posts are 403; SKIP_TWILIO_VALIDATION only 
 test('text-back: one first text per number per cooldown; other numbers unaffected; 0 disables', async (t) => {
   quiet(t);
   const count = (p) => smsLog().split('\n').filter((l) => l.includes(`SMS -> ${p}:`)).length;
-  await call('+15558880001'); await call('+15558880001'); await call('+15558880001');
-  assert.equal(count('+15558880001'), 1);
-  await call('+15558880002');
-  assert.equal(count('+15558880002'), 1);
+  await call('+14708880001'); await call('+14708880001'); await call('+14708880001');
+  assert.equal(count('+14708880001'), 1);
+  await call('+14708880002');
+  assert.equal(count('+14708880002'), 1);
   withEnv(t, { TEXTBACK_COOLDOWN_MINUTES: '0' });
-  await call('+15558880003'); await call('+15558880003');
-  assert.equal(count('+15558880003'), 2);
+  await call('+14708880003'); await call('+14708880003');
+  assert.equal(count('+14708880003'), 2);
 });
 
 // ---------- (5) admin login ----------

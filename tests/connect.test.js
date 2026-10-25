@@ -197,7 +197,8 @@ test('connect state persists in Postgres (buzz_kv config row) across a restart',
 // ---------- admin onboarding ----------
 test('onboarding routes require admin auth and same origin', async (t) => {
   reset(t);
-  assert.equal((await req('/admin/connect/onboard', { method: 'POST' })).status, 401);
+  assert.equal((await req('/admin/connect/onboard', { method: 'POST' })).status, 403, 'no Origin: refused before auth');
+  assert.equal((await req('/admin/connect/onboard', { method: 'POST', headers: { origin: BASE } })).status, 401);
   assert.equal((await req('/admin/connect/refresh')).status, 401);
   assert.equal((await req('/admin/connect/return')).status, 401);
   assert.equal((await req('/admin/connect/mock')).status, 401);
@@ -262,11 +263,11 @@ test('text flow, Stripe on but not connected: booked without deposit, owner told
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY });
   quiet(t);
   const f = fakeStripe(); connect.setStripe(f);
-  const b = await textToBooking('+15553330001');
+  const b = await textToBooking('+14703330001');
   assert.ok(b);
   assert.equal(b.status, 'confirmed'); assert.equal(b.amount, 0); assert.equal(b.depositSkipped, 'stripe_not_connected');
   assert.equal(f.calls.sessions.length, 0);
-  const lead = store.db.leads.find((l) => l.phone === '+15553330001');
+  const lead = store.db.leads.find((l) => l.phone === '+14703330001');
   assert.match(lead.messages.at(-1).body, /You're booked/);
   assert.doesNotMatch(lead.messages.at(-1).body, /deposit/i);
   assert.ok(store.db.alerts.some((a) => /deposit off: Stripe not connected/.test(a.body)));
@@ -277,17 +278,17 @@ test('text flow, connected + charges enabled: deposit link is a direct-charge Ch
   quiet(t);
   const f = fakeStripe({ charges_enabled: true }); connect.setStripe(f);
   store.setOverride({ stripeConnect: { accountId: 'acct_ready', mode: 'test', chargesEnabled: true } });
-  const b = await textToBooking('+15553330002');
+  const b = await textToBooking('+14703330002');
   assert.equal(b.status, 'held');
   assert.deepEqual(f.calls.sessions[0].o, { stripeAccount: 'acct_ready' });
-  const lead = store.db.leads.find((l) => l.phone === '+15553330002');
+  const lead = store.db.leads.find((l) => l.phone === '+14703330002');
   assert.match(lead.messages.at(-1).body, /checkout\.stripe\.com/);
 });
 
 test('text flow, mock mode: /pay/mock unchanged and marks the deposit paid', async (t) => {
   reset(t);
   quiet(t);
-  const b = await textToBooking('+15553330003');
+  const b = await textToBooking('+14703330003');
   assert.equal(b.status, 'held');
   assert.equal(b.payUrl, `https://shop.example/pay/mock/${b.id}`);
   assert.equal((await req(`/pay/mock/${b.id}`)).status, 200);
