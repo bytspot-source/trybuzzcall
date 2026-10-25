@@ -38,11 +38,62 @@ function defaultPoolFactory(url) {
   return pool;
 }
 
+// ---- DATA_DIR / SPILL_DIR validation (T1) ----
+// These folders hold full phone numbers (db.json, sms.log, the opt-out spill file). Rules:
+//   - production: the path must be absolute (a relative path would resolve against whatever the working directory is);
+//   - never inside public/ (express.static would serve the files on the web) and never elsewhere inside the app
+//     folder, except the default data/ folder (git-ignored and not served);
+//   - folders we create are 0700 and files 0600; an existing group- or world-writable folder gets a loud warning.
+// A refused value does not crash the server: we log a loud warning and use the safe default (DATA_DIR -> <app>/data,
+// SPILL_DIR -> DATA_DIR) so the missed-call line keeps answering. status().pathWarnings shows it on admin /health.
+const APP_ROOT = path.resolve(__dirname, '..');
+const DEFAULT_DATA_DIR = path.join(APP_ROOT, 'data');
+const PUBLIC_DIR = path.join(APP_ROOT, 'public');
+const within = (p, root) => p === root || p.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
+// realpath of the deepest existing ancestor + the rest, so a symlink can't smuggle the folder into public/.
+function realish(p) {
+  let cur = p; const rest = [];
+  for (;;) {
+    try { return path.join(fs.realpathSync(cur), ...rest); } catch {}
+    const up = path.dirname(cur); if (up === cur) return p;
+    rest.unshift(path.basename(cur)); cur = up;
+  }
+}
+function checkDir(raw, name) {
+  if (raw == null || String(raw).trim() === '') return { dir: null };
+  const s = String(raw).trim();
+  if (require('./security').isProduction() && !path.isAbsolute(s)) return { problem: `${name} must be an absolute path in production (got a relative path)` };
+  const dir = path.resolve(s), real = realish(dir), root = realish(APP_ROOT);
+  if (within(dir, PUBLIC_DIR) || within(real, realish(PUBLIC_DIR))) return { problem: `${name} is inside public/ (files there are served on the web)` };
+  if ((within(dir, APP_ROOT) && !within(dir, DEFAULT_DATA_DIR)) || (within(real, root) && !within(real, realish(DEFAULT_DATA_DIR)))) return { problem: `${name} is inside the app folder` };
+  return { dir };
+}
+function ensureDir(dir, name, warnings) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    const m = fs.statSync(dir).mode & 0o777;
+    if (m & 0o022) {
+      const w = `${name} folder is group- or world-writable (mode ${m.toString(8).padStart(4, '0')}); use a folder only this app's user can write (chmod 700)`;
+      warnings.push(w); console.error(`[store] WARNING: ${w}: ${dir}`);
+    }
+  } catch {}
+}
+const FILE_MODE = { mode: 0o600 };
+
 function createStore(opts = {}) {
-  const DIR = opts.dir ? path.resolve(opts.dir) : path.join(__dirname, '..', 'data');
+  const pathWarnings = [];
+  const refuse = (problem, fallbackLabel) => {
+    pathWarnings.push(`${problem}; using ${fallbackLabel}`);
+    console.error(`[store] !!!!!!!!!! WARNING: ${problem}. Ignoring it and using ${fallbackLabel} instead.`);
+  };
+  const dataCheck = checkDir(opts.dir, 'DATA_DIR');
+  if (dataCheck.problem) refuse(dataCheck.problem, `the default ${DEFAULT_DATA_DIR}`);
+  const DIR = dataCheck.dir || DEFAULT_DATA_DIR;
   const databaseUrl = opts.databaseUrl || '';
   const poolFactory = opts.poolFactory || defaultPoolFactory;
-  fs.mkdirSync(DIR, { recursive: true });
+  ensureDir(DIR, 'DATA_DIR', pathWarnings);
+  // Tighten files created by older versions (0644 under the default umask) to owner-only.
+  for (const f of ['db.json', 'config.json', 'sms.log', 'optout-spill.jsonl']) { try { const fp = path.join(DIR, f); if (fs.statSync(fp).mode & 0o077) fs.chmodSync(fp, 0o600); } catch {} }
   const FILE = path.join(DIR, 'db.json');
   // Config override (admin 'Apply to this line'): { values: { ENV_KEY: 'value' }, setupId, appliedAt }.
   // Read with priority over env by src/config.js. Kept separate from db so db stays data-only.
@@ -59,12 +110,17 @@ function createStore(opts = {}) {
   let backend = 'file';      // 'file' | 'postgres'
   let pool = null;
   let dbDirty = false, cfgDirty = false, timer = null, flushing = null, lastError = null;
-  // Runtime write failures (Postgres reachable at boot, then failing): opt-outs/opt-ins are also appended to a local
-  // spill file (DATA_DIR/optout-spill.jsonl) and merged at the next successful boot. The owner is alerted once per
+  // Runtime write failures (Postgres reachable at boot, then failing): opt-outs are also appended to a local
+  // spill file (DATA_DIR/optout-spill.jsonl) and merged at the next successful boot. Opt-ins (START) are NOT spilled
+  // and opt-in lines are ignored at merge: the spill file can only ever ADD opt-outs, so a planted or stale line can't
+  // silently re-enable texting to someone who said STOP. An opt-in during an outage still applies in memory and is
+  // written to Postgres when it recovers; only if the server restarts mid-outage does the caller need to text START again. The owner is alerted once per
   // outage (on the first spill, or when writes keep failing for STORAGE_ALERT_MINUTES, default 5).
   // SPILL_DIR: put the spill file on a persistent disk (e.g. a Render disk mounted at /var/data); default DATA_DIR.
-  const SPILL_DIR = opts.spillDir || process.env.SPILL_DIR ? path.resolve(opts.spillDir || process.env.SPILL_DIR) : DIR;
-  try { fs.mkdirSync(SPILL_DIR, { recursive: true }); } catch {}
+  const spillCheck = checkDir(opts.spillDir || process.env.SPILL_DIR, 'SPILL_DIR');
+  if (spillCheck.problem) refuse(spillCheck.problem, 'DATA_DIR');
+  const SPILL_DIR = spillCheck.dir || DIR;
+  if (SPILL_DIR !== DIR) { try { ensureDir(SPILL_DIR, 'SPILL_DIR', pathWarnings); } catch (e) { console.error('[store] could not create SPILL_DIR:', e.message); } }
   const SPILL = path.join(SPILL_DIR, 'optout-spill.jsonl');
   const { maskPhone } = require('./security');
   let spilledThisOutage = []; // masked numbers opted out while Postgres writes were failing (for the owner alert)
@@ -84,13 +140,16 @@ function createStore(opts = {}) {
     Promise.resolve().then(() => onDegraded(payload)).catch(() => {});
   }
   function spill(entry) {
-    try { fs.appendFileSync(SPILL, JSON.stringify(entry) + '\n'); console.error(`[store] postgres write failing: ${entry.op === 'out' ? 'opt-out' : 'opt-in'} also saved to ${SPILL}`); }
-    catch (e) { console.error('[store] spill write failed:', e.message); }
-    if (entry.op === 'out') { const m = maskPhone(entry.phone); spilledThisOutage.push(m); degradedAlert('spill', m); }
-    else degradedAlert('spill');
+    if (entry.op !== 'out') { console.error('[store] postgres write failing: opt-in kept in memory only (written when the database recovers; not spilled)'); degradedAlert('spill'); return; }
+    try {
+      fs.appendFileSync(SPILL, JSON.stringify(entry) + '\n', FILE_MODE);
+      try { fs.chmodSync(SPILL, 0o600); } catch {}
+      console.error(`[store] postgres write failing: opt-out also saved to ${SPILL}`);
+    } catch (e) { console.error('[store] spill write failed:', e.message); }
+    const m = maskPhone(entry.phone); spilledThisOutage.push(m); degradedAlert('spill', m);
   }
   const spillCount = () => { try { return fs.readFileSync(SPILL, 'utf8').split('\n').filter(Boolean).length; } catch { return 0; } };
-  // Apply spilled records (in order) to db. Returns the number applied.
+  // Apply spilled opt-out records to db (opt-in lines are ignored, see above). Returns the number applied.
   function mergeSpill() {
     let lines = [];
     try { lines = fs.readFileSync(SPILL, 'utf8').split('\n').filter(Boolean); } catch { return 0; }
@@ -98,17 +157,16 @@ function createStore(opts = {}) {
     let n = 0;
     for (const l of lines) {
       let e; try { e = JSON.parse(l); } catch { continue; }
-      if (!e || typeof e.phone !== 'string') continue;
+      if (!e || typeof e.phone !== 'string' || !/^\+\d{8,15}$/.test(e.phone)) continue;
       if (e.op === 'out' && !db.optOuts[e.phone]) { db.optOuts[e.phone] = { at: e.at || new Date().toISOString(), source: String(e.source || 'spill').slice(0, 40) }; n++; }
-      if (e.op === 'in' && db.optOuts[e.phone] && Date.parse(e.at) >= Date.parse(db.optOuts[e.phone].at || 0)) { delete db.optOuts[e.phone]; n++; }
     }
     return n;
   }
   const clearSpill = () => { try { fs.rmSync(SPILL, { force: true }); } catch {} };
 
-  const writeFiles = () => fs.writeFileSync(FILE, JSON.stringify(db, null, 2));
+  const writeFiles = () => fs.writeFileSync(FILE, JSON.stringify(db, null, 2), FILE_MODE);
   const writeConfigFile = () => {
-    if (Object.keys(override).length) fs.writeFileSync(CONFIG_FILE, JSON.stringify(override, null, 2));
+    if (Object.keys(override).length) fs.writeFileSync(CONFIG_FILE, JSON.stringify(override, null, 2), FILE_MODE);
     else fs.rmSync(CONFIG_FILE, { force: true });
   };
 
@@ -202,7 +260,8 @@ function createStore(opts = {}) {
     // degraded = Postgres backend but writes are currently failing (data since then lives in memory + the spill file).
     status: () => ({ backend, lastError: redact(lastError), configured: !!databaseUrl, fallback: !!databaseUrl && backend !== 'postgres',
       degraded: backend === 'postgres' && !!failSince, failingSince: failSince ? new Date(failSince).toISOString() : null, spillPending: spillCount(),
-      spillDir: SPILL_DIR === DIR ? 'DATA_DIR' : 'SPILL_DIR' }),
+      spillDir: SPILL_DIR === DIR ? 'DATA_DIR' : 'SPILL_DIR', pathWarnings: pathWarnings.slice() }),
+    dataDir: () => DIR,
     setDegradedAlert(fn) { onDegraded = fn || null; },
     findOpenLead: (phone) => db.leads.find((l) => l.phone === phone && l.status !== 'done' && l.status !== 'opted_out'),
     findBooking: (id) => db.bookings.find((b) => b.id === id),
@@ -292,4 +351,5 @@ function createStore(opts = {}) {
 
 const store = createStore({ dir: process.env.DATA_DIR || undefined, databaseUrl: process.env.DATABASE_URL || '' });
 store.pgConfig = pgConfig;
+store.checkDir = checkDir; // exported for tests
 module.exports = store;

@@ -218,7 +218,8 @@ async function startSite(t) {
     assert.equal(health[key], false, `${key} must be disabled`);
   }
   for (const key of ['openai', 'leadFee', 'leadFeeWaived']) assert.equal(key in health, false, `public /health must not expose ${key}`);
-  assert.equal(typeof health.storage, 'string');
+  assert.equal('storage' in health, false, 'public /health must not expose the storage backend (T3: admin-only)');
+  assert.ok(['ok', 'degraded'].includes(health.storageState));
 
   const cache = new Map();
   function publicResource(target) {

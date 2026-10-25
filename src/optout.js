@@ -57,10 +57,13 @@ const STRONG = [
 
 // ---- Spanish (matched on lowercase text with accents stripped) ----
 // Whole message only (optionally with "por favor"/"ya"/"gracias"): basta, alto, cancelar, baja, pare, parar, detener.
-// "para" counts ONLY as the entire message ("para el martes" = "for Tuesday").
+// "para" counts only when every other word is filler from PARA_FILLER ("para", "Para por favor", "para ya",
+// "para pls"); "para el martes" = "for Tuesday" and "para mañana a las 3" stay normal replies (T2). PARA_FILLER is
+// deliberately narrower than ES_FILLER (no "ok"/"y") because "para" is so common as a preposition.
 const deaccent = (t) => normalize(t).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 const ES_WHOLE = new Set(['basta', 'alto', 'cancelar', 'cancela', 'cancelen', 'baja', 'pare', 'paren', 'parar', 'detener', 'detente', 'deten']);
 const ES_FILLER = new Set(['por', 'favor', 'porfa', 'porfavor', 'ya', 'gracias', 'ok', 'y']);
+const PARA_FILLER = new Set(['por', 'favor', 'porfa', 'porfavor', 'ya', 'pls', 'please', 'gracias']);
 const ES_PHRASES = [
   /\bno\s+(?:me|nos)\s+(?:escrib(?:an|as|a|ir)|mand(?:en|es|e)|envi(?:en|es|e)|text(?:een|ees|ee)|contact(?:en|es|e)|llam(?:en|es|e)|moleste[ns]?)\b/,
   /\bdej(?:a|en|e)\s+de\s+(?:escribir|mandar|enviar|textear|molestar|llamar)\w*/,
@@ -73,7 +76,7 @@ const ES_PHRASES = [
 function spanishOptOut(raw) {
   const t = deaccent(raw);
   const w = t.match(/[a-z]+/g) || [];
-  if (w.length === 1 && w[0] === 'para') return true;
+  if (w.includes('para') && w.every((x) => x === 'para' || PARA_FILLER.has(x))) return true;
   const core = w.filter((x) => !ES_FILLER.has(x));
   if (core.length === 1 && ES_WHOLE.has(core[0])) return true;
   return ES_PHRASES.some((re) => re.test(t));

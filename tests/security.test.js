@@ -218,13 +218,13 @@ test('security headers on public pages; no x-powered-by; backup files not served
   fs.writeFileSync(path.join(__dirname, '../public/zz-test.html.bak-1'), 'secret draft');
   try { assert.equal((await req('/zz-test.html.bak-1')).status, 404); } finally { fs.rmSync(path.join(__dirname, '../public/zz-test.html.bak-1'), { force: true }); }
 });
-test('/health: public keeps status fields (ok, storage, billing, serviceActive) but not pricing/AI config; admin sees all', async () => {
+test('/health: public keeps status fields (ok, storageState, billing, serviceActive) but not pricing/AI/storage-backend config; admin sees all', async () => {
   app.locals.resetAdminLockout();
   const h = await (await req('/health')).json();
-  for (const k of ['ok', 'storage', 'billing', 'serviceActive', 'twilio', 'stripe', 'connect', 'connectStatus', 'vertical', 'booking', 'deposit']) assert.ok(k in h, k);
-  for (const k of ['leadFee', 'leadFeeWaived', 'openai']) assert.equal(k in h, false, k);
+  for (const k of ['ok', 'storageState', 'billing', 'serviceActive', 'twilio', 'stripe', 'connect', 'connectStatus', 'vertical', 'booking', 'deposit']) assert.ok(k in h, k);
+  for (const k of ['leadFee', 'leadFeeWaived', 'openai', 'storage', 'storageDetail']) assert.equal(k in h, false, k);
   const a = await (await req('/health', { headers: auth })).json();
-  assert.ok('leadFee' in a && 'openai' in a);
+  assert.ok('leadFee' in a && 'openai' in a && 'storage' in a && 'storageDetail' in a);
 });
 test('waitlist: per-IP rate limit (429) and bounded list', async () => {
   app.locals.resetFormLimits();

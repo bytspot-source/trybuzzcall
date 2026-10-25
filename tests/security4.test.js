@@ -137,7 +137,7 @@ test('R2: admin /health shows storage state and fail-closed policy; public /heal
   assert.equal(pub.storageState, 'ok', 'dev file storage = ok (public summary is ok|degraded)');
   assert.equal(pub.storageDetail, undefined);
   const adm = await (await req('/health', { headers: auth })).json();
-  assert.deepEqual(Object.keys(adm.storageDetail).sort(), ['backend', 'databaseConfigured', 'degraded', 'failClosed', 'failClosedReason', 'failingSince', 'fallback', 'lastError', 'optOutSpillPending', 'spillDir', 'state']);
+  assert.deepEqual(Object.keys(adm.storageDetail).sort(), ['backend', 'databaseConfigured', 'degraded', 'failClosed', 'failClosedReason', 'failingSince', 'fallback', 'lastError', 'optOutSpillPending', 'pathWarnings', 'spillDir', 'state']);
   assert.equal(adm.storageDetail.failClosed, false);
   withEnv(t, { REQUIRE_POSTGRES: '1' });
   assert.equal((await (await req('/health', { headers: auth })).json()).storageDetail.failClosed, true);
@@ -175,7 +175,7 @@ test('R3: Postgres write failures after boot spill opt-outs to a local file, ale
   assert.doesNotMatch(JSON.stringify(st), /secretpw/);
   s.optIn('+14045550402');
   await new Promise((r) => setTimeout(r, 10));
-  assert.equal(s.status().spillPending, 3, 'opt-in spilled too');
+  assert.equal(s.status().spillPending, 2, 'T1: opt-ins are not spilled (kept in memory, written on recovery)');
   pool.fail = false;
   await s.flush();
   assert.equal(s.status().degraded, false);
@@ -199,7 +199,7 @@ test('R3: spill file is merged at boot (Postgres) and written through', async (t
   const s = store.createStore({ dir: d, databaseUrl: 'postgres://u:p@db.example/x', poolFactory: () => pool });
   await s.init();
   assert.equal(s.isOptedOut('+14045550411'), true);
-  assert.equal(s.isOptedOut('+14045550412'), false, 'later opt-in wins');
+  assert.equal(s.isOptedOut('+14045550412'), true, 'T1: opt-in lines in the spill file are ignored (it can only add opt-outs)');
   assert.equal(s.isOptedOut('+14045550499'), true, 'existing data kept');
   assert.ok(pool.writes.length && pool.writes[pool.writes.length - 1].optOuts['+14045550411'], 'merged opt-out written to Postgres');
   assert.equal(fs.existsSync(path.join(d, 'optout-spill.jsonl')), false);

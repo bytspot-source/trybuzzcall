@@ -169,7 +169,9 @@ test('server boots on file storage with no DATABASE_URL, and with an unreachable
       t2.after(async () => { child.kill('SIGTERM'); await new Promise((r) => (child.exitCode !== null || child.signalCode ? r() : child.once('close', r))); });
       const h = await fetch(`http://127.0.0.1:${port}/health`);
       assert.equal(h.status, 200);
-      assert.equal((await h.json()).storage, 'file');
+      const hj = await h.json();
+      // no DATABASE_URL in dev = file storage = ok; unreachable DATABASE_URL = file fallback = degraded
+      assert.equal(hj.storageState, databaseUrl ? 'degraded' : 'ok'); assert.equal('storage' in hj, false, 'storage backend is admin-only (T3)');
       for (const p of ['/', '/setup']) assert.equal((await fetch(`http://127.0.0.1:${port}${p}`)).status, 200);
     });
   }

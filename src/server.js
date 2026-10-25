@@ -616,7 +616,7 @@ function storageHtml(esc) {
     : st.fallback ? '<b style="color:#b00">FALLBACK</b>: DATABASE_URL set but running on temporary file storage'
       : st.backend === 'postgres' ? 'OK (Postgres)' : `file storage${sec.isProduction() ? ' <b style="color:#b00">(not durable on Render)</b>' : ''}`;
   const paused = Object.keys(store.db.botPaused || {}).filter((p) => store.isPaused(p));
-  return `<p id="storage">Storage: ${state} · fail-closed ${pol.failClosed ? 'ON' : 'off'} (${esc(pol.why)})${st.spillPending ? ` · ${st.spillPending} opt-out record(s) waiting in the spill file` : ''}${paused.length ? ` · automated texts paused (possible opt-out): ${paused.map(esc).join(', ')}` : ''}</p>`;
+  return `<p id="storage">Storage: ${state} · fail-closed ${pol.failClosed ? 'ON' : 'off'} (${esc(pol.why)})${st.spillPending ? ` · ${st.spillPending} opt-out record(s) waiting in the spill file` : ''}${st.pathWarnings.length ? ` · <b style="color:#b00">path warning</b>: ${st.pathWarnings.map(esc).join('; ')}` : ''}${paused.length ? ` · automated texts paused (possible opt-out): ${paused.map(esc).join(', ')}` : ''}</p>`;
 }
 // Admin (HTTP Basic auth; any username unless ADMIN_USERNAME is set)
 app.get('/admin', requireAdmin, (req, res) => {
@@ -637,11 +637,11 @@ ${setupPages.adminSetupsHtml(store.db.setups, config.effective(), config.overrid
 
 setInterval(() => booking.expireHolds(), 60000).unref();
 billing.init({ notify: (msg) => owner(null, msg), BASE });
-// Public health: status fields only (ops checks use ok/storage/billing/serviceActive/...). Pricing config and the
-// OpenAI flag are admin-only (send Basic auth to get them too).
+// Public health: status fields only (ops checks use ok/storageState/billing/serviceActive/...). Pricing config, the
+// OpenAI flag and the storage backend (`storage`, `storageDetail`) are admin-only (send Basic auth to get them too).
 app.get('/health', (req, res) => {
   const c = booking.cfg();
-  const h = { ok: true, vertical: c.vertical, trade: c.trade, flow: c.flow, billing: billing.summary().mode, serviceActive: billing.access().active, twilio: live, booking: c.booking, deposit: c.deposit, stripe: !!env.STRIPE_SECRET_KEY, connect: connect.mode() !== 'mock' && connect.depositsReady(), connectStatus: connect.status(), storage: store.backend() };
+  const h = { ok: true, vertical: c.vertical, trade: c.trade, flow: c.flow, billing: billing.summary().mode, serviceActive: billing.access().active, twilio: live, booking: c.booking, deposit: c.deposit, stripe: !!env.STRIPE_SECRET_KEY, connect: connect.mode() !== 'mock' && connect.depositsReady(), connectStatus: connect.status() };
   // Full state (admins): ok | degraded (Postgres writes failing right now) | fallback (DATABASE_URL set, running on
   // files) | file (no DATABASE_URL).
   const st = store.status();
@@ -650,9 +650,9 @@ app.get('/health', (req, res) => {
   h.storageState = fullState === 'ok' || (fullState === 'file' && !sec.isProduction()) ? 'ok' : 'degraded';
   if (req.headers.authorization && isAdmin(req)) {
     const pol = storagePolicy();
-    Object.assign(h, { openai: !!env.OPENAI_API_KEY, leadFee: c.leadFee, leadFeeWaived: c.leadFeeWaived, demoMode: sec.demoAllowed(),
+    Object.assign(h, { storage: store.backend(), openai: !!env.OPENAI_API_KEY, leadFee: c.leadFee, leadFeeWaived: c.leadFeeWaived, demoMode: sec.demoAllowed(),
       storageDetail: { state: fullState, backend: st.backend, spillDir: st.spillDir, databaseConfigured: st.configured, failClosed: pol.failClosed, failClosedReason: pol.why, fallback: st.fallback,
-        degraded: st.degraded, failingSince: st.failingSince, lastError: st.lastError, optOutSpillPending: st.spillPending } });
+        degraded: st.degraded, failingSince: st.failingSince, lastError: st.lastError, optOutSpillPending: st.spillPending, pathWarnings: st.pathWarnings } });
   }
   res.json(h);
 });

@@ -175,9 +175,9 @@ test('S4: toll-free/premium/non-geographic callers are not in the area-code repo
 });
 
 // ---------- S5 ----------
-test('S5: public /health has storage + an ok/degraded summary only; detail is admin-only', async (t) => {
+test('S5/T3: public /health has only an ok/degraded storage summary; storage + detail are admin-only', async (t) => {
   const pub = await (await req('/health')).json();
-  assert.equal(pub.storage, 'file');
+  assert.equal(pub.storage, undefined, 'T3: storage backend is admin-only');
   assert.ok(['ok', 'degraded'].includes(pub.storageState));
   assert.equal(pub.storageDetail, undefined);
   for (const k of ['lastError', 'failingSince', 'spillPending', 'fallback']) assert.equal(pub[k], undefined, k);

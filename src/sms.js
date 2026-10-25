@@ -13,7 +13,7 @@ const fs = require('fs');
 const path = require('path');
 const store = require('./store');
 const { maskPhone, isProduction, PLACEHOLDER_PHONE, limiter, num, on } = require('./security');
-const LOG = path.join(process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, '..', 'data'), 'sms.log');
+const LOG = path.join(store.dataDir(), 'sms.log'); // validated DATA_DIR (see store.js checkDir)
 const { TWILIO_ACCOUNT_SID: sid, TWILIO_AUTH_TOKEN: tok, TWILIO_PHONE_NUMBER: from } = process.env;
 let client = sid && tok && from ? require('twilio')(sid, tok) : null;
 const OPTED_OUT_CODES = new Set([21610]); // Twilio: "Attempt to send to unsubscribed recipient"
@@ -43,7 +43,7 @@ function writeLog(to, body, kind, result) {
   const full = !prod || on(process.env.LOG_FULL_PHONES);
   const bodies = !prod || on(process.env.SMS_LOG_BODIES);
   const line = bodies ? `[${ts}] SMS -> ${to}: ${body}` : `[${ts}] SMS -> ${to} (${kind}, ${String(body || '').length} chars): ${result}`;
-  try { fs.appendFileSync(LOG, (full ? line : maskPhone(line)) + '\n'); } catch (e) { console.error('sms.log write failed:', e.message); }
+  try { fs.appendFileSync(LOG, (full ? line : maskPhone(line)) + '\n', { mode: 0o600 }); } catch (e) { console.error('sms.log write failed:', e.message); }
 }
 
 // opts.kind: 'caller' (default; counts toward the hourly/daily caps) | 'owner' (alerts to the shop owner)
