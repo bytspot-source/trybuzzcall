@@ -185,7 +185,7 @@ test('N2/R2: real boot with unreachable DATABASE_URL: production fails closed (n
   const c = await boot({ NODE_ENV: 'development', DEMO_MODE: '' });
   assert.equal(c.res, 'up', c.out);
   assert.match(c.out, /fail-closed off \(development\)/);
-  assert.equal((await (await fetch(`http://127.0.0.1:${c.port}/health`)).json()).storageState, 'fallback');
+  assert.equal((await (await fetch(`http://127.0.0.1:${c.port}/health`)).json()).storageState, 'degraded', 'public summary: ok|degraded only');
   c.child.kill('SIGKILL');
 });
 test('N2: an inbound STOP is recorded before the webhook answers', async (t) => {

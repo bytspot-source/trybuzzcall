@@ -54,17 +54,71 @@ const STRONG = [
   /\blose\s+(?:my|this)\s+(?:number|#)\b/i,
   /\b(?:delete|erase)\s+(?:my|this)\s+(?:number|#)\b/i,
 ];
-const STOP_WORDS = new Set(['stop', 'stopall', 'unsubscribe', 'optout']);
-// Words that make a short "stop ..." message a job description or scheduling reply, not an opt-out.
-const JOB_WORDS = new Set(`leak leaks leaking leaky valve valves drip drips dripping water drain drains clog clogged toilet toilets
+
+// ---- Spanish (matched on lowercase text with accents stripped) ----
+// Whole message only (optionally with "por favor"/"ya"/"gracias"): basta, alto, cancelar, baja, pare, parar, detener.
+// "para" counts ONLY as the entire message ("para el martes" = "for Tuesday").
+const deaccent = (t) => normalize(t).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+const ES_WHOLE = new Set(['basta', 'alto', 'cancelar', 'cancela', 'cancelen', 'baja', 'pare', 'paren', 'parar', 'detener', 'detente', 'deten']);
+const ES_FILLER = new Set(['por', 'favor', 'porfa', 'porfavor', 'ya', 'gracias', 'ok', 'y']);
+const ES_PHRASES = [
+  /\bno\s+(?:me|nos)\s+(?:escrib(?:an|as|a|ir)|mand(?:en|es|e)|envi(?:en|es|e)|text(?:een|ees|ee)|contact(?:en|es|e)|llam(?:en|es|e)|moleste[ns]?)\b/,
+  /\bdej(?:a|en|e)\s+de\s+(?:escribir|mandar|enviar|textear|molestar|llamar)\w*/,
+  /\b(?:dar(?:me|nos)?|den(?:me|nos)?|dame|denos|quiero\s+darme)\s+de\s+baja\b/,
+  /\bnumero\s+equivocado\b|\bse\s+equivoc(?:o|aron)\s+de\s+numero\b/,
+  /\bno\s+(?:quiero|deseo)\s+(?:recibir\s+)?(?:mas\s+)?(?:mensajes|textos|sms)\b|\bno\s+mas\s+(?:mensajes|textos|sms)\b|\bya\s+no\s+(?:me\s+)?(?:escriban|manden|envien)\b/,
+  /\bborr(?:en|a|e)\s+mi\s+numero\b/,
+  /\bno\s+estoy\s+interesad[oa]\b|\bno\s+me\s+interesa\b/,
+];
+function spanishOptOut(raw) {
+  const t = deaccent(raw);
+  const w = t.match(/[a-z]+/g) || [];
+  if (w.length === 1 && w[0] === 'para') return true;
+  const core = w.filter((x) => !ES_FILLER.has(x));
+  if (core.length === 1 && ES_WHOLE.has(core[0])) return true;
+  return ES_PHRASES.some((re) => re.test(t));
+}
+
+// ---- English "stop" anywhere ----
+// Stop tokens: stop/stopall/unsubscribe/optout, stretched or obfuscated spellings (stoooop, STOPP, st0p, stahp), 🛑.
+// For each command occurrence of stop (not "won't stop", "to stop", "make it stop", which describe the problem):
+//  - its own sentence/clause ("STOP! not today", "stop. over it", "... no. stop") or repeated -> opt-out, even if a
+//    job word appears elsewhere; unless it is a correction ("stop, I meant Saturday", "stop, sorry, wait").
+//  - followed directly by a job noun or "by" ("stop leak under sink", "Stop valve is broken", "stop by tomorrow",
+//    "stop the leak") -> normal reply.
+//  - otherwise: job noun or time present -> normal reply; else 5 words or fewer -> opt-out; longer -> 'maybe'.
+const JOB_NOUNS = new Set(`leak leaks leaking leaky valve valves drip drips dripping water drain drains clog clogged toilet toilets
 sink sinks faucet faucets pipe pipes tap taps cock heater hvac ac furnace thermostat breaker outlet wire wiring light lights
 gas smell noise running flooding flood roof gutter shower tub hose sump pump meter bleeding braids hair appointment appt
-tech technician plumber electrician by over meant saturday sunday monday tuesday wednesday
-thursday friday today tonight tomorrow morning afternoon evening noon oclock`.split(/\s+/));
-const words = (t) => normalize(t).toLowerCase().replace(/[’']/g, '').match(/[a-z]+/g) || [];
-const hasStopWord = (w) => w.some((x) => STOP_WORDS.has(x));
+tech technician plumber electrician`.split(/\s+/));
+const DESCRIPTIVE = new Set('to wont doesnt didnt cant cannot never not it will would could should gonna wanna make made can isnt aint'.split(' '));
+const CORRECTION = /^\s*[,.;:!\-]*\s*(?:i\s+meant|i\s+mean|sorry|wait|actually|no\s+wait|correction|scratch\s+that)\b/;
+const REFUSALS = /\b(?:not\s+interested|no\s+longer\s+interested|go\s+away)\b/;
 const TIME_RE = /\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a|p)\b|\b\d{1,2}:\d{2}\b|\b(?:at|after|before|around|until)\s+\d/i;
-const hasJobWord = (w, raw) => w.some((x) => JOB_WORDS.has(x)) || TIME_RE.test(raw);
+const STOP_TOKENS = new Set(['stop', 'stopall', 'unsubscribe', 'optout', 'stahp', 'stopal']);
+const prep = (raw) => normalize(raw).replace(/\u{1F6D1}/gu, ' stop ').toLowerCase().replace(/[’']/g, '');
+const words = (t) => prep(t).match(/[a-z]+/g) || [];
+const isStopToken = (tok) => STOP_TOKENS.has(tok) || STOP_TOKENS.has(tok.replace(/0/g, 'o').replace(/([a-z])\1+/g, '$1'));
+function stopOccurrences(t) {
+  const out = [], re = /[a-z0-9]+/g;
+  let m, prev = null;
+  while ((m = re.exec(t))) {
+    const tok = m[0];
+    if (/[a-z]/.test(tok) && isStopToken(tok)) {
+      const rest = t.slice(m.index + tok.length);
+      const next = (/^\s+(?:(?:the|my|this|that|a|an|your|our)\s+)?([a-z]+)/.exec(rest) || [])[1];
+      out.push({
+        descriptive: !!prev && DESCRIPTIVE.has(prev),
+        standalone: /^\s*(?:$|[^a-z0-9\s])/.test(rest),
+        correction: CORRECTION.test(rest),
+        directJob: !!next && (next === 'by' || JOB_NOUNS.has(next)),
+      });
+    }
+    prev = tok;
+  }
+  return out;
+}
+const hasJobWord = (w, t) => w.some((x) => JOB_NOUNS.has(x)) || TIME_RE.test(t);
 
 // -> 'optout' (exact Twilio keyword) | 'revoke' (any other opt-out; app confirms once) | 'optin' | 'help'
 //    | 'maybe' (longer message mentioning stop, no job word: pause the bot, ask the owner) | null
@@ -76,11 +130,23 @@ function classify(text) {
   if (OPT_OUT.includes(k)) return 'revoke';
   if (OPT_IN.includes(k)) return 'optin';
   if (HELP.includes(k)) return 'help';
-  const t = normalize(raw);
-  if (STRONG.some((re) => re.test(t)) || PHRASES.some((re) => re.test(t))) return 'revoke';
-  const w = words(raw);
-  if (!hasStopWord(w)) return null;
-  if (hasJobWord(w, normalize(raw))) return null;
+  const n = normalize(raw);
+  if (STRONG.some((re) => re.test(n)) || PHRASES.some((re) => re.test(n))) return 'revoke';
+  if (spanishOptOut(raw)) return 'revoke';
+  const t = prep(raw), w = words(raw), job = hasJobWord(w, t);
+  const occ = stopOccurrences(t).filter((o) => !o.descriptive);
+  if (!occ.length) {
+    if (REFUSALS.test(t) && !job) return w.length <= 5 ? 'revoke' : 'maybe';
+    // descriptive-only mentions ("wont stop") with no job context still count in short messages
+    if (stopOccurrences(t).length && !job) return w.length <= 5 ? 'revoke' : 'maybe';
+    return null;
+  }
+  const commands = occ.filter((o) => !o.correction);
+  if (commands.some((o) => o.standalone) || commands.length >= 2) return 'revoke';
+  if (!commands.length) return null; // "stop, I meant Saturday"
+  if (commands[0].directJob || job) return null;
   return w.length <= 5 ? 'revoke' : 'maybe';
 }
-module.exports = { classify, letters, normalize, words, OPT_OUT, OPT_IN, HELP };
+// 'es' when the message is a Spanish opt-out (the confirmation is then bilingual).
+const language = (text) => (spanishOptOut(String(text ?? '')) ? 'es' : 'en');
+module.exports = { classify, language, letters, normalize, words, OPT_OUT, OPT_IN, HELP };

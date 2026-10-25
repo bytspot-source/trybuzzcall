@@ -252,7 +252,7 @@ async function startTextBack(phone) {
   if (!sec.isNanp(phone)) {
     const why = sec.nanpReason(phone);
     console.log(`[textback] skipped caller id ${phone ? sec.maskPhone(String(phone).slice(0, 20)) : '(blank)'}: ${why}`);
-    if (/area code/.test(why) && why !== 'premium area code') recordAreaSkip(String(phone).slice(2, 5));
+    if (why === 'non-US/Canada NANP area code' || why === 'not a US/Canada area code') recordAreaSkip(String(phone).slice(2, 5)); // never toll-free/premium/non-geographic
     return false;
   }
   if (store.isOptedOut(phone)) { console.log(`[textback] skipped ${sec.maskPhone(phone)}: opted out`); return false; }
@@ -301,7 +301,10 @@ app.post('/twilio/sms', verifyTwilio, async (req, res) => {
   if (kw === 'revoke') { // any other opt-out (keyword variant or plain language): exactly one confirmation, then silence
     if (!store.isOptedOut(from)) {
       await optOutNow(from, 'message');
-      await sendSms(from, `${biz}: You're unsubscribed and won't get more texts from us. Reply START to resubscribe.`, { force: true });
+      // Spanish opt-outs (basta, no me escriban, ...) get a bilingual confirmation; Twilio doesn't handle those keywords.
+      const en = `${biz}: You're unsubscribed and won't get more texts from us. Reply START to resubscribe.`;
+      const es = `Se canceló su suscripción y no recibirá más mensajes. Responda START para volver a suscribirse.`;
+      await sendSms(from, optout.language(body) === 'es' ? `${en} / ${es}` : en, { force: true });
       await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: ${from} asked not to be texted ("${body.trim().slice(0, 60)}") and is opted out.`);
     }
     return twiml(res, '');
@@ -639,14 +642,16 @@ billing.init({ notify: (msg) => owner(null, msg), BASE });
 app.get('/health', (req, res) => {
   const c = booking.cfg();
   const h = { ok: true, vertical: c.vertical, trade: c.trade, flow: c.flow, billing: billing.summary().mode, serviceActive: billing.access().active, twilio: live, booking: c.booking, deposit: c.deposit, stripe: !!env.STRIPE_SECRET_KEY, connect: connect.mode() !== 'mock' && connect.depositsReady(), connectStatus: connect.status(), storage: store.backend() };
-  // storageState: ok | degraded (Postgres writes failing right now) | fallback (DATABASE_URL set, running on files)
-  //   | file (no DATABASE_URL). Details (no secrets) for admins only.
+  // Full state (admins): ok | degraded (Postgres writes failing right now) | fallback (DATABASE_URL set, running on
+  // files) | file (no DATABASE_URL).
   const st = store.status();
-  h.storageState = st.degraded ? 'degraded' : st.fallback ? 'fallback' : st.backend === 'postgres' ? 'ok' : 'file';
+  const fullState = st.degraded ? 'degraded' : st.fallback ? 'fallback' : st.backend === 'postgres' ? 'ok' : 'file';
+  // Public: only ok/degraded (file storage in production counts as degraded). Full detail is admin-only.
+  h.storageState = fullState === 'ok' || (fullState === 'file' && !sec.isProduction()) ? 'ok' : 'degraded';
   if (req.headers.authorization && isAdmin(req)) {
     const pol = storagePolicy();
     Object.assign(h, { openai: !!env.OPENAI_API_KEY, leadFee: c.leadFee, leadFeeWaived: c.leadFeeWaived, demoMode: sec.demoAllowed(),
-      storageDetail: { backend: st.backend, databaseConfigured: st.configured, failClosed: pol.failClosed, failClosedReason: pol.why, fallback: st.fallback,
+      storageDetail: { state: fullState, backend: st.backend, spillDir: st.spillDir, databaseConfigured: st.configured, failClosed: pol.failClosed, failClosedReason: pol.why, fallback: st.fallback,
         degraded: st.degraded, failingSince: st.failingSince, lastError: st.lastError, optOutSpillPending: st.spillPending } });
   }
   res.json(h);
@@ -752,10 +757,14 @@ async function storageCheck(pol = storagePolicy()) {
   return { ok: false, fatal: false, message };
 }
 // Runtime Postgres write failures (after a good boot): one owner alert per outage (see store.js spill file).
-store.setDegradedAlert(({ reason, since }) => {
+const storageAlert = ({ reason, since, optedOut = [] }) => {
+  const nums = optedOut.length ? ` Opted out during the outage (masked): ${optedOut.join(', ')}.` : '';
+  if (reason === 'spill_more') return owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: opt-out during database outage: ${optedOut.join(', ')}. Do not text this number.`);
   console.error(`[store] !!!!!!!!!! WARNING: postgres writes failing${since ? ` since ${since}` : ''} (${reason}); opt-outs are kept in memory and in the local spill file until it recovers.`);
-  return owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: storage problem: database writes are failing${since ? ` since ${since}` : ''}. Opt-outs are saved to a local backup file and will be merged when the database is back. Please check the database (Neon/Render).`);
-});
+  return owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: storage problem: database writes are failing${since ? ` since ${since}` : ''}. Opt-outs are saved to a local backup file and will be merged when the database is back.${nums} Please check the database.`);
+};
+store.setDegradedAlert(storageAlert);
+app.locals.storageAlert = storageAlert;
 app.locals.storagePolicy = storagePolicy;
 app.locals.initStorage = initStorage;
 

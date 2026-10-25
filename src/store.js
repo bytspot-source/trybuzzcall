@@ -62,19 +62,32 @@ function createStore(opts = {}) {
   // Runtime write failures (Postgres reachable at boot, then failing): opt-outs/opt-ins are also appended to a local
   // spill file (DATA_DIR/optout-spill.jsonl) and merged at the next successful boot. The owner is alerted once per
   // outage (on the first spill, or when writes keep failing for STORAGE_ALERT_MINUTES, default 5).
-  const SPILL = path.join(DIR, 'optout-spill.jsonl');
+  // SPILL_DIR: put the spill file on a persistent disk (e.g. a Render disk mounted at /var/data); default DATA_DIR.
+  const SPILL_DIR = opts.spillDir || process.env.SPILL_DIR ? path.resolve(opts.spillDir || process.env.SPILL_DIR) : DIR;
+  try { fs.mkdirSync(SPILL_DIR, { recursive: true }); } catch {}
+  const SPILL = path.join(SPILL_DIR, 'optout-spill.jsonl');
+  const { maskPhone } = require('./security');
+  let spilledThisOutage = []; // masked numbers opted out while Postgres writes were failing (for the owner alert)
   let failSince = null, degradedAlerted = false, onDegraded = null;
   const alertMs = () => { const m = Number(process.env.STORAGE_ALERT_MINUTES); return (Number.isFinite(m) && m >= 0 ? m : 5) * 60000; };
   const redact = (m) => (m == null ? m : String(m).replace(/postgres(?:ql)?:\/\/\S+/gi, 'postgres://[redacted]').slice(0, 200));
-  function degradedAlert(reason) {
-    if (degradedAlerted || !onDegraded) return;
+  // First call per outage: the outage alert (with any masked opted-out numbers so far). Each later opt-out during the
+  // same outage sends a short follow-up with its masked number (max 20 per outage), so the owner has an out-of-band
+  // record even if this instance's disk is lost.
+  function degradedAlert(reason, maskedNumber) {
+    if (!onDegraded) return;
+    if (degradedAlerted && !maskedNumber) return;
+    if (degradedAlerted && spilledThisOutage.length > 20) return;
+    const payload = { reason: degradedAlerted ? 'spill_more' : reason, since: failSince ? new Date(failSince).toISOString() : null, error: redact(lastError),
+      optedOut: degradedAlerted ? [maskedNumber] : spilledThisOutage.slice() };
     degradedAlerted = true;
-    Promise.resolve().then(() => onDegraded({ reason, since: failSince ? new Date(failSince).toISOString() : null, error: redact(lastError) })).catch(() => {});
+    Promise.resolve().then(() => onDegraded(payload)).catch(() => {});
   }
   function spill(entry) {
-    try { fs.appendFileSync(SPILL, JSON.stringify(entry) + '\n'); console.error(`[store] postgres write failing: ${entry.op === 'out' ? 'opt-out' : 'opt-in'} also saved to ${path.basename(SPILL)}`); }
+    try { fs.appendFileSync(SPILL, JSON.stringify(entry) + '\n'); console.error(`[store] postgres write failing: ${entry.op === 'out' ? 'opt-out' : 'opt-in'} also saved to ${SPILL}`); }
     catch (e) { console.error('[store] spill write failed:', e.message); }
-    degradedAlert('spill');
+    if (entry.op === 'out') { const m = maskPhone(entry.phone); spilledThisOutage.push(m); degradedAlert('spill', m); }
+    else degradedAlert('spill');
   }
   const spillCount = () => { try { return fs.readFileSync(SPILL, 'utf8').split('\n').filter(Boolean).length; } catch { return 0; } };
   // Apply spilled records (in order) to db. Returns the number applied.
@@ -124,7 +137,7 @@ function createStore(opts = {}) {
           await pgWrite(); lastError = null;
           if (!dbDirty && !cfgDirty && (failSince || fs.existsSync(SPILL))) {
             if (failSince) console.log(`[store] postgres writes recovered after ${Math.round((Date.now() - failSince) / 1000)}s`);
-            failSince = null; degradedAlerted = false; clearSpill(); // everything (incl. spilled opt-outs) is now in Postgres
+            failSince = null; degradedAlerted = false; spilledThisOutage = []; clearSpill(); // everything (incl. spilled opt-outs) is now in Postgres
           }
         } catch (e) {
           lastError = e.message; console.error('[store] postgres write failed, will retry:', redact(e.message));
@@ -188,7 +201,8 @@ function createStore(opts = {}) {
     // fallback = DATABASE_URL is configured but we are running on the file backend (Postgres was unreachable at boot).
     // degraded = Postgres backend but writes are currently failing (data since then lives in memory + the spill file).
     status: () => ({ backend, lastError: redact(lastError), configured: !!databaseUrl, fallback: !!databaseUrl && backend !== 'postgres',
-      degraded: backend === 'postgres' && !!failSince, failingSince: failSince ? new Date(failSince).toISOString() : null, spillPending: spillCount() }),
+      degraded: backend === 'postgres' && !!failSince, failingSince: failSince ? new Date(failSince).toISOString() : null, spillPending: spillCount(),
+      spillDir: SPILL_DIR === DIR ? 'DATA_DIR' : 'SPILL_DIR' }),
     setDegradedAlert(fn) { onDegraded = fn || null; },
     findOpenLead: (phone) => db.leads.find((l) => l.phone === phone && l.status !== 'done' && l.status !== 'opted_out'),
     findBooking: (id) => db.bookings.find((b) => b.id === id),

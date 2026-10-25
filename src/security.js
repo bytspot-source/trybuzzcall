@@ -96,13 +96,19 @@ function securityHeaders(base) {
 // and premium 900, plus the 976 premium exchange and N11 service exchanges (211/411/911...): SMS pumping / toll fraud.
 // TEXT_EXTRA_AREA_CODES="787,939" adds codes (a new overlay, or territories if the shop really serves them).
 const AREA_CODES = require('./areaCodes');
-const BLOCKED_AREA_CODES = new Set(['900']);
+// Never textable, even if listed in TEXT_EXTRA_AREA_CODES: premium 900, toll-free (in use and reserved), and the
+// non-geographic service codes (5XX personal communications, 600/622 Canada non-geographic, 700, 710 US government).
+const PREMIUM_AREA_CODES = new Set(['900']);
+const TOLL_FREE_AREA_CODES = new Set('800 833 844 855 866 877 888 822 880 881 882 883 884 885 886 887 889'.split(' '));
+const NON_GEOGRAPHIC_AREA_CODES = new Set('500 521 522 523 524 525 526 527 528 529 532 533 535 538 542 543 544 545 546 547 549 550 552 553 554 556 566 569 577 588 589 600 622 633 644 655 677 688 700 710'.split(' '));
 const extraAreaCodes = () => new Set(String(process.env.TEXT_EXTRA_AREA_CODES || '').split(/[\s,]+/).filter((x) => /^[2-9]\d{2}$/.test(x)));
 function nanpReason(p) {
   const m = /^\+1([2-9]\d{2})([2-9]\d{2})\d{4}$/.exec(String(p || ''));
   if (!m) return 'not a +1 number';
   const [, npa, nxx] = m;
-  if (BLOCKED_AREA_CODES.has(npa)) return 'premium area code';
+  if (PREMIUM_AREA_CODES.has(npa)) return 'premium area code';
+  if (TOLL_FREE_AREA_CODES.has(npa)) return 'toll-free area code';
+  if (NON_GEOGRAPHIC_AREA_CODES.has(npa)) return 'non-geographic area code';
   if (!AREA_CODES.US.has(npa) && !AREA_CODES.CA.has(npa) && !extraAreaCodes().has(npa)) return AREA_CODES.NON_US_CA.has(npa) ? 'non-US/Canada NANP area code' : 'not a US/Canada area code';
   if (nxx === '976') return 'premium exchange 976';
   if (/^[2-9]11$/.test(nxx)) return 'service exchange';

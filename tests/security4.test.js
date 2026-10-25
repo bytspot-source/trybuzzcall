@@ -58,7 +58,8 @@ test('R1: job and scheduling replies stay normal replies (job-word guard applies
   for (const m of [...MUST_STAY_REPLIES, ...ALSO_REPLIES]) assert.equal(optout.classify(m), null, m);
 });
 test('R1: longer messages mentioning stop with no job context are "maybe" (pause + owner check)', () => {
-  for (const m of ['I dont know who this is but stop', 'I never asked for this so stop it already ok', 'Who gave you this number? Stop now ok?'])
+  // ("I dont know who this is but stop" is now an opt-out: stop as its own clause, see security5 S2)
+  for (const m of ['I never asked for this so stop it already ok', 'Who gave you this number? Stop now ok?', 'I really need you guys to stop this right away ok'])
     assert.equal(optout.classify(m), 'maybe', m);
   assert.equal(optout.classify('My faucet will not stop dripping since last night'), null, 'job word: normal reply');
 });
@@ -104,7 +105,7 @@ test('R1 e2e: ambiguous longer "stop" message pauses automated texts and alerts 
   quiet(t);
   const p = num(); await call(p); await text(p, 'Dana');
   const before = sentTo(p).length, alerts = store.db.alerts.length;
-  await text(p, 'I dont know who this is but stop');
+  await text(p, 'I never asked for this so stop it already ok');
   assert.equal(store.isOptedOut(p), false);
   assert.equal(store.isPaused(p), true);
   assert.equal(sentTo(p).length, before, 'no automated reply');
@@ -133,10 +134,10 @@ test('R1: pause expires after BOT_PAUSE_HOURS', (t) => {
 // ---------- R2 ----------
 test('R2: admin /health shows storage state and fail-closed policy; public /health shows storageState only', async (t) => {
   const pub = await (await req('/health')).json();
-  assert.equal(pub.storageState, 'file');
+  assert.equal(pub.storageState, 'ok', 'dev file storage = ok (public summary is ok|degraded)');
   assert.equal(pub.storageDetail, undefined);
   const adm = await (await req('/health', { headers: auth })).json();
-  assert.deepEqual(Object.keys(adm.storageDetail).sort(), ['backend', 'databaseConfigured', 'degraded', 'failClosed', 'failClosedReason', 'failingSince', 'fallback', 'lastError', 'optOutSpillPending']);
+  assert.deepEqual(Object.keys(adm.storageDetail).sort(), ['backend', 'databaseConfigured', 'degraded', 'failClosed', 'failClosedReason', 'failingSince', 'fallback', 'lastError', 'optOutSpillPending', 'spillDir', 'state']);
   assert.equal(adm.storageDetail.failClosed, false);
   withEnv(t, { REQUIRE_POSTGRES: '1' });
   assert.equal((await (await req('/health', { headers: auth })).json()).storageDetail.failClosed, true);
@@ -167,7 +168,8 @@ test('R3: Postgres write failures after boot spill opt-outs to a local file, ale
   const lines = fs.readFileSync(spillFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
   assert.deepEqual(lines.map((l) => [l.op, l.phone]), [['out', '+14045550401'], ['out', '+14045550402']]);
   await new Promise((r) => setTimeout(r, 10));
-  assert.equal(alerts.length, 1, 'one owner alert per outage');
+  assert.equal(alerts.length, 2, 'one outage alert + one follow-up per later opt-out (S3)');
+  assert.deepEqual(alerts.map((a) => [a.reason, a.optedOut]), [['spill', ['+1******0401']], ['spill_more', ['+1******0402']]]);
   const st = s.status();
   assert.deepEqual([st.degraded, st.spillPending], [true, 2]);
   assert.doesNotMatch(JSON.stringify(st), /secretpw/);

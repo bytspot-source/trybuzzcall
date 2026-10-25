@@ -131,8 +131,29 @@ Single-tenant (one business per deploy, one subscription), JSON store, no retry 
 
 By default state lives in files under `DATA_DIR` (`db.json`, `config.json`). On hosts with an ephemeral filesystem (Render free plan) those are wiped on every restart/redeploy/spin-down. Set `DATABASE_URL` to a Postgres connection string and the same two JSON documents are stored in a `buzz_kv` table instead (created automatically; the first boot seeds it from any existing files). Writes are debounced (~200 ms) and flushed on SIGTERM. Opt-outs and opt-ins skip the debounce and are written immediately. If `DATABASE_URL` is set but Postgres is unreachable at boot, the app falls back to file storage so the line keeps answering; in production it logs a loud warning and sends an owner alert. In production with `DATABASE_URL` set this is fatal instead, with no flag needed (retries `REQUIRE_POSTGRES_RETRIES`, default 5, 3 s apart, then exits so Render keeps the previous deploy or restarts); `REQUIRE_POSTGRES=1` extends that to a missing `DATABASE_URL`. If writes fail after boot, opt-outs are also appended to `DATA_DIR/optout-spill.jsonl` (merged at the next boot), `/health` shows `storageState: "degraded"`, and the owner is alerted once per outage. Admins see the full storage state on `/health` (with credentials) and at the top of `/admin`. `/health` reports `storage: "file"|"postgres"`. Note `sms.log` is a log only and stays file-based. Tests: `tests/storage.test.js` (set `TEST_DATABASE_URL` to also exercise a real database).
 
+## Hosting for the pilot: not on Render Free or Neon Free
+
+Don't run a live pilot on free tiers. Checked 2026-10-25 against https://render.com/docs/free, https://render.com/pricing and https://neon.com/pricing:
+
+- **Render Free web service:** spins down after 15 minutes without traffic and takes about a minute to spin back up (a missed call that arrives while it is waking up may get no text-back); local files, including the opt-out spill file, are lost on every spin-down, restart and redeploy; no persistent disks; Render "might restart a Free web service at any time"; 750 free instance hours per workspace per month, after which Free services are suspended. Render's own docs say not to use Free instances for production.
+- **Render Free Postgres:** expires 30 days after creation (deleted after a 14-day grace period), 1 GB, no backups, maintenance/restarts at any time.
+- **Neon Free:** compute always scales to zero after 5 minutes idle (cold start on the next query), 100 CU-hours per project per month (compute is suspended until the next billing period when used up), 1 GB storage per project, 6-hour history window, community support only.
+
+**Estimated** monthly cost of a minimal paid setup (list prices on the pages above, 2026-10-25; estimates, not quotes; excludes Twilio and Stripe fees):
+
+| Piece | Option | Estimate |
+|---|---|---|
+| Web service | Render "Less than 1 CPU" (0.5 CPU / 512 MB, plan `0.5c-512mb`) | ~$7/month |
+| Persistent disk for `SPILL_DIR` (optional) | Render SSD, 1 GB at $0.25/GB-month | ~$0.25/month |
+| Database | Render Postgres basic (`0.1c-256mb`, 1 GB included) | ~$6/month |
+| or | Neon Launch, 0.25 CU at $0.106/CU-hour: ~$19/month if always on (0.25 × 730 h × $0.106), much less with scale-to-zero; storage $0.35/GB-month (this app stores well under 1 GB) | ~$2–20/month |
+| Workspace | Render Hobby | $0 |
+
+So roughly **$13–27/month** (estimate). Note: per Render's docs a persistent disk **disables zero-downtime deploys**, so with a disk a failed boot (fail-closed storage) means downtime instead of Render keeping the previous deploy live. Use `SPILL_DIR` with a disk only if you accept that; otherwise leave it unset (the spill file then only survives a process restart on the same instance, and the owner alert lists the masked opted-out numbers as the out-of-band record).
+
 ## Go-live checklist (pilot)
 
+- Hosting: a paid Render instance and a paid database (see above), not Free.
 - Render env: `NODE_ENV=production`, `DATABASE_URL` (the app refuses to start without Postgres when it is set), a 20+ character `ADMIN_PASSWORD` (plus `ADMIN_USERNAME`, `ADMIN_PASSWORD_STRICT=1`), `OWNER_PHONE`, `PUBLIC_BASE_URL`. Remove `DEMO_MODE` once Stripe/Twilio are live.
 - Twilio console: Advanced Opt-Out on (it confirms exact STOP keywords; the app confirms every other opt-out once), Geo-Permissions US/Canada only, SMS Pumping Protection on.
 - **Area codes:** text-backs go only to US/Canada area codes in `src/areaCodes.js` (NANPA list, refreshed yearly; a test fails when it is ~12 months old). If the shop serves callers from a code that is skipped (a brand-new overlay, or Puerto Rico 787/939, USVI 340, Guam 671), set `TEXT_EXTRA_AREA_CODES=787,939`. The owner gets a daily text counting callers skipped for their area code.
