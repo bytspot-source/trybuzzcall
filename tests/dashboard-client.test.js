@@ -68,7 +68,7 @@ function deferred() {
   let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 }
-function boot({ forms = [], plans = [], pages = [], nav = [], filters = [], hash = '', ids = {}, dialog = null, fetch } = {}) {
+function boot({ forms = [], plans = [], pages = [], nav = [], filters = [], hash = '', pathname = '/admin', ids = {}, dialog = null, fetch } = {}) {
   const doc = new Element(), calls = [], destinations = [], timers = new Map(), events = new Map();
   let reloads = 0, timerId = 0;
   const crumb = new Element();
@@ -79,7 +79,7 @@ function boot({ forms = [], plans = [], pages = [], nav = [], filters = [], hash
   const hiddenControl = new Element(); hiddenControl.hidden = true;
   doc.queries.set('[data-js-only]', [hiddenControl]);
   doc.getElementById = id => id === 'confirm-dialog' ? dialog : ids[id] || pages.find(p => p.dataset.page === id) || null;
-  const location = { origin: 'https://shop.example', pathname: '/admin', search: '', hash,
+  const location = { origin: 'https://shop.example', pathname, search: '', hash,
     assign: value => destinations.push(value), reload: () => { reloads++; } };
   const win = {
     location, history: { replaceState: (_, __, value) => destinations.push(value) },
@@ -255,4 +255,63 @@ test('failed plan change discards the quote and requires a new preview', async (
 test('untrusted return destinations are never followed', async () => {
   const form=apiForm({return:'https://attacker.example/'});const app=boot({forms:[form]});
   await form.fire('submit'); assert.deepEqual(app.destinations,['/admin#payments']);
+});
+
+test('vendor plan changes use the form endpoint and refresh the vendor workspace', async () => {
+  const form = planForm();
+  form.action = 'https://shop.example/vendor/billing/preview';
+  form.dataset.changeAction = '/vendor/billing/change-plan';
+  form.dataset.return = '/vendor#payments';
+  const app = boot({ plans: [form], pathname: '/vendor', fetch: async () => response(200, { amount_due_now: 20 }) });
+  await form.fire('submit'); await form.confirm.fire('click');
+  assert.deepEqual(app.calls.map(call => call.url), ['https://shop.example/vendor/billing/preview', 'https://shop.example/vendor/billing/change-plan']);
+  assert.deepEqual(app.destinations, ['/vendor#payments']);
+  assert.equal(app.reloads(), 1);
+});
+
+test('vendor billing return destinations are allowlisted and invalid destinations stay in vendor scope', async () => {
+  for (const destination of [undefined, 'https://attacker.example/', '//attacker.example/vendor', 'http://[invalid', '/vendor/settings', '/vendor/billing/mock/portal/extra']) {
+    const form = apiForm({ return: destination });
+    form.action = 'https://shop.example/vendor/billing/cancel';
+    const app = boot({ forms: [form], pathname: '/vendor/billing/mock/portal' });
+    await form.fire('submit');
+    const target = app.destinations[0];
+    assert.equal(new URL(target, 'https://shop.example').pathname, '/vendor');
+    assert.equal(new URL(target, 'https://shop.example').hash, '#payments');
+    assert.equal(app.calls.length, 1);
+  }
+  const form = apiForm({ return: '/vendor/billing/mock/portal' });
+  const app = boot({ forms: [form], pathname: '/vendor' });
+  await form.fire('submit');
+  assert.deepEqual(app.destinations, ['https://shop.example/vendor/billing/mock/portal']);
+  assert.equal(app.reloads(), 0);
+  const same = apiForm({ return: '/vendor/billing/mock/portal' });
+  const portal = boot({ forms: [same], pathname: '/vendor/billing/mock/portal' });
+  await same.fire('submit');
+  assert.equal(portal.reloads(), 1);
+  const unsafe = apiForm({ return: '//attacker.example/vendor' });
+  const fallback = boot({ forms: [unsafe], pathname: '/vendor' });
+  await unsafe.fire('submit');
+  assert.deepEqual(fallback.destinations, ['/vendor#payments']);
+  assert.equal(fallback.reloads(), 1, 'Even fallback fragments must refresh stale billing values');
+});
+
+test('a cross-origin plan change action is refused without sending credentials', async () => {
+  const form = planForm();
+  form.dataset.changeAction = 'https://attacker.example/charge';
+  const app = boot({ plans: [form], fetch: async () => response(200, { amount_due_now: 20 }) });
+  await form.fire('submit'); await form.confirm.fire('click');
+  assert.equal(app.calls.length, 1);
+  assert.match(form.output.textContent, /must stay on/);
+  assert.equal(app.destinations.length, 0);
+});
+
+test('a missing plan return uses the current vendor scope rather than legacy admin', async () => {
+  const form = planForm();
+  delete form.dataset.return;
+  form.dataset.changeAction = '/vendor/billing/change-plan';
+  const app = boot({ plans: [form], pathname: '/vendor', fetch: async () => response(200, { amount_due_now: 0 }) });
+  await form.fire('submit'); await form.confirm.fire('click');
+  assert.deepEqual(app.destinations, ['/vendor#payments']);
+  assert.equal(app.reloads(), 1);
 });

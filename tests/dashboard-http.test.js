@@ -207,14 +207,14 @@ test('dashboard and payment safety over isolated local HTTP', { timeout: 60000 }
 
   await t.test('authenticated dashboard and billing portal link real assets and all six workspace sections', async () => {
     f.reset();
-    for (const route of ['/admin', '/billing/mock/portal', '/billing/portal', '/billing/status', '/admin/connect/mock']) {
+    for (const route of ['/admin', '/admin/legacy', '/billing/mock/portal', '/billing/portal', '/billing/status', '/admin/connect/mock']) {
       const denied = await f.request(route);
       assert.equal(denied.status, 401);
       assert.match(denied.headers['www-authenticate'], /^Basic /);
       assert.doesNotMatch(denied.body, /Fixture shop|Owner workspace/);
     }
     const before = f.snapshot();
-    const dashboard = html(await f.request('/admin', { admin: true }));
+    const dashboard = html(await f.request('/admin/legacy', { admin: true }));
     const portal = html(await f.request('/billing/mock/portal', { admin: true }));
     assert.deepEqual(attributes(dashboard, 'data-page'), SECTIONS);
     for (const body of [dashboard, portal]) {
@@ -258,7 +258,7 @@ test('dashboard and payment safety over isolated local HTTP', { timeout: 60000 }
       at: new Date().toISOString(), url: 'https://invoice.stripe.com/i/fixture?one=1&two=2' });
     f.store.save();
     const before = f.snapshot();
-    const dashboard = html(await f.request('/admin', { admin: true }));
+    const dashboard = html(await f.request('/admin/legacy', { admin: true }));
     assertEscaped(dashboard, [business, leadName, need, window, bookingName, service, slot, alert, email]);
     assert.ok(dashboard.includes(`data-state="${escaped(state)}"`));
     assert.equal(attributes(dashboard, 'onmouseover').length, 0);
@@ -284,14 +284,14 @@ test('dashboard and payment safety over isolated local HTTP', { timeout: 60000 }
     for (const key of ['STRIPE_WEBHOOK_SECRET', 'STRIPE_CONNECT_WEBHOOK_SECRET', 'TWILIO_AUTH_TOKEN',
       'OPENAI_API_KEY', 'DATABASE_URL', 'SETUP_WAIVER_CODE']) process.env[key] = f.marker();
     const b = f.seedBooking(), session = await f.checkout();
-    for (const route of ['/admin', '/billing/mock/portal', '/admin/connect/mock', '/billing/status',
+    for (const route of ['/admin', '/admin/legacy', '/billing/mock/portal', '/admin/connect/mock', '/billing/status',
       '/admin/connect/status', `/pay/mock/${b.id}`, session.path, '/payment/return?status=success', '/billing/return?status=success']) {
       const response = await f.request(route, { admin: true });
       assert.equal(response.status, 200); // fixture checks every response body AND headers against every sentinel
     }
     for (const mode of ['test', 'live']) {
       process.env.STRIPE_SECRET_KEY = `sk_${mode}_${f.marker()}`;
-      html(await f.request('/admin', { admin: true }));
+      html(await f.request('/admin/legacy', { admin: true }));
       html(await f.request('/payment/return?status=success'));
       json(await f.request('/billing/status', { admin: true }));
     }
@@ -303,7 +303,7 @@ test('dashboard and payment safety over isolated local HTTP', { timeout: 60000 }
       f.store.setOverride({ stripeConnect: { accountId: `acct_fixture_${mode}`, mode,
         chargesEnabled: true, payoutsEnabled: true, requirementsDue: [] } });
       const before = f.snapshot();
-      const body = html(await f.request('/admin', { admin: true }));
+      const body = html(await f.request('/admin/legacy', { admin: true }));
       if (mode === 'mock') {
         assert.match(body, /Demo payments/);
         assert.match(body, /Simulated amounts · no real money/);
@@ -320,7 +320,7 @@ test('dashboard and payment safety over isolated local HTTP', { timeout: 60000 }
         assert.match(body, />Deposits enabled</);
         assert.doesNotMatch(body, /Demo payments|Stripe test mode|Simulated amounts/);
         process.env.DEPOSIT_ENABLED = '0';
-        const disabled = html(await f.request('/admin', { admin: true }));
+        const disabled = html(await f.request('/admin/legacy', { admin: true }));
         assert.match(disabled, />Deposits off</);
         assert.doesNotMatch(disabled, />Deposits enabled</);
       }
@@ -345,7 +345,7 @@ test('dashboard and payment safety over isolated local HTTP', { timeout: 60000 }
       }
       if (!env.STRIPE_SECRET_KEY) {
         assert.equal((await f.post('/api/checkout', { json: true })).status, 503);
-        const body = html(await f.request('/admin', { admin: true }));
+        const body = html(await f.request('/admin/legacy', { admin: true }));
         assert.match(body, /Payments are not configured/);
         assert.doesNotMatch(body, /Demo payments|action="\/admin\/connect\/onboard"/);
       }

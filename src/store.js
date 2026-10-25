@@ -81,12 +81,22 @@ function ensureDir(dir, name, warnings) {
 const FILE_MODE = { mode: 0o600 };
 
 function createStore(opts = {}) {
+  // Only trusted, stable shop IDs belong here, never paths or raw request input.
+  const namespace = opts.namespace;
+  if (namespace !== undefined && (typeof namespace !== 'string' || !/^[a-zA-Z0-9_-]{1,80}$/.test(namespace))) {
+    throw new TypeError('Invalid store namespace');
+  }
+  const dbKey = namespace === undefined ? 'db' : `shop:${namespace}:db`;
+  const configKey = namespace === undefined ? 'config' : `shop:${namespace}:config`;
   const pathWarnings = [];
   const refuse = (problem, fallbackLabel) => {
     pathWarnings.push(`${problem}; using ${fallbackLabel}`);
     console.error(`[store] !!!!!!!!!! WARNING: ${problem}. Ignoring it and using ${fallbackLabel} instead.`);
   };
   const dataCheck = checkDir(opts.dir, 'DATA_DIR');
+  if (namespace !== undefined && (!dataCheck.dir || dataCheck.problem)) {
+    throw new TypeError('Namespaced stores require a valid, unique data directory');
+  }
   if (dataCheck.problem) refuse(dataCheck.problem, `the default ${DEFAULT_DATA_DIR}`);
   const DIR = dataCheck.dir || DEFAULT_DATA_DIR;
   const databaseUrl = opts.databaseUrl || '';
@@ -119,7 +129,8 @@ function createStore(opts = {}) {
   // SPILL_DIR: put the spill file on a persistent disk (e.g. a Render disk mounted at /var/data); default DATA_DIR.
   const spillCheck = checkDir(opts.spillDir || process.env.SPILL_DIR, 'SPILL_DIR');
   if (spillCheck.problem) refuse(spillCheck.problem, 'DATA_DIR');
-  const SPILL_DIR = spillCheck.dir || DIR;
+  // A shared persistent spill base MUST NOT merge another shop's opt-outs.
+  const SPILL_DIR = spillCheck.dir && namespace !== undefined ? path.join(spillCheck.dir, namespace) : spillCheck.dir || DIR;
   if (SPILL_DIR !== DIR) { try { ensureDir(SPILL_DIR, 'SPILL_DIR', pathWarnings); } catch (e) { console.error('[store] could not create SPILL_DIR:', e.message); } }
   const SPILL = path.join(SPILL_DIR, 'optout-spill.jsonl');
   const { maskPhone } = require('./security');
@@ -173,14 +184,21 @@ function createStore(opts = {}) {
   async function pgWrite() {
     if (dbDirty) {
       dbDirty = false;
-      try { await pool.query(`INSERT INTO ${TABLE} (key, value, updated_at) VALUES ('db', $1::jsonb, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, [JSON.stringify(db)]); }
+      try {
+        if (namespace === undefined) await pool.query(`INSERT INTO ${TABLE} (key, value, updated_at) VALUES ('db', $1::jsonb, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, [JSON.stringify(db)]);
+        else await pool.query(`INSERT INTO ${TABLE} (key, value, updated_at) VALUES ($1, $2::jsonb, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, [dbKey, JSON.stringify(db)]);
+      }
       catch (e) { dbDirty = true; throw e; }
     }
     if (cfgDirty) {
       cfgDirty = false;
       try {
-        if (Object.keys(override).length) await pool.query(`INSERT INTO ${TABLE} (key, value, updated_at) VALUES ('config', $1::jsonb, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, [JSON.stringify(override)]);
-        else await pool.query(`DELETE FROM ${TABLE} WHERE key = 'config'`);
+        if (namespace === undefined) {
+          if (Object.keys(override).length) await pool.query(`INSERT INTO ${TABLE} (key, value, updated_at) VALUES ('config', $1::jsonb, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, [JSON.stringify(override)]);
+          else await pool.query(`DELETE FROM ${TABLE} WHERE key = 'config'`);
+        } else if (Object.keys(override).length) {
+          await pool.query(`INSERT INTO ${TABLE} (key, value, updated_at) VALUES ($1, $2::jsonb, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, [configKey, JSON.stringify(override)]);
+        } else await pool.query(`DELETE FROM ${TABLE} WHERE key = $1`, [configKey]);
       } catch (e) { cfgDirty = true; throw e; }
     }
   }
@@ -226,8 +244,10 @@ function createStore(opts = {}) {
     try {
       pool = poolFactory(databaseUrl);
       await pool.query(`CREATE TABLE IF NOT EXISTS ${TABLE} (key text PRIMARY KEY, value jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`);
-      const { rows } = await pool.query(`SELECT key, value FROM ${TABLE} WHERE key IN ('db', 'config')`);
-      const byKey = Object.fromEntries(rows.map((r) => [r.key, r.value]));
+      const { rows } = namespace === undefined
+        ? await pool.query(`SELECT key, value FROM ${TABLE} WHERE key IN ('db', 'config')`)
+        : await pool.query(`SELECT key, value FROM ${TABLE} WHERE key IN ($1, $2)`, [dbKey, configKey]);
+      const byKey = Object.fromEntries(rows.map((r) => [r.key === dbKey ? 'db' : 'config', r.value]));
       if (byKey.db) {
         for (const k of Object.keys(db)) delete db[k];
         Object.assign(db, defaultDb(), byKey.db);
@@ -349,7 +369,38 @@ function createStore(opts = {}) {
   };
 }
 
-const store = createStore({ dir: process.env.DATA_DIR || undefined, databaseUrl: process.env.DATABASE_URL || '' });
-store.pgConfig = pgConfig;
-store.checkDir = checkDir; // exported for tests
-module.exports = store;
+const root = createStore({ dir: process.env.DATA_DIR || undefined, databaseUrl: process.env.DATABASE_URL || '' });
+root.pgConfig = pgConfig;
+root.checkDir = checkDir; // exported for tests
+Object.defineProperty(root, 'root', { value: root, writable: false, configurable: false });
+const shopContext = require('./shopContext');
+const activeStore = () => {
+  const context = shopContext.current();
+  if (!context) return root;
+  // A facade in a context would recurse forever (or, worse, silently access root).
+  if (!context.store || context.store === facade) throw new TypeError('Shop context requires an actual store, not the store facade');
+  return context.store;
+};
+const wrappers = new WeakMap();
+const facade = new Proxy(root, {
+  get(target, key) {
+    if (key === 'root') return root;
+    if (['createStore', 'pgConfig', 'checkDir'].includes(key)) return root[key];
+    const captured = activeStore(), value = captured[key];
+    if (typeof value !== 'function') return value;
+    // Preserve the captured implementation when wrapping/restoring a method in the
+    // same store, but resolve a different tenant at invocation after an async hop.
+    const method = (...args) => {
+      const actual = activeStore();
+      return Reflect.apply(actual === captured ? value : actual[key], actual, args);
+    };
+    wrappers.set(method, { store: captured, value });
+    return method;
+  },
+  set(target, key, value) {
+    if (key === 'root') return false;
+    const actual = activeStore(), wrapped = typeof value === 'function' && wrappers.get(value);
+    return Reflect.set(actual, key, wrapped && wrapped.store === actual ? wrapped.value : value);
+  },
+});
+module.exports = facade;

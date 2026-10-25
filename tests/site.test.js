@@ -448,6 +448,14 @@ test('duplicate waitlist submissions are suppressed until the first request sett
   assertPost(h.requests[1], '/api/waitlist', { email: 'another-shop@example.test', businessType: 'home_services' });
 });
 
+test('approval-based checkout sends the owner to the fixed vendor sign-in route', async (t) => {
+  const h = harness(t, () => jsonResponse({ error: 'Sign in', next: 'https://untrusted.example/' }, 401));
+  await h.checkout('monthly').dispatch('click');
+  assert.deepEqual(h.redirects, ['/vendor/login']);
+  assert.match(h.checkoutStatus.textContent, /approved vendor account/);
+  assertCheckoutControls(h, false);
+});
+
 for (const [plan, destination, label] of [
   ['monthly', mockCheckout, 'relative local mock'],
   ['annual', stripeCheckout, 'Stripe'],
@@ -764,6 +772,8 @@ test('deferred frontend script, stylesheet, and all local asset/link targets exi
     for (const reference of [attrs.src, attrs.href, attrs.poster].filter(Boolean)) {
       const url = new URL(reference, `${origin}/`);
       if (url.origin !== origin) continue; // Mail, phone, and external URLs are not local files.
+      // This server-rendered sign-in route is exercised by site-http and vendor-http, not served from public/.
+      if (url.pathname === '/vendor/login') continue;
       if (url.pathname === '/' && url.hash) {
         byId(decodeURIComponent(url.hash.slice(1)));
         continue;

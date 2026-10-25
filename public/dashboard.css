@@ -456,6 +456,14 @@ input[type="checkbox"], input[type="radio"] { width: 20px; height: 20px; flex: 0
 .payment-footer a { display: inline-flex; align-items: center; min-height: 44px; }
 .payment-footer > span { margin-left: auto; }
 
+/* Platform and vendor pages share materials, but keep their roles explicit. */
+.workspace-auth { max-width: 600px; margin-inline: auto; }
+.workspace-form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 0 1.25rem; }
+.workspace-logout { margin-top: 1rem; padding-inline: .5rem; }
+.workspace-request + .workspace-request { margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border); }
+.workspace-request form { margin-top: .75rem; }
+.activation-code { white-space: pre-wrap; overflow-wrap: anywhere; user-select: all; border: 1px solid var(--border-strong); background: var(--warning-bg); }
+
 /* Native modal: closed dialogs stay closed without JavaScript. */
 .confirmation-dialog, #confirm-dialog {
   width: min(480px, calc(100% - 2rem));

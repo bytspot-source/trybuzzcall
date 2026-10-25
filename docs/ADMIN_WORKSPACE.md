@@ -1,6 +1,8 @@
-# Admin workspace and payment pages
+# Legacy admin workspace and payment pages
 
-The private workspace at `/admin` uses the existing HTTP Basic authentication, login limits, and same-origin write protection. The redesign does not replace authentication, approve SMS consent, connect a payment provider, or deploy the service.
+For the separate platform admin at `/admin` and individual vendor accounts at `/vendor`, see [Vendor workspaces](VENDOR_WORKSPACES.md). This guide describes the retained single-business workspace.
+
+The private legacy workspace at `/admin/legacy` uses the existing HTTP Basic authentication, login limits, and same-origin write protection. The redesign does not replace authentication, approve SMS consent, connect a payment provider, or deploy the service.
 
 ## Workspace
 

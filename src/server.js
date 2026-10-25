@@ -17,6 +17,8 @@ const adminPages = require('./adminPages');
 const paymentPages = require('./paymentPages');
 const crypto = require('crypto');
 const sec = require('./security');
+const vendors = require('./vendors');
+const shopContext = require('./shopContext');
 
 const app = express();
 app.disable('x-powered-by');
@@ -47,15 +49,27 @@ app.post('/stripe/webhook', express.raw({ type: '*/*' }), async (req, res) => {
     else return res.status(503).send('Webhook not configured');
   } catch (e) { console.error('stripe webhook rejected:', e.message); return res.status(400).send('Webhook error'); }
   if (!event || typeof event !== 'object' || !event.type) return res.status(400).send('Webhook error');
+  const destination = await vendors.stripeShop(event);
+  if (!destination) return res.json({ received: true, ignored: 'unassigned or conflicting shop' });
+  if (destination.retry) return res.status(503).send('Shop ownership pending; retry this event.');
+  const handle = async () => {
   // Shop subscription events (and subscription-mode checkout) -> billing.js. Deposit checkouts fall through.
-  try { if (await billing.handleEvent(event)) return res.json({ received: true }); }
+  try {
+    if (await billing.handleEvent(event)) {
+      if (shopContext.current()) await vendors.flush(shopContext.current().store);
+      return res.json({ received: true });
+    }
+  }
   catch (e) { console.error('billing webhook error:', e.message); return res.status(500).send('billing handler error'); }
-  if (['checkout.session.completed', 'checkout.session.async_payment_succeeded'].includes(event.type)) {
+  // Vendor deposits are direct Connect charges; platform-account events cannot mark them paid.
+  if (!shopContext.current() && ['checkout.session.completed', 'checkout.session.async_payment_succeeded'].includes(event.type)) {
     const s = event.data.object;
     const id = s.metadata?.bookingId || s.client_reference_id;
     if (id && s.payment_status !== 'unpaid') await onPaid(id);
   }
   res.json({ received: true });
+  };
+  return destination.shop ? vendors.run(destination.shop.id, handle, { suspended: true }) : handle();
 });
 // Stripe Connect webhook (endpoint scope "Connected accounts", its own signing secret STRIPE_CONNECT_WEBHOOK_SECRET).
 // Deposits are direct charges on the shop's account, so their checkout events arrive here with a top-level `account`.
@@ -70,6 +84,9 @@ app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, re
     else return res.status(503).send('Connect webhook not configured');
   } catch (e) { console.error('connect webhook rejected:', e.message); return res.status(400).send('Webhook error'); }
   const ignore = (why) => res.json({ received: true, ignored: why });
+  const destination = await vendors.stripeShop(event || {}, true);
+  if (!destination) return ignore('unassigned or conflicting shop');
+  const handle = async () => {
   const acct = connect.accountId();
   if (!event || !event.account || !acct || event.account !== acct) return ignore('account mismatch');
   if (!connect.livemodeOk(event)) return ignore('livemode mismatch');
@@ -98,7 +115,10 @@ app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, re
       default: return ignore('unhandled type');
     }
   } catch (e) { console.error('connect webhook error:', e.message); return res.status(500).send('connect handler error'); }
+  if (shopContext.current()) await vendors.flush(shopContext.current().store);
   res.json({ received: true });
+  };
+  return destination.shop ? vendors.run(destination.shop.id, handle, { suspended: true }) : handle();
 });
 app.use(express.urlencoded({ extended: false, limit: '100kb' }));
 app.use(express.json({ limit: '100kb' }));
@@ -107,13 +127,13 @@ app.use(express.json({ limit: '100kb' }));
 // before every such route, so a new route can't forget it. Case-insensitive because Express routing is.
 // Private business/payment pages must never be stored in shared caches or leak capability URLs as referrers.
 app.use((req, res, next) => {
-  if (/^\/(admin|api\/billing|billing|pay|payment)(\/|$)/i.test(req.path)) {
+  if (/^\/(admin|vendor|api\/billing|billing|pay|payment)(\/|$)/i.test(req.path)) {
     res.set('Cache-Control', 'private, no-store');
     res.set('Referrer-Policy', 'no-referrer');
   }
   next();
 });
-const ORIGIN_GUARDED = /^\/(admin|api\/billing|billing)(\/|$)/i;
+const ORIGIN_GUARDED = /^\/(admin|vendor|api\/billing|billing)(\/|$)/i;
 app.use((req, res, next) => (['GET', 'HEAD', 'OPTIONS'].includes(req.method) || !ORIGIN_GUARDED.test(req.path) ? next() : sameOrigin(req, res, next)));
 // Never serve editor/backup leftovers (e.g. public/terms.html.bak-*) or dotfiles from public/.
 app.use((req, res, next) => (/\.(bak|orig|swp)\b|~$|\/\./i.test(req.path) ? res.status(404).send('Not found') : next()));
@@ -267,7 +287,26 @@ async function startTextBack(phone) {
 }
 
 // 1) Incoming call: forward to owner if configured, else treat as missed
-app.post('/twilio/voice', verifyTwilio, async (req, res) => {
+const routeTwilio = (callback = false) => async (req, res, next) => {
+  const destination = await vendors.twilioShop(req.body, callback);
+  if (!destination) return twiml(res, '');
+  if (destination.shop) {
+    if (req.path.startsWith('/twilio/voice') && !req.body.CallSid) return twiml(res, '');
+    return vendors.run(destination.shop.id, () => next());
+  }
+  next();
+};
+function recordVendorCall(req, status) {
+  if (!shopContext.current() || typeof req.body.CallSid !== 'string' || req.body.CallSid.length > 80) return;
+  const calls = (store.db.calls ||= []);
+  const prior = calls.find(call => call.id === req.body.CallSid);
+  if (prior) { if (prior.status !== 'ringing') return false; prior.status = status; }
+  else calls.unshift({id:req.body.CallSid,phone:/^\+[1-9]\d{7,14}$/.test(req.body.From) ? req.body.From : null,status,at:new Date().toISOString()});
+  if (calls.length > 500) calls.length = 500;
+  store.save(); return true;
+}
+app.post('/twilio/voice', verifyTwilio, routeTwilio(), async (req, res) => {
+  if (recordVendorCall(req, env.FORWARD_TO_PHONE ? 'ringing' : 'missed') === false) return twiml(res, '<Hangup/>');
   if (env.FORWARD_TO_PHONE) {
     return twiml(res, `<Dial timeout="${env.RING_TIMEOUT_SECONDS || 20}" action="${BASE}/twilio/voice/status">${env.FORWARD_TO_PHONE}</Dial>`);
   }
@@ -276,8 +315,9 @@ app.post('/twilio/voice', verifyTwilio, async (req, res) => {
 });
 
 // 2) Dial result: no-answer/busy/failed => missed call
-app.post('/twilio/voice/status', verifyTwilio, async (req, res) => {
+app.post('/twilio/voice/status', verifyTwilio, routeTwilio(true), async (req, res) => {
   const s = req.body.DialCallStatus;
+  if (recordVendorCall(req, ['no-answer','busy','failed','canceled'].includes(s) ? 'missed' : s === 'completed' ? 'answered' : 'ringing') === false) return twiml(res, '<Hangup/>');
   if (['no-answer', 'busy', 'failed', 'canceled'].includes(s)) {
     const texted = await startTextBack(req.body.From);
     return twiml(res, `<Say>${texted ? missedSay() : missedSayNoText()}</Say><Hangup/>`);
@@ -289,7 +329,7 @@ app.post('/twilio/voice/status', verifyTwilio, async (req, res) => {
 const optOutNow = (phone, source) => Promise.race([store.optOut(phone, source), sec.sleep(5000)]);
 
 // 3) Caller SMS replies
-app.post('/twilio/sms', verifyTwilio, async (req, res) => {
+app.post('/twilio/sms', verifyTwilio, routeTwilio(), async (req, res) => {
   const from = req.body.From, body = String(req.body.Body || '');
   if (!sec.isNanp(from)) return twiml(res, ''); // never text non-US/CA or anonymous senders
   const kw = optout.classify(body);
@@ -392,12 +432,18 @@ async function onPaid(id) {
 // A payment link is safe to open: only an explicit same-origin POST completes a simulation.
 const mockPaymentOnly = (req, res, next) => env.STRIPE_SECRET_KEY || !sec.demoAllowed()
   ? res.status(404).send('mock payments disabled') : next();
-app.get('/pay/mock/:id', mockPaymentOnly, (req, res) => {
+const routeBooking = async (req, res, next) => {
+  const destination = await vendors.bookingShop(req.params.id);
+  if (!destination) return res.status(404).send('booking not found');
+  if (destination.shop) return vendors.run(destination.shop.id, () => next());
+  next();
+};
+app.get('/pay/mock/:id', mockPaymentOnly, routeBooking, (req, res) => {
   const b = store.findBooking(req.params.id);
   if (!b) return res.status(404).send('booking not found');
   res.type('html').send(paymentPages.deposit({ booking: b, businessName: env.BUSINESS_NAME || 'Your business' }));
 });
-app.post('/pay/mock/:id', mockPaymentOnly, sameOrigin, async (req, res) => {
+app.post('/pay/mock/:id', mockPaymentOnly, sameOrigin, routeBooking, async (req, res) => {
   const b = store.findBooking(req.params.id);
   if (!b) return res.status(404).send('booking not found');
   if (!b.paid && (b.status !== 'held' || !Number.isFinite(Date.parse(b.holdExpiresAt)) || Date.parse(b.holdExpiresAt) <= Date.now())) {
@@ -448,6 +494,7 @@ const apiErr = (res, e) => {
   return res.status(status).json({ error: e.message });
 };
 app.post('/api/checkout', checkoutLimit, async (req, res) => {
+  if (vendors.all().length) return res.status(401).json({ error: 'Sign in to your vendor dashboard to choose a subscription.', next: '/vendor/login' });
   if (!env.STRIPE_SECRET_KEY && !sec.demoAllowed()) return res.status(503).json({ error: 'checkout not available' });
   const plan = planParam(req.body.plan); if (!plan) return res.status(400).json({ error: 'plan must be monthly or annual' });
   const email = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(req.body.email || '')) ? String(req.body.email).trim() : undefined;
@@ -538,6 +585,7 @@ function sameOrigin(req, res, next) {
   if (r === 'ok') return next();
   return res.status(403).send(r === 'cross' ? 'cross-origin request refused' : 'cross-origin request refused (missing Origin)');
 }
+require('./vendorRoutes').register(app, { requireAdmin, BASE, sameOrigin });
 app.post('/admin/setups/:id/apply', requireAdmin, (req, res) => {
   const s = store.findSetup(req.params.id);
   if (!s) return res.status(404).json({ error: 'setup not found' });
@@ -604,7 +652,7 @@ app.post('/admin/connect/mock/complete', connectMockOnly, requireAdmin, (req, re
   res.redirect(303, '/admin#connect');
 });
 // Authenticated, server-rendered workspace. Only explicitly selected non-secret values reach templates.
-app.get('/admin', requireAdmin, (req, res) => {
+app.get('/admin/legacy', requireAdmin, (req, res) => {
   res.type('html').send(adminPages.render({
     businessName: env.BUSINESS_NAME || 'Your business',
     leads: store.db.leads, bookings: store.db.bookings || [], alerts: store.db.alerts, waitlist: store.db.waitlist,
@@ -616,7 +664,14 @@ app.get('/admin', requireAdmin, (req, res) => {
   }));
 });
 
-setInterval(() => booking.expireHolds(), 60000).unref();
+async function maintainShops() {
+  for (const shop of vendors.all().filter(s => s.status !== 'provisioning')) {
+    try { await vendors.run(shop.id, () => { booking.expireHolds(); runRetention(); }, { suspended: true }); }
+    catch { console.error('[vendors] Shop maintenance unavailable; check storage health.'); }
+  }
+}
+setInterval(() => { booking.expireHolds(); maintainShops().catch(() => {}); }, 60000).unref();
+app.locals.maintainShops = maintainShops;
 billing.init({ notify: (msg) => owner(null, msg), BASE });
 // Public health: status fields only (ops checks use ok/storageState/billing/serviceActive/...). Pricing config, the
 // OpenAI flag and the storage backend (`storage`, `storageDetail`) are admin-only (send Basic auth to get them too).
@@ -769,5 +824,12 @@ daily(); setInterval(runRetention, 86400000).unref();
 setInterval(() => reportAreaSkips().catch(() => {}), 3600000).unref(); // reports each finished UTC day within the hour
 const server = app.listen(port, () => console.log(`missedcall-buzz on :${port} (vertical ${booking.cfg().vertical}, trade ${booking.cfg().trade}, twilio ${live ? 'LIVE' : 'LOG-ONLY'}, ai ${env.OPENAI_API_KEY ? 'openai' : 'templates'}, storage ${store.backend()})`));
 // Render sends SIGTERM on restart/redeploy: flush pending writes to Postgres before exiting.
-for (const sig of ['SIGTERM', 'SIGINT']) process.once(sig, () => { server.close(); store.close().finally(() => process.exit(0)); });
+let stopping = false;
+for (const sig of ['SIGTERM', 'SIGINT']) process.once(sig, () => {
+  if (stopping) return;
+  stopping = true;
+  require('./shutdown').drainAndFlush(server, async () => {
+    await vendors.close({strict:true}); await store.close(); vendors.healthy(store.root);
+  }).then(() => process.exit(0), () => { console.error('[shutdown] Requests or storage did not drain cleanly.'); process.exit(1); });
+});
 });
