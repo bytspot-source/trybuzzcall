@@ -2,6 +2,12 @@
 
 When a customer call is missed, we text the caller back, collect **name / need / callback window**, then **buzz the owner by SMS** with who/what and a tap-to-call link. Built for any appointment-based local business that books by phone, in any US state; home services (plumbing/HVAC) and hair braiders are the featured pilots. It does not do spam filtering.
 
+## Owner workspace
+
+Open `/admin` with your existing admin credentials for Overview, Leads, Bookings, Payments, Operations and Shop setup. The workspace uses stored records, searchable tables, confirmed billing actions and explicit Stripe test/demo/live states. Live card entry and payout onboarding remain on Stripe-hosted pages.
+
+See [Admin workspace and payment pages](docs/ADMIN_WORKSPACE.md) for behavior and validation notes. Opening `/pay/mock/:id` no longer completes a simulated payment; an explicit same-origin POST is required. The payment return pages do not treat query strings as proof of payment. This redesign does not deploy the app or enable live payments/SMS.
+
 ## Stack
 Node 20 + Express. Leads are stored in a JSON file (`data/db.json`), with no native dependencies. Uses the Twilio SDK, optional OpenAI (via fetch), and the Stripe SDK.
 

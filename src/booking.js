@@ -165,7 +165,7 @@ async function depositLink(b, BASE) {
         product_data: { name: b.service ? `Deposit: ${b.service} with ${env.BUSINESS_NAME || `your ${trade().pro || 'pro'}`}, ${b.slotLabel}` : `Deposit: ${env.BUSINESS_NAME || 'service'} visit ${b.slotLabel}` } } }],
       metadata: { bookingId: b.id }, client_reference_id: b.id,
       expires_at: Math.floor(Date.now() / 1000) + Math.max(cfg().holdMin, 30) * 60, // Stripe min 30 min
-      success_url: `${BASE}/?deposit=success`, cancel_url: `${BASE}/?deposit=cancel`,
+      success_url: `${BASE}/payment/return?status=success`, cancel_url: `${BASE}/payment/return?status=cancel`,
       ...connectParams(b, acct),
     }, { stripeAccount: acct });
     b.stripeSessionId = s.id; b.payUrl = s.url;

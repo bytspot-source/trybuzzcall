@@ -13,6 +13,8 @@ const billing = require('./billing');
 const connect = require('./connect');
 const setupRules = require('./setupRules');
 const setupPages = require('./setupPages');
+const adminPages = require('./adminPages');
+const paymentPages = require('./paymentPages');
 const crypto = require('crypto');
 const sec = require('./security');
 
@@ -103,6 +105,14 @@ app.use(express.json({ limit: '100kb' }));
 // Central CSRF guard: every state-changing request (anything but GET/HEAD/OPTIONS) to an admin or billing endpoint
 // (/admin/*, /api/billing/*, /billing/*, including the mock billing routes) must come from this site. Registered once,
 // before every such route, so a new route can't forget it. Case-insensitive because Express routing is.
+// Private business/payment pages must never be stored in shared caches or leak capability URLs as referrers.
+app.use((req, res, next) => {
+  if (/^\/(admin|api\/billing|billing|pay|payment)(\/|$)/i.test(req.path)) {
+    res.set('Cache-Control', 'private, no-store');
+    res.set('Referrer-Policy', 'no-referrer');
+  }
+  next();
+});
 const ORIGIN_GUARDED = /^\/(admin|api\/billing|billing)(\/|$)/i;
 app.use((req, res, next) => (['GET', 'HEAD', 'OPTIONS'].includes(req.method) || !ORIGIN_GUARDED.test(req.path) ? next() : sameOrigin(req, res, next)));
 // Never serve editor/backup leftovers (e.g. public/terms.html.bak-*) or dotfiles from public/.
@@ -161,16 +171,6 @@ async function requireAdmin(req, res, next) {
   next();
 }
 app.locals.resetAdminLockout = () => { adminFails.reset(); adminGlobalFails.reset(); adminAlertedAt = 0; };
-function billingHtml(esc) {
-  const x = billing.summary(), s = x.subscription;
-  const d = (v) => (v ? new Date(v).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }) : '-');
-  return `<h1>Subscription <small style="font-weight:400;font-size:.6em">(${x.mode}${x.mode === 'mock' ? `, mock clock ${d(x.now)}` : ''})</small></h1>` + (s
-    ? `<p>Status: <b>${esc(s.status)}</b> · plan <b>${esc(s.plan)}</b>${s.amount != null ? ` ($${esc(s.amount)})` : ''} · current period ends ${esc(d(s.current_period_end))}${s.trial_end ? ` · trial end ${esc(d(s.trial_end))}` : ''}${s.cancel_at_period_end ? ' · <b>cancels at period end</b>' : ''}<br>Service: <b>${x.access.active ? 'ACTIVE' : 'INACTIVE'}</b> (${esc(x.access.reason)}) · <a href="/billing/portal">Billing portal</a></p>`
-    : `<p>No subscription on file. Service: <b>${x.access.active ? 'ACTIVE' : 'INACTIVE'}</b> (${esc(x.access.reason)})</p>`)
-    + `<p>Founding shops (setup waived): ${x.founding.taken}/${x.founding.limit}</p>`
-    + (x.shops.length ? `<details><summary>Shops (${x.shops.length})</summary><table><tr><th>#</th><th>Subscription</th><th>Plan</th><th>Status</th><th>Founding</th><th>Setup fee</th></tr>${x.shops.map((h) => `<tr><td>${h.n}</td><td>${esc(h.subscription)}</td><td>${esc(h.plan)}</td><td>${esc(h.status)}</td><td>${h.founding ? 'yes' : ''}</td><td>${esc(h.setup.status)}${h.setup.amount != null ? ' $' + esc(h.setup.amount) : ''} (${esc(h.setup.reason)})</td></tr>`).join('')}</table></details>` : '')
-    + (x.invoices.length ? `<details><summary>Invoices (${x.invoices.length})</summary><ul>${x.invoices.map((i) => `<li>${esc(d(i.at))}: $${esc(i.amount_due)} ${esc(i.status)} (${esc(i.reason)})</li>`).join('')}</ul></details>` : '');
-}
 const twiml = (res, xml) => res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?><Response>${xml}</Response>`);
 
 // Twilio signature check. With TWILIO_AUTH_TOKEN set, every webhook must carry a valid X-Twilio-Signature
@@ -389,14 +389,29 @@ async function onPaid(id) {
   return b;
 }
 
-// Mock deposit page (only when Stripe isn't configured, and in production only with DEMO_MODE=1): visiting marks it paid.
-app.get('/pay/mock/:id', async (req, res) => {
-  if (env.STRIPE_SECRET_KEY || !sec.demoAllowed()) return res.status(404).send('mock payments disabled');
-  const b0 = store.findBooking(req.params.id);
-  if (!b0) return res.status(404).send('booking not found');
-  const b = await onPaid(b0.id);
-  res.type('html').send(`<!doctype html><meta charset="utf-8"><title>Deposit</title><body style="font-family:sans-serif;margin:2rem"><h1>${b.status === 'confirmed' ? 'Paid - you\'re booked!' : 'Payment received'}</h1><p>MOCK $${b.amount} deposit for ${b.slotLabel}. Status: ${b.status}</p>`);
+// A payment link is safe to open: only an explicit same-origin POST completes a simulation.
+const mockPaymentOnly = (req, res, next) => env.STRIPE_SECRET_KEY || !sec.demoAllowed()
+  ? res.status(404).send('mock payments disabled') : next();
+app.get('/pay/mock/:id', mockPaymentOnly, (req, res) => {
+  const b = store.findBooking(req.params.id);
+  if (!b) return res.status(404).send('booking not found');
+  res.type('html').send(paymentPages.deposit({ booking: b, businessName: env.BUSINESS_NAME || 'Your business' }));
 });
+app.post('/pay/mock/:id', mockPaymentOnly, sameOrigin, async (req, res) => {
+  const b = store.findBooking(req.params.id);
+  if (!b) return res.status(404).send('booking not found');
+  if (!b.paid && (b.status !== 'held' || !Number.isFinite(Date.parse(b.holdExpiresAt)) || Date.parse(b.holdExpiresAt) <= Date.now())) {
+    return res.status(409).type('html').send(paymentPages.deposit({ booking: b, businessName: env.BUSINESS_NAME || 'Your business' }));
+  }
+  await onPaid(b.id);
+  res.redirect(303, `/pay/mock/${encodeURIComponent(b.id)}`);
+});
+// Redirect parameters never prove payment. These read-only pages wait for provider/webhook confirmation.
+for (const [route, kind] of [['/payment/return', 'deposit'], ['/billing/return', 'subscription']]) {
+  app.get(route, (req, res) => res.type('html').send(paymentPages.returnPage({ kind,
+    outcome: req.query.status === 'success' ? 'success' : 'cancel',
+    businessName: env.BUSINESS_NAME || 'Your business', mode: connect.mode() })));
+}
 
 async function buzzOwner(lead) {
   const msg = agent.isAppointments()
@@ -450,39 +465,31 @@ app.post('/api/billing/preview', requireAdmin, async (req, res) => {
 });
 app.post('/api/billing/change-plan', requireAdmin, async (req, res) => {
   const plan = planParam(req.body.plan); if (!plan) return res.status(400).json({ error: 'plan must be monthly or annual' });
-  try { res.json(await billing.changePlan(plan, req.body.proration_date, req.body.sub)); } catch (e) { apiErr(res, e); }
+  try { billingReply(req, res, await billing.changePlan(plan, req.body.proration_date, req.body.sub)); } catch (e) { apiErr(res, e); }
 });
-app.post('/api/billing/cancel', requireAdmin, async (req, res) => { try { res.json(await billing.setCancel(true, req.body.sub)); } catch (e) { apiErr(res, e); } });
-app.post('/api/billing/resume', requireAdmin, async (req, res) => { try { res.json(await billing.setCancel(false, req.body.sub)); } catch (e) { apiErr(res, e); } });
+app.post('/api/billing/cancel', requireAdmin, async (req, res) => { try { billingReply(req, res, await billing.setCancel(true, req.body.sub)); } catch (e) { apiErr(res, e); } });
+app.post('/api/billing/resume', requireAdmin, async (req, res) => { try { billingReply(req, res, await billing.setCancel(false, req.body.sub)); } catch (e) { apiErr(res, e); } });
 // Self-service: Stripe Billing Portal (update card, invoices, cancel). Mock mode: local portal page.
 app.get('/billing/portal', requireAdmin, async (req, res) => { try { res.redirect(303, await billing.portalUrl(BASE)); } catch (e) { apiErr(res, e); } });
 
 // Mock billing (only without STRIPE_SECRET_KEY): checkout page, portal page, and a clock to simulate the lifecycle.
 const mockOnly = (req, res, next) => (env.STRIPE_SECRET_KEY ? res.status(404).send('mock billing disabled (Stripe live)')
   : !sec.demoAllowed() ? res.status(404).send('mock billing disabled (set DEMO_MODE=1)') : next());
-const escH = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 app.get('/billing/mock/checkout/:id', mockOnly, (req, res) => {
-  const sess = billing.mockSessionInfo(req.params.id); if (!sess) return res.status(404).send('session not found');
-  const c = billing.cfg();
-  const setupTxt = sess.setup.status === 'pending' ? ` One-time setup $${c.mock.setup} (estimate) is added to your first invoice after the free trial, not today; cancel during the trial and you pay nothing.`
-    : sess.setup.status === 'waived' ? ` Setup fee waived (${escH(sess.setup.reason)}).` : '';
-  res.type('html').send(`<!doctype html><meta charset="utf-8"><title>MOCK checkout</title><body style="font-family:sans-serif;margin:2rem;max-width:36rem">
-<h1>MOCK Stripe Checkout</h1><p>Plan: <b>${escH(sess.plan)}</b> ($${c.mock[sess.plan]}/${sess.plan === 'annual' ? 'yr' : 'mo'}, demo amount).${setupTxt}</p>
-<p>${c.trialDays ? `${c.trialDays}-day free trial. Card required; it is charged automatically when the trial ends unless you cancel.` : 'No trial.'}</p>
-<form method="post" action="/billing/mock/checkout/${escH(req.params.id)}/complete"><label>Card (mock) <input value="4242 4242 4242 4242" readonly></label> <button>Start ${c.trialDays ? 'free trial' : 'subscription'}</button></form>`);
+  const session = billing.mockSessionInfo(req.params.id); if (!session) return res.status(404).send('session not found');
+  res.type('html').send(paymentPages.checkout({ session, cfg: billing.cfg(), id: req.params.id, businessName: env.BUSINESS_NAME || 'Your business' }));
 });
 app.post('/billing/mock/checkout/:id/complete', mockOnly, async (req, res) => {
-  try { const s = await billing.mockCompleteCheckout(req.params.id, BASE); res.json({ ok: true, subscription: s }); } catch (e) { apiErr(res, e); }
+  try {
+    const s = await billing.mockCompleteCheckout(req.params.id, BASE);
+    if (wantsHtml(req)) return res.redirect(303, `/billing/mock/checkout/${encodeURIComponent(req.params.id)}`);
+    res.json({ ok: true, subscription: s });
+  } catch (e) { apiErr(res, e); }
 });
 app.get('/billing/mock/portal', mockOnly, requireAdmin, (req, res) => {
-  const x = billing.summary(), s = x.subscription || {};
-  res.type('html').send(`<!doctype html><meta charset="utf-8"><title>MOCK billing portal</title><body style="font-family:sans-serif;margin:2rem;max-width:40rem">
-<h1>MOCK Billing Portal</h1><p>Status: <b>${escH(s.status || 'none')}</b> · plan ${escH(s.plan || '-')} · period ends ${escH(s.current_period_end || '-')}${s.cancel_at_period_end ? ' · <b>cancels at period end</b>' : ''} · access: ${x.access.active ? 'ON' : 'OFF'} (${escH(x.access.reason)})</p>
-<form method="post" action="/billing/mock/update-card"><button>Update card (and pay open invoice)</button></form>
-<form method="post" action="/api/billing/cancel"><button>Cancel at end of period</button></form>
-<h2>Invoices</h2><ul>${x.invoices.map((i) => `<li>${escH(i.at)}: $${escH(i.amount_due)} ${escH(i.status)} (${escH(i.reason)})</li>`).join('')}</ul><p><a href="${escH(BASE)}/">Return to site</a></p>`);
+  res.type('html').send(adminPages.billingPortal({ billing: billing.summary(), businessName: env.BUSINESS_NAME || 'Your business' }));
 });
-app.post('/billing/mock/update-card', mockOnly, requireAdmin, async (req, res) => { try { res.json(await billing.mockUpdateCard(BASE, req.body.sub)); } catch (e) { apiErr(res, e); } });
+app.post('/billing/mock/update-card', mockOnly, requireAdmin, async (req, res) => { try { billingReply(req, res, await billing.mockUpdateCard(BASE, req.body.sub)); } catch (e) { apiErr(res, e); } });
 app.post('/billing/mock/advance', mockOnly, requireAdmin, async (req, res) => {
   const days = Number(req.body.days); if (!Number.isFinite(days) || days < 0 || days > 800) return res.status(400).json({ error: 'days 0-800' });
   await billing.mockAdvance(days, BASE); res.json(billing.summary());
@@ -498,6 +505,8 @@ app.get('/trades.js', (req, res) => res.type('application/javascript').sendFile(
 // POST /setup (JSON or form). 422 = errors, 409 = warnings not confirmed (send confirm=1), 200 = saved as 'pending'.
 // Never touches the live config: an admin reviews it and clicks 'Apply to this line'.
 const wantsJson = (req) => req.is('application/json') || /application\/json/.test(req.get('accept') || '');
+const wantsHtml = (req) => !wantsJson(req) && /text\/html/.test(req.get('accept') || '');
+const billingReply = (req, res, result) => wantsHtml(req) ? res.redirect(303, '/admin#payments') : res.json(result);
 app.post('/setup', setupLimit, (req, res) => {
   const body = req.body && typeof req.body === 'object' ? req.body : {};
   const json = wantsJson(req);
@@ -539,11 +548,7 @@ app.post('/admin/setups/:id/apply', requireAdmin, (req, res) => {
   const changes = ['OWNER_PHONE', 'FORWARD_TO_PHONE'].filter((k) => (next[k] || '') !== (env[k] || '')).map((k) => ({ key: k, from: env[k] || '', to: next[k] || '' }));
   if (changes.length && !/^(1|true|yes)$/i.test(String(req.body.confirm_phones || ''))) {
     if (wantsJson(req)) return res.status(409).json({ ok: false, needsConfirm: true, phoneChanges: changes, hint: 'resend with confirm_phones=1' });
-    const lbl = { OWNER_PHONE: 'Lead alerts go to', FORWARD_TO_PHONE: 'Calls ring first at' };
-    return res.status(409).type('html').send(`<!doctype html><meta charset="utf-8"><title>Confirm phone change</title><body style="font-family:sans-serif;margin:2rem;max-width:40rem">
-<h1>Confirm phone number change</h1><p>Applying setup <code>${escH(s.id)}</code> (${escH(values.businessName || '')}) changes:</p><ul>${changes.map((c) => `<li>${lbl[c.key]}: <b>${escH(c.from || '(none)')}</b> &rarr; <b>${escH(c.to || '(none)')}</b></li>`).join('')}</ul>
-<p>Only continue if you recognise these numbers. Anyone can submit the public setup form.</p>
-<form method="post" action="/admin/setups/${escH(s.id)}/apply"><input type="hidden" name="confirm_phones" value="1"><label><input type="checkbox" required> These are the shop's own numbers</label><br><br><button>Apply with these numbers</button> <a href="/admin#setups">Cancel</a></form>`);
+    return res.status(409).type('html').send(paymentPages.phoneConfirmation({ setupId: s.id, businessName: values.businessName || 'Your business', changes }));
   }
   const applied = config.apply(next, { setupId: s.id });
   for (const x of store.db.setups) if (x.status === 'applied' && x.id !== s.id) x.status = 'replaced';
@@ -590,10 +595,7 @@ app.get('/admin/connect/status', requireAdmin, (req, res) => res.json(connect.su
 const connectMockOnly = (req, res, next) => (connect.mode() !== 'mock' ? res.status(404).send('mock onboarding disabled (Stripe configured)')
   : !sec.demoAllowed() ? res.status(404).send('mock onboarding disabled (set DEMO_MODE=1)') : next());
 app.get('/admin/connect/mock', connectMockOnly, requireAdmin, (req, res) => {
-  const x = connect.summary();
-  res.type('html').send(`<!doctype html><meta charset="utf-8"><title>MOCK Stripe onboarding</title><body style="font-family:sans-serif;margin:2rem;max-width:40rem">
-<h1>MOCK Stripe onboarding</h1><p>No Stripe key is configured, so this simulates the Stripe-hosted onboarding for account <code>${escH(x.accountId || '-')}</code>. No real money moves.</p>
-<form method="post" action="/admin/connect/mock/complete"><button>Finish mock onboarding (charges enabled)</button></form><p><a href="/admin#connect">Back to admin</a></p>`);
+  res.type('html').send(paymentPages.connectOnboarding({ connect: connect.summary(), businessName: env.BUSINESS_NAME || 'Your business' }));
 });
 app.post('/admin/connect/mock/complete', connectMockOnly, requireAdmin, (req, res) => {
   const s = connect.mockComplete();
@@ -601,38 +603,17 @@ app.post('/admin/connect/mock/complete', connectMockOnly, requireAdmin, (req, re
   if (wantsJson(req)) return res.json(connect.summary());
   res.redirect(303, '/admin#connect');
 });
-function connectHtml(esc) {
-  const x = connect.summary();
-  const btn = x.status === 'charges_enabled' ? '' : `<form method="post" action="/admin/connect/onboard" style="display:inline"><button>${x.accountId ? 'Continue Stripe onboarding' : 'Connect Stripe to receive deposits'}</button></form> `;
-  const sync = x.accountId && x.mode !== 'mock' ? '<form method="post" action="/admin/connect/sync" style="display:inline"><button>Refresh status</button></form>' : '';
-  return `<h1 id="connect">Deposit payouts (Stripe Connect)</h1><p>Status: <b>${esc(x.label)}</b> (${esc(x.mode)})${x.accountId ? ` · account <code>${esc(x.accountId)}</code>${x.source === 'env' ? ' (from STRIPE_CONNECT_ACCOUNT_ID)' : ''}` : ''}${x.accountId ? ` · details submitted: ${x.detailsSubmitted ? 'yes' : 'no'} · payouts: ${x.payoutsEnabled ? 'on' : 'off'}` : ''}${x.requirementsDue.length ? ` · Stripe still needs: ${esc(x.requirementsDue.join(', '))}` : ''}</p>
-<p>Deposits are paid straight into the shop's own Stripe account (the shop is the seller); refunds are issued by the owner from their Stripe Dashboard. ${x.depositsReady ? 'Deposits: <b>ON</b>.' : 'Deposits: <b>OFF</b> until charges are enabled; callers are booked without a deposit.'}</p>
-<p>${btn}${sync}</p>`;
-}
-
-function storageHtml(esc) {
-  const st = store.status(), pol = storagePolicy();
-  const state = st.degraded ? `<b style="color:#b00">DEGRADED</b>: database writes failing since ${esc(st.failingSince)} (${esc(st.lastError)})`
-    : st.fallback ? '<b style="color:#b00">FALLBACK</b>: DATABASE_URL set but running on temporary file storage'
-      : st.backend === 'postgres' ? 'OK (Postgres)' : `file storage${sec.isProduction() ? ' <b style="color:#b00">(not durable on Render)</b>' : ''}`;
-  const paused = Object.keys(store.db.botPaused || {}).filter((p) => store.isPaused(p));
-  return `<p id="storage">Storage: ${state} · fail-closed ${pol.failClosed ? 'ON' : 'off'} (${esc(pol.why)})${st.spillPending ? ` · ${st.spillPending} opt-out record(s) waiting in the spill file` : ''}${st.pathWarnings.length ? ` · <b style="color:#b00">path warning</b>: ${st.pathWarnings.map(esc).join('; ')}` : ''}${paused.length ? ` · automated texts paused (possible opt-out): ${paused.map(esc).join(', ')}` : ''}</p>`;
-}
-// Admin (HTTP Basic auth; any username unless ADMIN_USERNAME is set)
+// Authenticated, server-rendered workspace. Only explicitly selected non-secret values reach templates.
 app.get('/admin', requireAdmin, (req, res) => {
-  const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-  const rows = store.db.leads.slice(0, 100).map((l) => `<tr><td>${esc(l.createdAt)}</td><td>${esc(l.phone)}</td><td>${esc(l.name)}</td><td>${l.urgent ? '🚨 ' : ''}${esc(l.need)}</td><td>${esc(l.window)}</td><td>${esc(l.status)}</td></tr>`).join('');
-  const lf = booking.leadFeeTotals(), fc = booking.cfg();
-  const alerts = store.db.alerts.slice(0, 50).map((a) => `<li>${esc(a.at)} → ${esc(a.to)}: ${esc(a.body)}</li>`).join('');
-  const waitlist = store.db.waitlist.map((w) => {
-    const label = { home_services: 'Home services', braiders: 'Braiders', other: 'Other local business' }[w.businessType] || '';
-    return `<li>${esc(w.email)}${label ? ` · Business type: ${esc(label)}` : ''}</li>`;
-  }).join('');
-  res.send(`<!doctype html><meta charset="utf-8"><title>Admin</title><style>body{font-family:sans-serif;margin:2rem}td,th{border:1px solid #ccc;padding:4px 8px}table{border-collapse:collapse}</style>
-${storageHtml(esc)}${billingHtml(esc)}${connectHtml(esc)}<h1>Leads</h1><table><tr><th>When</th><th>Phone</th><th>Name</th><th>Need</th><th>Callback</th><th>Status</th></tr>${rows}</table>
-<h2>Lead fees</h2><p><b>Total: $${money(lf.total)}</b> from ${lf.count} paid lead(s) (fee $${money(fc.leadFee)}/paid lead${fc.leadFeeWaived ? ', WAIVED' : ''}; ${fc.connectAccount ? 'Stripe Connect ' + esc(fc.connectAccount) + ' (application fee, capped at 1/3 of the deposit)' : 'no Stripe connected'})<br>Due (to invoice): $${money(lf.due)} · Collected via Connect: $${money(lf.collected)} · Waived (pilot): $${money(lf.waived)} · Under review (slot lost): $${money(lf.review)}</p>
-<h2>Bookings</h2><ul>${(store.db.bookings || []).slice(0, 50).map((b) => `<li>${esc(b.slotLabel)}: ${esc(b.name)} (${esc(b.phone)}) - ${esc(b.status)}${b.paid ? ' PAID $' + esc(b.amount) : ''}${b.depositSkipped ? ' · deposit off: Stripe not connected' : ''}${b.lead_fee_status ? ` · lead fee $${money(b.lead_fee || 0)} ${esc(b.lead_fee_status)}` : ''}</li>`).join('')}</ul><h2>Owner alerts</h2><ul>${alerts}</ul><h2>Waitlist (${store.db.waitlist.length})</h2><ul>${waitlist}</ul>
-${setupPages.adminSetupsHtml(store.db.setups, config.effective(), config.override(), booking.cfg())}`);
+  res.type('html').send(adminPages.render({
+    businessName: env.BUSINESS_NAME || 'Your business',
+    leads: store.db.leads, bookings: store.db.bookings || [], alerts: store.db.alerts, waitlist: store.db.waitlist,
+    billing: billing.summary(), connect: connect.summary(), cfg: booking.cfg(), fees: booking.leadFeeTotals(),
+    storage: store.status(), policy: storagePolicy(), production: sec.isProduction(), demoAllowed: sec.demoAllowed(),
+    paused: Object.keys(store.db.botPaused || {}).filter(phone => store.isPaused(phone)), twilioLive: live,
+    pendingSetups: (store.db.setups || []).filter(s => s.status === 'pending').length,
+    setupHTML: setupPages.adminSetupsHtml(store.db.setups, config.effective(), config.override(), booking.cfg()),
+  }));
 });
 
 setInterval(() => booking.expireHolds(), 60000).unref();

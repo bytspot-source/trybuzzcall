@@ -215,7 +215,7 @@ async function createCheckout({ plan, email, BASE, setupWaived }) {
     subscription_data: { metadata: { plan }, ...(c.trialDays ? { trial_period_days: c.trialDays, trial_settings: { end_behavior: { missing_payment_method: 'cancel' } } } : {}) },
     metadata: { plan, setup_waived: setupWaived ? '1' : '0' }, allow_promotion_codes: true,
     ...(setupNote ? { custom_text: { submit: { message: setupNote } } } : {}),
-    success_url: `${BASE}/?checkout=success&session_id={CHECKOUT_SESSION_ID}`, cancel_url: `${BASE}/?checkout=cancel`,
+    success_url: `${BASE}/billing/return?status=success`, cancel_url: `${BASE}/billing/return?status=cancel`,
   });
   return { url: session.url, id: session.id, setup: preview };
 }
@@ -266,7 +266,7 @@ async function portalUrl(BASE) {
   if (!cfg().live) return `${BASE}/billing/mock/portal`;
   const customer = B().subscription?.customer;
   if (!customer) throw err('no Stripe customer on file yet (complete checkout first)', 404);
-  const ps = await stripe().billingPortal.sessions.create({ customer, return_url: cfg().portalReturn || `${BASE}/` });
+  const ps = await stripe().billingPortal.sessions.create({ customer, return_url: cfg().portalReturn || `${BASE}/admin#payments` });
   return ps.url;
 }
 

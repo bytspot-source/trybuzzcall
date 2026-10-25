@@ -429,11 +429,11 @@ test('public site over real local HTTP', { timeout: 60000 }, async (t) => {
     const before = await site.readStore();
     const response = await site.request('/admin');
     assertResponse(response, 200, /^text\/html$/i, '/admin');
-    assert.ok(response.body.includes('<li>home_services@example.com · Business type: Home services</li>'));
-    assert.ok(response.body.includes('<li>braiders@example.com · Business type: Braiders</li>'));
-    assert.ok(response.body.includes('<li>other@example.com · Business type: Other local business</li>'));
-    assert.ok(response.body.includes('<li>other.shop@example.com</li>'));
-    assert.ok(response.body.includes('<li>&lt;owner&amp;&quot;tag&gt;@example.com · Business type: Braiders</li>'));
+    assert.ok(response.body.includes('<td>home_services@example.com</td><td>Home services</td>'));
+    assert.ok(response.body.includes('<td>braiders@example.com</td><td>Braiders</td>'));
+    assert.ok(response.body.includes('<td>other@example.com</td><td>Other local business</td>'));
+    assert.ok(response.body.includes('<td>other.shop@example.com</td><td>Not specified</td>'));
+    assert.ok(response.body.includes('<td>&lt;owner&amp;&quot;tag&gt;@example.com</td><td>Braiders</td>'));
     assert.ok(!response.body.includes(email), 'Raw HTML must not appear in the admin waitlist');
     assert.deepEqual(await site.readStore(), before, 'Viewing admin must not change persisted data');
   });
@@ -453,11 +453,13 @@ test('public site over real local HTTP', { timeout: 60000 }, async (t) => {
       const before = await site.readStore();
       assert.equal(before.billing.mock.sessions[checkout.id].plan, plan);
       assertUncompleted(before);
-      // GET the page only: never submit its /complete form or visit /pay/mock.
+      // GET the page only: never submit its /complete form.
       const page = await site.request(url.href);
       assertResponse(page, 200, /^text\/html$/i, `${plan} mock checkout page`);
-      assert.match(page.body, /<h1>MOCK Stripe Checkout<\/h1>/);
-      assert.ok(page.body.includes(`Plan: <b>${plan}</b>`));
+      assert.match(page.body, /<h1>Review your demo plan<\/h1>/);
+      assert.ok(page.body.includes(`<h2>${plan === 'annual' ? 'Annual' : 'Monthly'} plan</h2>`));
+      assert.match(page.body, /No real money moves/);
+      assert.doesNotMatch(page.body, /4242 4242/);
       assert.deepEqual(await site.readStore(), before, 'Viewing checkout must not complete it or charge');
     });
   }
