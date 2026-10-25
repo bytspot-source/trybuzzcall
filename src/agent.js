@@ -8,6 +8,7 @@ const biz = () => env.BUSINESS_NAME || 'our team';
 const city = () => (env.BUSINESS_CITY || '').trim();
 const inCity = () => (city() ? ` in ${city()}` : '');
 const booking = require('./booking');
+const shopTime = require('./shopTime');
 const { escapeRe } = require('./security'); // service names come from the public /setup form
 const isBraiders = () => booking.trade().key === 'braiders';
 
@@ -46,7 +47,7 @@ const slotPrompt = (slots, lead) => {
     ? `${solo() ? "I'm" : "We're"} booked up that day, here are the closest openings` : `Here's what ${solo() ? 'I' : 'we'} have open`;
   return `${pre} for ${lead?.service || 'your appointment'}:\n${list}\nReply 1, 2 or 3 to book, or "call" if you'd rather ${solo() ? 'I' : 'we'} call you.${linkLine()}`;
 };
-const sameDay = (a, b) => a.toDateString() === new Date(b).toDateString();
+const sameDay = (a, b) => shopTime.sameDay(a, b);
 
 // Appointments: pick a service by number or by name; anything else in the reply is kept as size/length notes.
 function pickService(text) {
@@ -68,13 +69,17 @@ function pickService(text) {
 const DAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
 const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
 function parseDay(text, now = new Date()) {
-  const t = text.toLowerCase(), d = new Date(now); d.setHours(0, 0, 0, 0);
-  if (/\btoday\b|\btonight\b/.test(t)) return d;
-  if (/\btomorrow\b|\btmrw\b/.test(t)) { d.setDate(d.getDate() + 1); return d; }
+  const t = text.toLowerCase(), zone = shopTime.timeZone(), d = shopTime.parts(now, zone);
+  if (/\btoday\b|\btonight\b/.test(t)) return shopTime.toInstant(d, 0, zone);
+  if (/\btomorrow\b|\btmrw\b/.test(t)) return shopTime.toInstant(shopTime.addDays(d, 1), 0, zone);
   const md = t.match(/\b(\d{1,2})\/(\d{1,2})\b/) || (() => { const m = t.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})\b/); return m ? [m[0], MONTHS.indexOf(m[1]) + 1, m[2]] : null; })();
-  if (md) { const x = new Date(d.getFullYear(), Number(md[1]) - 1, Number(md[2])); if (x < d) x.setFullYear(x.getFullYear() + 1); return x; }
+  if (md) {
+    const month = Number(md[1]), day = Number(md[2]);
+    const year = d.year + (month < d.month || (month === d.month && day < d.day) ? 1 : 0);
+    return shopTime.toInstant({ year, month, day }, 0, zone);
+  }
   const w = t.match(/\b(sun|mon|tue|wed|thu|fri|sat)[a-z]*\b/);
-  if (w) { const add = (DAYS.indexOf(w[1]) - d.getDay() + 7) % 7; d.setDate(d.getDate() + add); return d; }
+  if (w) { const add = (DAYS.indexOf(w[1]) - shopTime.weekday(d) + 7) % 7; return shopTime.toInstant(shopTime.addDays(d, add), 0, zone); }
   return null;
 }
 // Urgent flag (owner alert gets 🚨): jobs flow only, trade-specific words (plumbing/HVAC keep the original list).

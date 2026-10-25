@@ -122,9 +122,12 @@
     return result;
   }
   function returnTo(path) {
-    const url = new URL(path || '/admin#payments', window.location.origin);
-    if (url.origin !== window.location.origin || !['/admin', '/billing/mock/portal'].includes(url.pathname)) {
-      window.location.assign('/admin#payments'); return;
+    const fallback = /^\/vendor(?:\/|$)/.test(window.location.pathname) ? '/vendor#payments' : '/admin#payments';
+    let url;
+    try { url = new URL(path || fallback, window.location.origin); }
+    catch { url = new URL(fallback, window.location.origin); }
+    if (url.origin !== window.location.origin || url.username || url.password || !['/admin', '/billing/mock/portal', '/vendor', '/vendor/billing/mock/portal'].includes(url.pathname)) {
+      url = new URL(fallback, window.location.origin);
     }
     // A fragment-only assign would leave stale billing values in the DOM.
     if (url.pathname === window.location.pathname && url.search === window.location.search) {
@@ -195,9 +198,9 @@
       pending = true; busy(form, true);
       feedback(form, 'Applying your plan change…', false);
       try {
-        await post('/api/billing/change-plan', quote);
+        await post(form.dataset.changeAction || '/api/billing/change-plan', quote);
         quote = null;
-        returnTo('/admin#payments');
+        returnTo(form.dataset.return);
       } catch (error) {
         // A new preview is required after an uncertain write; never replay a stale quote.
         quote = null; panel.hidden = true;

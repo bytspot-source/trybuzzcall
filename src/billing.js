@@ -12,7 +12,8 @@
 //   shops [{ subscriptionId, customer, plan, founding, setup: {status, reason, amount, itemId} }], invoices, events, mock }.
 const crypto = require('crypto');
 const store = require('./store');
-const env = process.env;
+const env = require('./config').env;
+const shopContext = require('./shopContext');
 const on = (v) => /^(1|true|yes|on)$/i.test(String(v || ''));
 const num = (v, d) => (String(v ?? '').trim() !== '' && Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : d);
 const DAY = 86400000;
@@ -36,7 +37,7 @@ const cfg = () => ({
 });
 
 const B = () => { store.db.billing = store.db.billing || {}; const b = store.db.billing;
-  for (const [k, v] of [['invoices', []], ['events', []], ['mock', {}], ['subs', {}], ['shops', []]]) b[k] = b[k] || v;
+  for (const [k, v] of [['invoices', []], ['events', []], ['mock', {}], ['subs', {}], ['shops', []], ['pendingCheckouts', {}]]) b[k] = b[k] || v;
   b.mock.subs = b.mock.subs || {}; b.mock.sessions = b.mock.sessions || {};
   if (b.subscription && !b.subs[b.subscription.id]) b.subs[b.subscription.id] = b.subscription; // migrate older single-sub state
   return b; };
@@ -45,12 +46,31 @@ const iso = (secs) => (secs ? new Date(secs * 1000).toISOString() : null);
 const secs = (ms) => Math.floor(ms / 1000);
 const money = (n) => (Math.round(n * 100) / 100).toFixed(2);
 const fmtDate = (isoStr) => (isoStr ? new Date(isoStr).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '?');
-let stripeClient = null;
-const stripe = () => (stripeClient = stripeClient || require('stripe')(env.STRIPE_SECRET_KEY));
+const stripe = () => require('./connect').stripe();
 let notify = async () => {};
-let PORTAL = '';
-function init(opts) { if (opts.notify) notify = opts.notify; if (opts.BASE) PORTAL = `${opts.BASE}/billing/portal`; }
+let platformBase = '';
+const billingPath = () => shopContext.current() ? '/vendor/billing' : '/billing';
+const portalLink = () => `${platformBase}${billingPath()}/portal`;
+const tenantMetadata = () => shopContext.current() ? { shopId: shopContext.shopId() } : {};
+function init(opts) { if (opts.notify) notify = opts.notify; if (opts.BASE) platformBase = opts.BASE; }
 const err = (msg, status) => Object.assign(new Error(msg), { status });
+const checkoutLocks = new Set();
+const eventFlights = new Map();
+const checkoutMatches = (record, options) => record.plan === options.plan && record.setupWaived === !!options.setupWaived;
+const checkoutConflict = () => err('Existing checkout must finish or expire before changing the plan or setup waiver', 409);
+const CHECKOUT_TTL = 23 * 60 * 60 * 1000;
+function ensureHealthy() {
+  const s = store.status();
+  if (s.degraded || s.fallback || s.lastError) throw err('Payment storage unavailable; please retry later', 503);
+}
+async function persistPayment() { store.save(); await store.flush(); ensureHealthy(); }
+function ensureNoSubscription() {
+  const b = B();
+  // Even an unknown status is a conflict: checkout must not create a second subscription.
+  if ([b.subscription, b.subs[b.primaryId], ...Object.values(b.subs), ...b.shops].some((s) => s && s.status !== 'canceled')
+    || (b.primaryId && !b.subs[b.primaryId]))
+    throw err('A subscription already exists; manage it in billing instead', 409);
+}
 
 // ---------- subscription state ----------
 const planOf = (sub) => {
@@ -80,7 +100,7 @@ function applySubscription(sub, source) {
 }
 async function syncFromStripe(subId, fallback, source) {
   // Live: re-read the subscription from Stripe so out-of-order (or forged unsigned) events can't set a wrong status.
-  if (cfg().live && subId) { try { return applySubscription(await stripe().subscriptions.retrieve(subId), source); } catch (e) { console.error('subscription sync failed:', e.message); } }
+  if (cfg().live && subId) return applySubscription(await stripe().subscriptions.retrieve(subId), source);
   return fallback ? applySubscription(fallback, source) : B().subs[subId];
 }
 
@@ -101,7 +121,10 @@ function decideSetup({ plan, override }) {
   const c = cfg();
   if (plan === 'annual') return { status: 'waived', reason: 'annual plan' };
   if (override || c.setupWaivedAll) return { status: 'waived', reason: 'override' };
-  if (foundingTaken() < c.foundingLimit) return { status: 'waived', reason: `founding shop #${foundingTaken() + 1} of ${c.foundingLimit}`, founding: true };
+  if (shopContext.current()) {
+    // Founding slots are platform-wide, never counted from a tenant's private store.
+    if (shopContext.current().shop.founding === true) return { status: 'waived', reason: 'founding shop', founding: true };
+  } else if (foundingTaken() < c.foundingLimit) return { status: 'waived', reason: `founding shop #${foundingTaken() + 1} of ${c.foundingLimit}`, founding: true };
   if (c.live ? !c.prices.setup : !(c.mock.setup > 0)) return { status: 'none', reason: 'no setup price configured' };
   return { status: 'pending', reason: 'charged on first invoice after the trial', amount: c.live ? null : c.mock.setup };
 }
@@ -122,13 +145,17 @@ async function removeSetupItem(shop, status, reason) {
   if (shop.setup?.status !== 'pending') return;
   if (cfg().live && shop.setup.itemId) {
     try { const it = await stripe().invoiceItems.retrieve(shop.setup.itemId); if (it.invoice) { shop.setup.status = 'invoiced'; return; } await stripe().invoiceItems.del(shop.setup.itemId); }
-    catch (e) { console.error('setup item delete failed:', e.message); return; }
+    catch (e) { console.error('setup item delete failed:', e.message); throw e; }
   } else { const ms = B().mock.subs[shop.subscriptionId]; if (ms) ms.pendingItems = (ms.pendingItems || []).filter((i) => i.id !== shop.setup.itemId); }
   shop.setup.status = status; shop.setup.reason = reason;
 }
 async function registerShop({ subscriptionId, customer, plan, override, status }) {
   const b = B(); let shop = shopOf(subscriptionId);
-  if (shop) return shop;
+  if (shop) {
+    // A provider failure may leave registration partially initialized. Reuse setup-sub's idempotency key.
+    if (shop.setup?.status === 'pending' && !shop.setup.itemId) await addSetupItem(shop);
+    store.save(); return shop;
+  }
   const d = decideSetup({ plan, override });
   shop = { n: b.shops.length + 1, subscriptionId, customer, plan, status, createdAt: new Date(now()).toISOString(), founding: !!d.founding,
     setup: { status: d.status, reason: d.reason, amount: d.amount ?? null, itemId: null } };
@@ -149,14 +176,29 @@ async function handleEvent(event) {
   if (!WATCHED.includes(event.type)) return false;
   const o = event.data.object;
   if (event.type === 'checkout.session.completed' && o.mode !== 'subscription') return false; // deposits handled by server.js
-  const b = B();
-  if (event.id && b.events.some((e) => e.id === event.id)) return true; // idempotent
-  b.events.unshift({ id: event.id, type: event.type, at: new Date(now()).toISOString() }); b.events = b.events.slice(0, 300);
+  // In-flight work is not completed work. A duplicate must await the same success or failure.
+  const key = event.id ? JSON.stringify([shopContext.shopId(), event.id]) : null;
+  if (key && eventFlights.has(key)) return eventFlights.get(key);
+  if (event.id && B().events.some((e) => e.id === event.id)) return true;
+  const flight = Promise.resolve().then(() => processEvent(event));
+  if (key) eventFlights.set(key, flight);
+  try { return await flight; }
+  finally { if (key) eventFlights.delete(key); }
+}
+
+async function processEvent(event) {
+  const b = B(), o = event.data.object;
   switch (event.type) {
     case 'checkout.session.completed': {
       const s = await syncFromStripe(o.subscription, null, event.type) || b.subs[o.subscription] || {};
       await registerShop({ subscriptionId: o.subscription, customer: o.customer, plan: s.plan || o.metadata?.plan || 'monthly',
         override: o.metadata?.setup_waived === '1', status: s.status || 'trialing' });
+      const pending = b.pendingCheckouts[o.id];
+      if (pending) {
+        pending.customer = typeof o.customer === 'string' ? o.customer : o.customer?.id || null;
+        pending.subscription = typeof o.subscription === 'string' ? o.subscription : o.subscription?.id || null;
+        pending.status = 'completed';
+      }
       break;
     }
     case 'customer.subscription.created': case 'customer.subscription.updated':
@@ -168,6 +210,7 @@ async function handleEvent(event) {
       void s; break;
     }
     case 'invoice.paid': case 'invoice.payment_failed': {
+      if (cfg().live && o.subscription) await syncFromStripe(o.subscription, null, event.type);
       const lines = (o.lines?.data || []).map((l) => ({ description: l.description, amount: l.amount / 100, invoice_item: l.invoice_item || null }));
       const inv = { id: o.id, subscription: o.subscription || null, status: event.type === 'invoice.paid' ? 'paid' : 'open',
         amount_due: (o.amount_due ?? 0) / 100, amount_paid: (o.amount_paid ?? 0) / 100, reason: o.billing_reason || null,
@@ -177,10 +220,9 @@ async function handleEvent(event) {
       const shop = shopOf(o.subscription);
       if (shop?.setup?.itemId && lines.some((l) => l.invoice_item === shop.setup.itemId))
         shop.setup.status = event.type === 'invoice.paid' ? 'paid' : 'invoiced (payment failed)';
-      if (cfg().live && o.subscription) await syncFromStripe(o.subscription, null, event.type);
       if (event.type === 'invoice.payment_failed') {
         const a = access();
-        await notify(`BuzzCall billing: your $${money(inv.amount_due)} payment didn't go through. Update your card here: ${PORTAL}${a.active ? '' : ' Until it is paid, callers get a short "please call back" text only (no booking or deposits).'}`);
+        await notify(`BuzzCall billing: your $${money(inv.amount_due)} payment didn't go through. Update your card here: ${portalLink()}${a.active ? '' : ' Until it is paid, callers get a short "please call back" text only (no booking or deposits).'}`);
       }
       break;
     }
@@ -189,35 +231,95 @@ async function handleEvent(event) {
       const shop = shopOf(o.id);
       const setup = shop?.setup?.status === 'pending' ? ` plus the one-time $${money(shop.setup.amount ?? cfg().setupLabel)} setup fee` : '';
       const amt = s.amount != null ? `$${money(s.amount)} (${s.plan})${setup}` : `your ${s.plan || ''} plan${setup}`;
-      await notify(`BuzzCall: your free trial ends ${fmtDate(s.trial_end)}. Your card will be charged ${amt} then, and the plan renews automatically unless you cancel before then: ${PORTAL}`);
+      await notify(`BuzzCall: your free trial ends ${fmtDate(s.trial_end)}. Your card will be charged ${amt} then, and the plan renews automatically unless you cancel before then: ${portalLink()}`);
       break;
     }
   }
-  store.save(); return true;
+  await persistPayment();
+  const completed = { id: event.id, type: event.type, at: new Date(now()).toISOString() };
+  b.events.unshift(completed); b.events = b.events.slice(0, 300);
+  try { await persistPayment(); }
+  catch (e) {
+    // Do not let an unpersisted completion suppress the provider's next delivery.
+    b.events = b.events.filter((entry) => entry !== completed);
+    try { store.save(); } catch {} // best effort; preserve the original persistence error
+    throw e;
+  }
+  return true;
 }
 
 // ---------- operations (live Stripe, or mock) ----------
-async function createCheckout({ plan, email, BASE, setupWaived }) {
-  const c = cfg(); PORTAL = `${BASE}/billing/portal`;
+async function createCheckout(options) {
+  const id = shopContext.shopId();
+  if (!shopContext.current()) return createCheckoutSession(options);
+  if (checkoutLocks.has(id)) throw err('Checkout is already being created; please retry', 409);
+  checkoutLocks.add(id);
+  try {
+    ensureHealthy();
+    ensureNoSubscription();
+    const pending = Object.values(B().pendingCheckouts).find((s) => s.shopId === id && s.status === 'open'
+      && Date.parse(s.expiresAt) > now() && Date.parse(s.createdAt) + CHECKOUT_TTL > now());
+    if (pending) {
+      if (!checkoutMatches(pending, options)) throw checkoutConflict();
+      await persistPayment(); // also retry any earlier failed persistence before returning a URL
+      if (!pending.url) throw err('Checkout is pending; please retry later', 409);
+      return { id: pending.id, url: pending.url, setup: pending.setup, ...(pending.mock ? { mock: true } : {}) };
+    }
+    const attempt = B().checkoutAttempt;
+    if (attempt) {
+      if (attempt.shopId !== id || !checkoutMatches(attempt, options)) throw checkoutConflict();
+      // Never rotate an uncertain key after Stripe may have forgotten it. Reconcile instead of risking a second subscription.
+      if (Date.parse(attempt.createdAt) + CHECKOUT_TTL <= now())
+        throw err('Checkout creation is unresolved; contact support to confirm it finished or expired before retrying', 409);
+    }
+    return await createCheckoutSession(options);
+  } finally { checkoutLocks.delete(id); }
+}
+async function createCheckoutSession({ plan, email, BASE, setupWaived }) {
+  const c = cfg();
   if (!c.live) return mockCreateCheckout({ plan, email, BASE, setupWaived });
-  const price = c.prices[plan];
-  if (!price) throw err(`Stripe price not configured (set STRIPE_PRICE_ID_BASE_${plan.toUpperCase()})`, 501);
-  const preview = decideSetup({ plan, override: setupWaived });
-  const line_items = [{ price, quantity: 1 }];
-  // No trial: the first paid invoice is at signup, so the setup price goes on it as a Checkout line item.
-  if (!c.trialDays && preview.status === 'pending') line_items.push({ price: c.prices.setup, quantity: 1 });
-  const setupNote = preview.status === 'pending' && c.trialDays
-    ? `One-time setup fee (estimate $${money(c.setupLabel)}) is added to your first invoice after the ${c.trialDays}-day free trial, not today. Cancel during the trial and you pay nothing.` : null;
-  const session = await stripe().checkout.sessions.create({
-    mode: 'subscription', line_items, payment_method_collection: 'always',
-    ...(email ? { customer_email: email } : {}),
-    // No billing_cycle_anchor: the cycle starts when the trial ends, so no partial first month.
-    subscription_data: { metadata: { plan }, ...(c.trialDays ? { trial_period_days: c.trialDays, trial_settings: { end_behavior: { missing_payment_method: 'cancel' } } } : {}) },
-    metadata: { plan, setup_waived: setupWaived ? '1' : '0' }, allow_promotion_codes: true,
-    ...(setupNote ? { custom_text: { submit: { message: setupNote } } } : {}),
-    success_url: `${BASE}/billing/return?status=success`, cancel_url: `${BASE}/billing/return?status=cancel`,
-  });
-  return { url: session.url, id: session.id, setup: preview };
+  const b = B(), tenant = !!shopContext.current();
+  let attempt = tenant ? b.checkoutAttempt : null;
+  if (!attempt) {
+    const price = c.prices[plan];
+    if (!price) throw err(`Stripe price not configured (set STRIPE_PRICE_ID_BASE_${plan.toUpperCase()})`, 501);
+    const preview = decideSetup({ plan, override: setupWaived });
+    const line_items = [{ price, quantity: 1 }];
+    // No trial: the first paid invoice is at signup, so the setup price goes on it as a Checkout line item.
+    if (!c.trialDays && preview.status === 'pending') line_items.push({ price: c.prices.setup, quantity: 1 });
+    const setupNote = preview.status === 'pending' && c.trialDays
+      ? `One-time setup fee (estimate $${money(c.setupLabel)}) is added to your first invoice after the ${c.trialDays}-day free trial, not today. Cancel during the trial and you pay nothing.` : null;
+    const customer = tenant ? b.subscription?.customer : null;
+    const createdAt = now();
+    const params = {
+      mode: 'subscription', line_items, payment_method_collection: 'always',
+      ...(customer ? { customer } : email ? { customer_email: email } : {}),
+      ...(tenant ? { expires_at: secs(createdAt + CHECKOUT_TTL) } : {}),
+      // No billing_cycle_anchor: the cycle starts when the trial ends, so no partial first month.
+      subscription_data: { metadata: { plan, ...tenantMetadata() }, ...(c.trialDays ? { trial_period_days: c.trialDays, trial_settings: { end_behavior: { missing_payment_method: 'cancel' } } } : {}) },
+      metadata: { plan, setup_waived: setupWaived ? '1' : '0', ...tenantMetadata() }, allow_promotion_codes: true,
+      ...(setupNote ? { custom_text: { submit: { message: setupNote } } } : {}),
+      success_url: `${BASE}${billingPath()}/return?status=success`, cancel_url: `${BASE}${billingPath()}/return?status=cancel`,
+    };
+    attempt = { ...tenantMetadata(), plan, setupWaived: !!setupWaived, createdAt: new Date(createdAt).toISOString(),
+      setup: preview, params, ...(tenant ? { idempotencyKey: `checkout-${shopContext.shopId()}-${crypto.randomBytes(16).toString('hex')}` } : {}) };
+    if (tenant) b.checkoutAttempt = attempt;
+  }
+  // Fail closed before calling Stripe, including retries after an unsuccessful local write.
+  if (tenant) await persistPayment();
+  const session = await stripe().checkout.sessions.create(attempt.params,
+    ...(tenant ? [{ idempotencyKey: attempt.idempotencyKey }] : []));
+  b.pendingCheckouts[session.id] = {
+    id: session.id, ...tenantMetadata(), url: session.url, status: 'open', setup: attempt.setup,
+    plan: attempt.plan, setupWaived: attempt.setupWaived,
+    customer: (typeof session.customer === 'string' ? session.customer : session.customer?.id) || attempt.params.customer || null,
+    subscription: (typeof session.subscription === 'string' ? session.subscription : session.subscription?.id) || null,
+    createdAt: attempt.createdAt,
+    expiresAt: new Date(Math.min(session.expires_at ? session.expires_at * 1000 : Infinity, Date.parse(attempt.createdAt) + CHECKOUT_TTL)).toISOString(),
+  };
+  if (tenant) delete b.checkoutAttempt;
+  await persistPayment();
+  return { url: session.url, id: session.id, setup: attempt.setup };
 }
 const pick = (subId) => { const b = B(); const s = subId ? b.subs[subId] : b.subscription; if (!s || !s.id) throw err('no subscription on file', 404); return s; };
 const prorationFor = (from, to) => (to === 'annual' && from !== 'annual' ? cfg().upgradeProration : cfg().downgradeProration);
@@ -263,10 +365,10 @@ async function setCancel(atPeriodEnd, subId) {
   return applySubscription(await stripe().subscriptions.update(s.id, { cancel_at_period_end: atPeriodEnd }), atPeriodEnd ? 'cancel' : 'resume');
 }
 async function portalUrl(BASE) {
-  if (!cfg().live) return `${BASE}/billing/mock/portal`;
+  if (!cfg().live) return `${BASE}${billingPath()}/mock/portal`;
   const customer = B().subscription?.customer;
   if (!customer) throw err('no Stripe customer on file yet (complete checkout first)', 404);
-  const ps = await stripe().billingPortal.sessions.create({ customer, return_url: cfg().portalReturn || `${BASE}/admin#payments` });
+  const ps = await stripe().billingPortal.sessions.create({ customer, return_url: shopContext.current() ? `${BASE}/vendor#payments` : cfg().portalReturn || `${BASE}/admin#payments` });
   return ps.url;
 }
 
@@ -277,10 +379,13 @@ const mockPrice = (plan) => ({ id: `price_mock_${plan}`, unit_amount: Math.round
 async function fire(type, object) { const ev = { id: mid('evt'), type, data: { object: JSON.parse(JSON.stringify(object)) } }; await handleEvent(ev); return ev; }
 const msub = (subId) => { const m = B().mock; const s = m.subs[subId || B().subscription?.id]; if (!s) throw err('no mock subscription', 404); return s; };
 
-function mockCreateCheckout({ plan, email, BASE, setupWaived }) {
-  const m = B().mock; PORTAL = `${BASE}/billing/portal`;
-  const sid = mid('cs'); m.sessions[sid] = { plan, email: email || null, setupWaived: !!setupWaived, createdAt: new Date(now()).toISOString() };
-  store.save(); return { url: `${BASE}/billing/mock/checkout/${sid}`, id: sid, mock: true, setup: decideSetup({ plan, override: setupWaived }) };
+async function mockCreateCheckout({ plan, email, BASE, setupWaived }) {
+  const m = B().mock, createdAt = now();
+  const sid = mid('cs'); m.sessions[sid] = { plan, email: email || null, setupWaived: !!setupWaived, createdAt: new Date(createdAt).toISOString(), ...tenantMetadata() };
+  const result = { url: `${BASE}${billingPath()}/mock/checkout/${sid}`, id: sid, mock: true, setup: decideSetup({ plan, override: setupWaived }) };
+  B().pendingCheckouts[sid] = { ...result, ...tenantMetadata(), plan, setupWaived: !!setupWaived, status: 'open', customer: null, subscription: null,
+    createdAt: new Date(createdAt).toISOString(), expiresAt: new Date(createdAt + CHECKOUT_TTL).toISOString() };
+  await persistPayment(); return result;
 }
 function mockSessionInfo(sid) { const s = B().mock.sessions[sid]; return s ? { ...s, setup: decideSetup({ plan: s.plan, override: s.setupWaived }) } : null; }
 // Mock invoice: lines = base price (and any pending invoice items); customer credit balance is used first.
@@ -295,16 +400,20 @@ function mockInvoice(sub, lines, reason) {
     lines: { data: lines.map((l) => ({ description: l.description, amount: Math.round(l.amount * 100), invoice_item: l.invoice_item || null })) } };
 }
 async function mockCompleteCheckout(sid, BASE) {
-  const mk = B().mock; PORTAL = `${BASE}/billing/portal`;
+  const mk = B().mock;
   const sess = mk.sessions[sid]; if (!sess) throw err('mock session not found', 404);
   if (sess.completed) return B().subs[sess.subscription];
+  if (shopContext.current()) {
+    ensureHealthy(); ensureNoSubscription();
+    if (Date.parse(sess.createdAt) + CHECKOUT_TTL <= now()) throw err('Checkout expired', 409);
+  }
   const c = cfg(), t = now(), trialEnd = c.trialDays ? t + c.trialDays * DAY : null;
-  const sub = { id: mid('sub'), object: 'subscription', customer: mid('cus'), status: trialEnd ? 'trialing' : 'active', cancel_at_period_end: false,
+  const sub = { id: mid('sub'), object: 'subscription', customer: (shopContext.current() && B().subscription?.customer) || mid('cus'), status: trialEnd ? 'trialing' : 'active', cancel_at_period_end: false,
     current_period_start: secs(t), current_period_end: secs(trialEnd || addInterval(t, sess.plan)), trial_end: trialEnd ? secs(trialEnd) : null,
-    items: { data: [{ id: mid('si'), price: mockPrice(sess.plan) }] }, metadata: { plan: sess.plan }, pendingItems: [], balance: 0, failNext: false };
+    items: { data: [{ id: mid('si'), price: mockPrice(sess.plan) }] }, metadata: { plan: sess.plan, ...tenantMetadata() }, pendingItems: [], balance: 0, failNext: false };
   mk.subs[sub.id] = sub; sess.completed = true; sess.subscription = sub.id;
   await fire('customer.subscription.created', sub);
-  await fire('checkout.session.completed', { mode: 'subscription', customer: sub.customer, subscription: sub.id, metadata: { plan: sess.plan, setup_waived: sess.setupWaived ? '1' : '0' } });
+  await fire('checkout.session.completed', { id: sid, mode: 'subscription', customer: sub.customer, subscription: sub.id, metadata: { plan: sess.plan, setup_waived: sess.setupWaived ? '1' : '0', ...tenantMetadata() } });
   if (trialEnd) await fire('invoice.paid', mockInvoice(sub, [{ description: `Free trial (${c.trialDays} days)`, amount: 0 }], 'subscription_create'));
   else {
     const shop = shopOf(sub.id), lines = [{ description: `BuzzCall ${sess.plan}`, amount: c.mock[sess.plan] }];
@@ -325,7 +434,6 @@ async function mockRenew(sub, reason) {
 }
 // Move the mock clock forward; fire what Stripe would have fired on the way, for every mock subscription.
 async function mockAdvance(days, BASE) {
-  PORTAL = `${BASE}/billing/portal`;
   const mk = B().mock; const target = now() + days * DAY;
   for (let guard = 0; guard < 500; guard++) {
     const ms = [];
@@ -346,7 +454,6 @@ async function mockAdvance(days, BASE) {
   store.save(); return B().subscription;
 }
 async function mockUpdateCard(BASE, subId) {
-  PORTAL = `${BASE}/billing/portal`;
   const sub = msub(subId); sub.failNext = false;
   if (sub.openInvoice && sub.status === 'past_due') { const inv = sub.openInvoice; sub.openInvoice = null; sub.status = 'active';
     await fire('invoice.paid', inv); await fire('customer.subscription.updated', sub); }

@@ -1,7 +1,8 @@
-// Optional booking + deposit. Slots computed in server-local time (set BUSINESS_TZ, applied as TZ at startup).
+// Optional booking + deposit. Slots use the active shop's explicit BUSINESS_TZ.
 const crypto = require('crypto');
 const store = require('./store');
 const env = require('./config').env; // override > env (see config.js)
+const shopTime = require('./shopTime');
 const trades = require('./trades');
 const connect = require('./connect');
 const on = (v) => /^(1|true|yes|on)$/i.test(String(v || ''));
@@ -78,24 +79,30 @@ function nextSlots(count = 3, opts = {}) {
   const c = cfg(), out = [];
   const dur = opts.minutes || c.slotMin, step = opts.minutes ? c.stepMin : c.slotMin;
   const t = new Date(Date.now() + c.leadMin * 60000);
-  const d = new Date(opts.from && opts.from > t ? opts.from : t); d.setHours(0, 0, 0, 0);
-  for (let day = 0; day < 21 && out.length < count; day++, d.setDate(d.getDate() + 1)) {
-    if (!c.days.includes(d.getDay())) continue;
+  const zone = shopTime.timeZone();
+  let d = shopTime.parts(opts.from && opts.from > t ? opts.from : t, zone);
+  for (let day = 0; day < 21 && out.length < count; day++, d = shopTime.addDays(d, 1)) {
+    if (!c.days.includes(shopTime.weekday(d))) continue;
     for (let m = c.open; m + dur <= c.close && out.length < count; m += step) {
-      const s = new Date(d); s.setMinutes(m);
+      const s = shopTime.toInstant(d, m, zone);
+      if (!s) continue; // spring-forward gap: do not silently offer a different wall time/day.
       const e = new Date(s.getTime() + dur * 60000);
+      const end = shopTime.parts(e, zone);
+      const sameDate = end.year === d.year && end.month === d.month && end.day === d.day;
+      const midnightClose = c.close === 1440 && end.hour === 0 && end.minute === 0
+        && shopTime.sameDay(e, shopTime.toInstant(shopTime.addDays(d, 1), 0, zone), zone);
+      if ((!sameDate || end.hour * 60 + end.minute > c.close) && !midnightClose) continue;
       if (s < t || isTaken(s.toISOString(), e.toISOString())) continue;
-      out.push({ start: s.toISOString(), end: e.toISOString(), minutes: dur, label: label(s, dur) });
+      out.push({ start: s.toISOString(), end: e.toISOString(), minutes: dur, label: label(s, dur, zone) });
     }
   }
   return out;
 }
-const tm = (x) => x.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-const dayLabel = (s) => s.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
-function label(s, dur) {
+function label(s, dur, zone = shopTime.timeZone()) {
   const e = new Date(s.getTime() + (dur || cfg().slotMin) * 60000);
-  if (cfg().appointments) return `${dayLabel(s)}, ${tm(s)} (done ~${tm(e)})`;
-  return `${dayLabel(s)} ${tm(s)}-${tm(e)}`;
+  const day = shopTime.dayLabel(s, zone), start = shopTime.timeLabel(s, zone), end = shopTime.timeLabel(e, zone);
+  if (cfg().appointments) return `${day}, ${start} (done ~${end})`;
+  return `${day} ${start}-${end}`;
 }
 
 // Returns booking or null if slot was taken in the meantime (double-booking guard).
@@ -118,7 +125,9 @@ function connectParams(b, acct) {
   const c = cfg();
   const feeCents = connect.applicationFeeCents(Math.round(b.amount * 100), c.leadFee, c.leadFeeWaived);
   b.connectAccount = acct; b.applicationFeeCents = feeCents;
-  return { payment_intent_data: { ...(feeCents > 0 ? { application_fee_amount: feeCents } : {}), metadata: { bookingId: b.id } } };
+  const shopId = require('./shopContext').shopId();
+  return { payment_intent_data: { ...(feeCents > 0 ? { application_fee_amount: feeCents } : {}),
+    metadata: { bookingId: b.id, ...(shopId ? { shopId } : {}) } } };
 }
 
 // Fail closed: no ready connected account (live/test Stripe) => no deposit. The held booking becomes a plain booking
@@ -163,7 +172,7 @@ async function depositLink(b, BASE) {
       mode: 'payment',
       line_items: [{ quantity: 1, price_data: { currency: 'usd', unit_amount: Math.round(b.amount * 100),
         product_data: { name: b.service ? `Deposit: ${b.service} with ${env.BUSINESS_NAME || `your ${trade().pro || 'pro'}`}, ${b.slotLabel}` : `Deposit: ${env.BUSINESS_NAME || 'service'} visit ${b.slotLabel}` } } }],
-      metadata: { bookingId: b.id }, client_reference_id: b.id,
+      metadata: { bookingId: b.id, ...(require('./shopContext').current() ? { shopId: require('./shopContext').shopId() } : {}) }, client_reference_id: b.id,
       expires_at: Math.floor(Date.now() / 1000) + Math.max(cfg().holdMin, 30) * 60, // Stripe min 30 min
       success_url: `${BASE}/payment/return?status=success`, cancel_url: `${BASE}/payment/return?status=cancel`,
       ...connectParams(b, acct),
@@ -174,7 +183,13 @@ async function depositLink(b, BASE) {
     const mockAcct = connect.chargeAccount(); // mock: tag with the simulated connected account, if onboarded
     if (mockAcct) connectParams(b, mockAcct);
   }
-  store.save(); return b.payUrl;
+  store.save();
+  if (require('./shopContext').current()) {
+    await store.flush();
+    const s = store.status();
+    if (s.degraded || s.fallback || s.lastError) throw Object.assign(new Error('Payment storage unavailable; please retry later'), { status: 503 });
+  }
+  return b.payUrl;
 }
 
 // Marks paid+confirmed. Returns {booking, changed}. Refuses if hold expired and slot taken by someone else.

@@ -116,6 +116,11 @@
       status(checkoutStatus, 'Opening secure checkout…');
       try {
         const { response, data } = await post('/api/checkout', { plan: button.dataset.checkout });
+        if (response.status === 401) {
+          status(checkoutStatus, 'Sign in to your approved vendor account to choose a subscription.');
+          window.location.assign('/vendor/login');
+          return;
+        }
         const url = response.ok && checkoutUrl(data.url);
         if (!url) throw new Error('Checkout unavailable');
         window.location.assign(url);

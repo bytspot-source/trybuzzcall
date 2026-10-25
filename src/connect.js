@@ -11,11 +11,12 @@
 // Mock mode (no STRIPE_SECRET_KEY): no Stripe calls; onboarding is simulated (/admin/connect/mock).
 const crypto = require('crypto');
 const store = require('./store');
+const shopContext = require('./shopContext');
 
 const key = () => process.env.STRIPE_SECRET_KEY || '';
 // 'mock' (no key) | 'test' (sk_test_/rk_test_) | 'live' (sk_live_/rk_live_ or anything else)
 const mode = () => (!key() ? 'mock' : /^(sk|rk)_test_/.test(key()) ? 'test' : 'live');
-const envId = () => (process.env.STRIPE_CONNECT_ACCOUNT_ID || '').trim() || null;
+const envId = () => shopContext.current() ? null : (process.env.STRIPE_CONNECT_ACCOUNT_ID || '').trim() || null;
 
 let factory = null; // tests inject a fake client; never hits the network then
 let client = null, clientKey = null;
@@ -77,7 +78,24 @@ function chargeAccount() {
 const depositsReady = () => mode() === 'mock' || !!chargeAccount();
 
 // Admin onboarding: create the account if none, then a single-use Account Link. Returns { url, accountId, created }.
+const onboarding = new Map();
+async function persistAccount() {
+  // Retry the write too: file-backend failures can leave the account in memory only.
+  save(stored());
+  await store.flush();
+  const s = store.status();
+  if (s.degraded || s.fallback || s.lastError) throw Object.assign(new Error('Payment storage unavailable; please retry later'), { status: 503 });
+}
 async function onboard(BASE, prefill = {}) {
+  if (!shopContext.current()) return onboardAccount(BASE, prefill);
+  const id = shopContext.shopId();
+  if (onboarding.has(id)) return onboarding.get(id);
+  const pending = onboardAccount(BASE, prefill);
+  onboarding.set(id, pending);
+  try { return await pending; } finally { onboarding.delete(id); }
+}
+async function onboardAccount(BASE, prefill = {}) {
+  const prefix = shopContext.current() ? '/vendor/connect' : '/admin/connect';
   if (mode() === 'mock') {
     let s = stored();
     if (!s || s.mode !== 'mock' || s.deauthorized) {
@@ -85,7 +103,8 @@ async function onboard(BASE, prefill = {}) {
         detailsSubmitted: false, payoutsEnabled: false, requirementsDue: ['mock onboarding'] };
       save(s);
     }
-    return { url: `${BASE}/admin/connect/mock`, accountId: s.accountId, created: true };
+    if (shopContext.current()) await persistAccount();
+    return { url: `${BASE}${prefix}/mock`, accountId: s.accountId, created: true };
   }
   let id = accountId(), created = false;
   if (!id) {
@@ -93,19 +112,21 @@ async function onboard(BASE, prefill = {}) {
       // Default controller properties, spelled out (= Standard): owner pays Stripe fees, Stripe owns losses and
       // requirement collection, full Stripe Dashboard. No `type`.
       controller: { fees: { payer: 'account' }, losses: { payments: 'stripe' }, requirement_collection: 'stripe', stripe_dashboard: { type: 'full' } },
-      metadata: { platform: 'buzzcall' },
+      metadata: { platform: 'buzzcall', ...(shopContext.current() ? { shopId: shopContext.shopId() } : {}) },
     };
     const bp = {};
     if (prefill.name) bp.name = String(prefill.name).slice(0, 100);
     if (prefill.url && /^https:\/\//.test(prefill.url)) bp.url = prefill.url;
     if (Object.keys(bp).length) params.business_profile = bp;
     if (prefill.email) params.email = prefill.email;
-    const a = await stripe().accounts.create(params);
+    const a = await stripe().accounts.create(params, ...(shopContext.current()
+      ? [{ idempotencyKey: `connect-${shopContext.shopId()}-${mode()}` }] : []));
     id = a.id; created = true;
     save(fromAccount(a, 'onboarding'));
   }
+  if (shopContext.current()) await persistAccount();
   const link = await stripe().accountLinks.create({ account: id, type: 'account_onboarding',
-    refresh_url: `${BASE}/admin/connect/refresh`, return_url: `${BASE}/admin/connect/return` });
+    refresh_url: `${BASE}${prefix}/refresh`, return_url: `${BASE}${prefix}/return` });
   return { url: link.url, accountId: id, created };
 }
 function mockComplete() {

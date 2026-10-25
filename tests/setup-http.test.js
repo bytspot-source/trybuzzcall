@@ -175,7 +175,7 @@ test('setup form over HTTP', { timeout: 60000 }, async (t) => {
   });
 
   await t.test('admin sees Shop setups with issues; Apply writes the override and the line uses it', async () => {
-    const adminPage = await (await s.get('/admin', s.auth(s.pass))).text();
+    const adminPage = await (await s.get('/admin/legacy', s.auth(s.pass))).text();
     assert.match(adminPage, /Shop setups \(\d+\)/);
     assert.match(adminPage, /Apply to this line/);
     assert.match(adminPage, /Current effective config/);
@@ -204,7 +204,7 @@ test('setup form over HTTP', { timeout: 60000 }, async (t) => {
     assert.equal(health.vertical, 'braiders');
     assert.equal(health.booking, true);
     assert.equal(health.deposit, true);
-    const after = await (await s.get('/admin', s.auth(s.pass))).text();
+    const after = await (await s.get('/admin/legacy', s.auth(s.pass))).text();
     assert.match(after, /<td>BUSINESS_NAME<\/td><td>Crown Braids<\/td><td>override<\/td>/);
     assert.match(after, /<td>BOOKING_ENABLED<\/td><td>1<\/td><td>override<\/td>/);
   });
@@ -220,7 +220,7 @@ test('setup form over HTTP', { timeout: 60000 }, async (t) => {
     assert.equal(fs.existsSync(path.join(s.dir, 'config.json')), false);
     const health = await (await s.get('/health')).json();
     assert.equal(health.vertical, 'home_services');
-    const page = await (await s.get('/admin', s.auth(s.pass))).text();
+    const page = await (await s.get('/admin/legacy', s.auth(s.pass))).text();
     assert.match(page, /<td>BUSINESS_NAME<\/td><td>Env Plumbing<\/td><td>env<\/td>/);
   });
 
@@ -230,7 +230,7 @@ test('setup form over HTTP', { timeout: 60000 }, async (t) => {
     const r = await s.json('/setup', pet);
     assert.equal(r.status, 200);
     const { id } = await r.json();
-    const admin = await (await s.get('/admin', s.auth(s.pass))).text();
+    const admin = await (await s.get('/admin/legacy', s.auth(s.pass))).text();
     assert.match(admin, /Sudsy Paws · Atlanta, GA · Pet groomer \(clients pick a service and time\)/);
     const ap = await s.json(`/admin/setups/${id}/apply`, { confirm_phones: 1 }, s.auth(s.pass));
     assert.equal(ap.status, 200);
@@ -244,7 +244,7 @@ test('setup form over HTTP', { timeout: 60000 }, async (t) => {
     assert.equal(health.trade, 'pet_grooming');
     assert.equal(health.flow, 'appointments');
     assert.equal(health.vertical, 'appointments');
-    const after = await (await s.get('/admin', s.auth(s.pass))).text();
+    const after = await (await s.get('/admin/legacy', s.auth(s.pass))).text();
     assert.match(after, /Running as: <b>Pet groomer<\/b> \(pet_grooming, appointments flow\)/);
     assert.match(after, /<td>BUSINESS_TYPE<\/td><td>pet_grooming<\/td><td>override<\/td>/);
 

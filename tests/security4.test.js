@@ -115,7 +115,7 @@ test('R1 e2e: ambiguous longer "stop" message pauses automated texts and alerts 
   assert.equal(sentTo(p).length, before, 'still nothing while paused');
   assert.equal(store.db.alerts.slice(0, store.db.alerts.length - alerts).filter((a) => /possible opt-out/.test(a.body)).length, 1, 'owner alerted once per pause');
   const lead = store.findOpenLead(p); assert.ok(lead.messages.some((m) => m.body === 'hello?'), 'messages kept for the owner');
-  const admin = await (await req('/admin', { headers: auth })).text();
+  const admin = await (await req('/admin/legacy', { headers: auth })).text();
   assert.match(admin, /automated texts paused \(possible opt-out\): [^<]*\+1770555/);
   await text(p, 'START');
   assert.equal(store.isPaused(p), false);
@@ -145,7 +145,7 @@ test('R2: admin /health shows storage state and fail-closed policy; public /heal
   store.status = () => ({ ...orig(), backend: 'postgres', degraded: true, failingSince: new Date().toISOString(), lastError: 'connect ECONNREFUSED' });
   t.after(() => { store.status = orig; });
   assert.equal((await (await req('/health')).json()).storageState, 'degraded');
-  assert.match(await (await req('/admin', { headers: auth })).text(), /DEGRADED/);
+  assert.match(await (await req('/admin/legacy', { headers: auth })).text(), /DEGRADED/);
 });
 
 // ---------- R3 ----------
