@@ -232,7 +232,7 @@ test('live/test onboarding: creates a default-controller (Standard-equivalent) a
   const r3 = await req('/admin/connect/return', { headers: auth });
   assert.equal(r3.status, 303); assert.equal(r3.headers.get('location'), '/admin#connect');
   assert.equal(connect.status(), 'charges_enabled');
-  const html = await (await req('/admin', { headers: auth })).text();
+  const html = await (await req('/admin/legacy', { headers: auth })).text();
   assert.match(html, /Deposit payouts \(Stripe Connect\)/);
   assert.match(html, /Charges enabled/);
   // mock onboarding page is off when Stripe is configured
@@ -242,7 +242,7 @@ test('live/test onboarding: creates a default-controller (Standard-equivalent) a
 test('admin shows Not connected + Connect Stripe button; mock onboarding enables charges without Stripe', async (t) => {
   reset(t);
   connect.setStripe(() => { throw new Error('no Stripe calls in mock mode'); });
-  let html = await (await req('/admin', { headers: auth })).text();
+  let html = await (await req('/admin/legacy', { headers: auth })).text();
   assert.match(html, /Status: <b>Not connected<\/b>/);
   assert.match(html, /action="\/admin\/connect\/onboard"/);
   const r = await req('/admin/connect/onboard', { method: 'POST', headers: { ...auth, origin: BASE } });
@@ -252,7 +252,7 @@ test('admin shows Not connected + Connect Stripe button; mock onboarding enables
   assert.equal((await req('/admin/connect/mock', { headers: auth })).status, 200);
   const done = await post('/admin/connect/mock/complete');
   assert.equal((await done.json()).status, 'charges_enabled');
-  html = await (await req('/admin', { headers: auth })).text();
+  html = await (await req('/admin/legacy', { headers: auth })).text();
   assert.match(html, /Charges enabled/);
   const h = await (await req('/health')).json();
   assert.equal(h.connectStatus, 'charges_enabled'); assert.equal(h.connect, false); // mock never counts as live connect
@@ -285,14 +285,25 @@ test('text flow, connected + charges enabled: deposit link is a direct-charge Ch
   assert.match(lead.messages.at(-1).body, /checkout\.stripe\.com/);
 });
 
-test('text flow, mock mode: /pay/mock unchanged and marks the deposit paid', async (t) => {
+test('text flow, mock mode: deposit GET is read-only; same-origin POST marks paid and redirects', async (t) => {
   reset(t);
   quiet(t);
   const b = await textToBooking('+14703330003');
+  const paymentPath = `/pay/mock/${b.id}`;
   assert.equal(b.status, 'held');
-  assert.equal(b.payUrl, `https://shop.example/pay/mock/${b.id}`);
-  assert.equal((await req(`/pay/mock/${b.id}`)).status, 200);
+  assert.equal(b.payUrl, `https://shop.example${paymentPath}`);
+  const before = JSON.stringify(store.db);
+  assert.equal((await req(paymentPath)).status, 200);
+  assert.equal(JSON.stringify(store.db), before, 'Opening the link must not mark paid or send confirmations');
+  for (const headers of [{}, { origin: 'https://evil.example' }]) {
+    assert.equal((await req(paymentPath, { method: 'POST', headers })).status, 403);
+    assert.equal(JSON.stringify(store.db), before, 'Rejected POST must not change state');
+  }
+  const response = await post(paymentPath);
+  assert.equal(response.status, 303);
+  assert.equal(response.headers.get('location'), paymentPath);
   assert.equal(store.findBooking(b.id).paid, true);
+  assert.equal(store.findBooking(b.id).status, 'confirmed');
 });
 
 // ---------- Connect webhook ----------

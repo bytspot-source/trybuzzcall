@@ -13,9 +13,11 @@ const fs = require('fs');
 const path = require('path');
 const store = require('./store');
 const { maskPhone, isProduction, PLACEHOLDER_PHONE, limiter, num, on } = require('./security');
-const LOG = path.join(store.dataDir(), 'sms.log'); // validated DATA_DIR (see store.js checkDir)
-const { TWILIO_ACCOUNT_SID: sid, TWILIO_AUTH_TOKEN: tok, TWILIO_PHONE_NUMBER: from } = process.env;
-let client = sid && tok && from ? require('twilio')(sid, tok) : null;
+const shopContext = require('./shopContext');
+const env = require('./config').env;
+const { TWILIO_ACCOUNT_SID: sid, TWILIO_AUTH_TOKEN: tok } = process.env;
+let client = sid && tok ? require('twilio')(sid, tok) : null;
+let injectedClient = false;
 const OPTED_OUT_CODES = new Set([21610]); // Twilio: "Attempt to send to unsubscribed recipient"
 
 const CAPS = {
@@ -35,7 +37,7 @@ let onCap = async () => {};
 const setCapAlert = (fn) => { onCap = fn || (async () => {}); };
 let warnedPlaceholder = false;
 
-function writeLog(to, body, kind, result) {
+function writeLog(logPath, to, body, kind, result) {
   const ts = new Date().toISOString();
   const meta = `[${ts}] SMS -> ${maskPhone(to)} (${kind}, ${String(body || '').length} chars): ${result}`;
   console.log(meta);
@@ -43,7 +45,7 @@ function writeLog(to, body, kind, result) {
   const full = !prod || on(process.env.LOG_FULL_PHONES);
   const bodies = !prod || on(process.env.SMS_LOG_BODIES);
   const line = bodies ? `[${ts}] SMS -> ${to}: ${body}` : `[${ts}] SMS -> ${to} (${kind}, ${String(body || '').length} chars): ${result}`;
-  try { fs.appendFileSync(LOG, (full ? line : maskPhone(line)) + '\n', { mode: 0o600 }); } catch (e) { console.error('sms.log write failed:', e.message); }
+  try { fs.appendFileSync(logPath, (full ? line : maskPhone(line)) + '\n', { mode: 0o600 }); } catch (e) { console.error('sms.log write failed:', e.message); }
 }
 
 // opts.kind: 'caller' (default; counts toward the hourly/daily caps) | 'owner' (alerts to the shop owner)
@@ -51,13 +53,20 @@ function writeLog(to, body, kind, result) {
 async function sendSms(to, body, opts = {}) {
   const kind = opts.kind || 'caller';
   try {
+    // Capture operation-local resources before awaiting the shared provider client.
+    const context = shopContext.current();
+    const actualStore = context ? context.store : store.root;
+    const from = env.TWILIO_PHONE_NUMBER;
+    const logPath = path.join(actualStore.dataDir(), 'sms.log');
+    if (context?.shop.status === 'suspended') return { ok: false, skipped: 'vendor_suspended' };
+    if (context && (!from || !/^\+[1-9]\d{7,14}$/.test(from))) return { ok: false, skipped: 'no_sender' };
     if (!to) return { ok: false, skipped: 'no_recipient' };
     if (to === PLACEHOLDER_PHONE && isProduction()) {
       if (!warnedPlaceholder) { console.error(`[security] OWNER_PHONE is not set (placeholder ${PLACEHOLDER_PHONE}): owner alerts are NOT being sent. Set OWNER_PHONE.`); warnedPlaceholder = true; }
       return { ok: false, skipped: 'placeholder_owner' };
     }
-    if (!opts.force && store.isOptedOut(to)) { console.log(`[sms] skipped ${maskPhone(to)}: opted out`); return { ok: false, skipped: 'opted_out' }; }
-    if (kind === 'caller' && !opts.force && store.isPaused && store.isPaused(to)) { console.log(`[sms] skipped ${maskPhone(to)}: automated texts paused (possible opt-out)`); return { ok: false, skipped: 'paused' }; }
+    if (!opts.force && actualStore.isOptedOut(to)) { console.log(`[sms] skipped ${maskPhone(to)}: opted out`); return { ok: false, skipped: 'opted_out' }; }
+    if (kind === 'caller' && !opts.force && actualStore.isPaused && actualStore.isPaused(to)) { console.log(`[sms] skipped ${maskPhone(to)}: automated texts paused (possible opt-out)`); return { ok: false, skipped: 'paused' }; }
     if (kind === 'caller') {
       const name = capCheck();
       if (name) {
@@ -70,15 +79,15 @@ async function sendSms(to, body, opts = {}) {
         return { ok: false, skipped: name === 'day' ? 'cap_day' : 'cap' };
       }
     }
-    if (!client) { writeLog(to, body, kind, 'log-only'); return { ok: true, logOnly: true }; }
+    if (!client || (!from && !injectedClient)) { writeLog(logPath, to, body, kind, 'log-only'); return { ok: true, logOnly: true }; }
     try {
       const m = await client.messages.create({ to, from, body });
-      writeLog(to, body, kind, `sent ${m && m.sid ? m.sid : ''}`.trim());
+      writeLog(logPath, to, body, kind, `sent ${m && m.sid ? m.sid : ''}`.trim());
       return { ok: true, sid: m && m.sid };
     } catch (e) {
       const code = Number(e && e.code) || null;
-      writeLog(to, body, kind, `FAILED ${code || ''} ${e && e.message ? e.message : e}`.trim());
-      if (OPTED_OUT_CODES.has(code)) store.optOut(to, `twilio_${code}`);
+      writeLog(logPath, to, body, kind, `FAILED ${code || ''} ${e && e.message ? e.message : e}`.trim());
+      if (OPTED_OUT_CODES.has(code)) await actualStore.optOut(to, `twilio_${code}`);
       return { ok: false, code, error: e && e.message };
     }
   } catch (e) { // never throw to callers
@@ -87,6 +96,6 @@ async function sendSms(to, body, opts = {}) {
   }
 }
 // Tests inject a fake Twilio client (never hits the network).
-const setClient = (c) => { client = c; };
+const setClient = (c) => { client = c; injectedClient = !!c; };
 const resetCap = () => { for (const c of Object.values(CAPS)) { c.lim = null; c.key = null; c.alerted = 0; } };
 module.exports = { sendSms, live: !!client, setClient, setCapAlert, resetCap, OPTED_OUT_CODES };

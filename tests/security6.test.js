@@ -164,13 +164,13 @@ test('T1: sms.log lives in the validated DATA_DIR and is 0600', async (t) => {
   assert.equal(store.dataDir(), dir);
   assert.equal(mode(path.join(dir, 'sms.log')), 0o600);
 });
-test('T1: admin /health and /admin show path warnings', async (t) => {
+test('T1: admin /health and /admin/legacy show path warnings', async (t) => {
   const orig = store.status; t.after(() => { store.status = orig; });
   store.status = () => ({ ...orig(), pathWarnings: ['SPILL_DIR is inside public/ (files there are served on the web); using DATA_DIR'] });
   const a = await (await req('/health', { headers: auth })).json();
   assert.match(a.storageDetail.pathWarnings[0], /SPILL_DIR is inside public/);
   assert.equal((await (await req('/health')).json()).pathWarnings, undefined);
-  assert.match(await (await req('/admin', { headers: auth })).text(), /path warning<\/b>: SPILL_DIR is inside public\//);
+  assert.match(await (await req('/admin/legacy', { headers: auth })).text(), /path warning<\/b>: SPILL_DIR is inside public\//);
 });
 
 // ---------- T2 ----------

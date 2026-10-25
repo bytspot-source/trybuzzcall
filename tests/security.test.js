@@ -256,7 +256,7 @@ test('mock pay/checkout pages: on locally, off in production unless DEMO_MODE=1'
   process.env.DEMO_MODE = '1';
   assert.equal((await req(new URL(co.url).pathname)).status, 200);
   assert.equal((await req('/pay/mock/' + b.id)).status, 200);
-  assert.equal(store.findBooking(b.id).paid, true);
+  assert.equal(store.findBooking(b.id).paid, false, 'Opening a demo payment page never completes a payment');
   delete process.env.DEMO_MODE;
 });
 test('SMS logs: stdout has no bodies and masked phones; sms.log keeps bodies locally, metadata only in production', async (t) => {
