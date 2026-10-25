@@ -189,7 +189,8 @@ async function fixture(t) {
     return { state: JSON.stringify(store.db), override: JSON.stringify(store.getOverride()), files };
   }
   async function checkout(plan = 'monthly') {
-    const result = json(await post('/api/checkout', { json: true, body: { plan, email: 'fixture@example.com' } }));
+    // Public checkout is retired; the legacy admin-only checkout tool creates the fixture subscription.
+    const result = json(await post('/api/checkout', { json: true, admin: true, body: { plan, email: 'fixture@example.com' } }));
     assert.equal(result.mock, true);
     assert.match(result.id, /^cs_mock_[a-f0-9]+$/);
     // PUBLIC_BASE_URL is deliberately inert; only its local path is requested.
@@ -344,7 +345,8 @@ test('dashboard and payment safety over isolated local HTTP', { timeout: 60000 }
         assert.equal((await f.post(route, { admin: true })).status, 404);
       }
       if (!env.STRIPE_SECRET_KEY) {
-        assert.equal((await f.post('/api/checkout', { json: true })).status, 503);
+        assert.equal((await f.post('/api/checkout', { json: true, admin: true })).status, 503);
+        assert.equal((await f.post('/api/checkout', { json: true })).status, 410);
         const body = html(await f.request('/admin/legacy', { admin: true }));
         assert.match(body, /Payments are not configured/);
         assert.doesNotMatch(body, /Demo payments|action="\/admin\/connect\/onboard"/);

@@ -197,6 +197,21 @@ async function assignPhone(id, phone) {
   if (shop.phoneNumber && shop.phoneNumber !== phone) (shop.retiredPhones ||= []).push(shop.phoneNumber);
   shop.phoneNumber = phone; await persist(); return publicShop(shop);
 }
+// Per-vendor outbound text limits (platform admin only). null/'' = platform default; 0 = this vendor's limit off.
+async function setSmsCaps(id, { hour, day } = {}) {
+  healthy(); const shop = get(id);
+  if (!shop) throw error('Vendor not found', 404);
+  const parse = (v, max) => {
+    if (v === undefined || v === null || String(v).trim() === '') return undefined;
+    const n = Number(String(v).trim());
+    if (!Number.isInteger(n) || n < 0 || n > max) throw error(`Texting limits must be whole numbers from 0 to ${max}.`);
+    return n;
+  };
+  const caps = { hour: parse(hour, 10000), day: parse(day, 100000) };
+  for (const k of Object.keys(caps)) if (caps[k] === undefined) delete caps[k];
+  if (Object.keys(caps).length) shop.smsCaps = caps; else delete shop.smsCaps;
+  await persist(); return { ...publicShop(shop), smsCaps: shop.smsCaps || {} };
+}
 // Inbound call routing is assigned by platform admin, not by a caller-provided shop ID.
 async function twilioShop(body, callback = false) {
   if (!all().length) return { legacy: true };
@@ -281,5 +296,5 @@ async function close({ strict = false } = {}) {
   if (tenantPool) { await tenantPool.end(); tenantPool = null; }
   if (strict && failed) throw error('Vendor storage could not be flushed.',503);
 }
-module.exports = { root, all, get, create, invite, activate, login, authenticate, logout, setCookie, setStatus, assignPhone,
+module.exports = { root, all, get, create, invite, activate, login, authenticate, logout, setCookie, setStatus, assignPhone, setSmsCaps,
   run, scopedStore, publicShop, persist, flush, healthy, twilioShop, stripeShop, bookingShop, close, error, SESSION_MS };

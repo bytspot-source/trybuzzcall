@@ -5,6 +5,10 @@
   const all = (selector, root = doc) => Array.from(root.querySelectorAll(selector));
   const pages = all('[data-page]');
   const links = all('[data-nav]');
+  // Mobile menu: mark when it is scrolled to the end (removes the fade hint) and keep the active item in view.
+  const navBar = doc.querySelector('.workspace-nav');
+  const navEdge = () => { if (navBar) navBar.classList.toggle('is-scrolled-end', navBar.scrollLeft + navBar.clientWidth >= navBar.scrollWidth - 4); };
+  if (navBar) { navBar.addEventListener('scroll', navEdge, { passive: true }); navEdge(); }
   function showPage(moveFocus) {
     if (!pages.length) return;
     let id;
@@ -22,6 +26,7 @@
       const active = link.dataset.nav === selected.dataset.page;
       link.classList.toggle('is-active', active);
       if (active) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current');
+      if (active && navBar && navBar.scrollWidth > navBar.clientWidth) { navBar.scrollLeft = Math.max(0, link.offsetLeft - 16); navEdge(); }
     });
     const crumb = doc.querySelector('[data-page-name]');
     if (crumb) crumb.textContent = selected.dataset.label;

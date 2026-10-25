@@ -234,25 +234,38 @@ test('waitlist: per-IP rate limit (429) and bounded list', async () => {
   assert.ok(r.headers.get('retry-after'));
   app.locals.resetFormLimits();
 });
-test('setup waiver code: exact match waives, near-misses do not', async () => {
+// Public self-serve checkout is retired (signup goes through /setup); the admin-only legacy tool keeps the waiver code.
+const adminCheckout = (body) => json('/api/checkout', body, { ...auth, origin: BASE });
+test('public /api/checkout is retired: 410 pointing to /setup, nothing created', async () => {
   app.locals.resetFormLimits();
-  const r1 = await (await json('/api/checkout', { plan: 'monthly', setup_waiver_code: 'FOUNDER-2026' })).json();
+  const sessions = Object.keys(store.db.billing?.mock?.sessions || {}).length;
+  for (const body of [{ plan: 'monthly' }, { plan: 'annual' }, { plan: 'monthly', setup_waiver_code: 'FOUNDER-2026' }]) {
+    const r = await json('/api/checkout', body);
+    assert.equal(r.status, 410);
+    assert.equal((await r.json()).next, '/setup');
+  }
+  assert.equal((await json('/api/checkout', { plan: 'monthly' }, { ...auth, origin: 'https://evil.example' })).status, 410, 'cross-site admin request gets no checkout');
+  assert.equal(Object.keys(store.db.billing?.mock?.sessions || {}).length, sessions);
+});
+test('setup waiver code (admin legacy checkout): exact match waives, near-misses do not', async () => {
+  app.locals.resetFormLimits();
+  const r1 = await (await adminCheckout({ plan: 'monthly', setup_waiver_code: 'FOUNDER-2026' })).json();
   assert.equal(r1.setup.status, 'waived');
-  const r2 = await (await json('/api/checkout', { plan: 'monthly', setup_waiver_code: 'FOUNDER-202' })).json();
+  const r2 = await (await adminCheckout({ plan: 'monthly', setup_waiver_code: 'FOUNDER-202' })).json();
   assert.equal(r2.setup.status, 'pending');
-  const r3 = await (await json('/api/checkout', { plan: 'monthly' })).json();
+  const r3 = await (await adminCheckout({ plan: 'monthly' })).json();
   assert.equal(r3.setup.status, 'pending');
 });
 test('mock pay/checkout pages: on locally, off in production unless DEMO_MODE=1', async (t) => {
   quiet(t);
   app.locals.resetFormLimits();
   const b = fakeBooking();
-  const co = await (await json('/api/checkout', { plan: 'monthly' })).json();
+  const co = await (await adminCheckout({ plan: 'monthly' })).json();
   withEnv(t, { NODE_ENV: 'production' });
   assert.equal((await req('/pay/mock/' + b.id)).status, 404);
   assert.equal(store.findBooking(b.id).paid, false);
   assert.equal((await req(new URL(co.url).pathname)).status, 404);
-  assert.equal((await json('/api/checkout', { plan: 'monthly' })).status, 503);
+  assert.equal((await adminCheckout({ plan: 'monthly' })).status, 503);
   process.env.DEMO_MODE = '1';
   assert.equal((await req(new URL(co.url).pathname)).status, 200);
   assert.equal((await req('/pay/mock/' + b.id)).status, 200);

@@ -74,6 +74,7 @@ hr { margin-block: 1.5rem; border: 0; border-top: 1px solid var(--border); }
 pre { max-width: 100%; padding: 1rem; overflow: auto; background: var(--surface-muted); border-radius: var(--radius-small); }
 .numeric { font-variant-numeric: tabular-nums; text-align: right; }
 .nowrap { white-space: nowrap; }
+.nav-scroll-hint { display: none; }
 .visually-hidden {
   position: absolute;
   width: 1px;
@@ -395,8 +396,12 @@ input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), select, t
   font-weight: 400;
   line-height: 1.5;
 }
-/* Preserve search icon clearance after the generic input rule. */
-.search-field input[type="search"] { padding-left: 2.6rem; }
+/* Preserve search icon clearance after the generic input rule (which has higher specificity). */
+.search-field input[type="search"], .table-toolbar .search-field input[type="search"]:not([type="hidden"]) { padding-left: 2.6rem; }
+.search-field > .ui-icon { z-index: 1; }
+.data-table th { white-space: nowrap; }
+.nowrap { white-space: nowrap; }
+.data-table tr.is-opted-out td { background: #fbf3f1; }
 select { padding-right: 2rem; }
 textarea { min-height: 120px; resize: vertical; }
 input::placeholder, textarea::placeholder { color: #687773; opacity: 1; }
@@ -540,6 +545,26 @@ input[type="checkbox"], input[type="radio"] { width: 20px; height: 20px; flex: 0
   .payment-footer { gap: .25rem 1rem; }
   .payment-footer > span { flex-basis: 100%; margin-left: 0; }
   .confirmation-dialog, #confirm-dialog { padding: 1.5rem; }
+  /* Scroll hint: the menu scrolls sideways; fade the trailing edge so hidden items are noticeable. */
+  .workspace-nav { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 2.5rem), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 2.5rem), transparent); padding-right: 2rem; scroll-snap-type: x proximity; }
+  .workspace-nav.is-scrolled-end { -webkit-mask-image: none; mask-image: none; }
+  .workspace-nav .nav-link { scroll-snap-align: start; }
+  .nav-scroll-hint { display: block; margin: -.25rem 0 .25rem; color: #b9c7c2; font-size: .6875rem; }
+  .sidebar-bottom > .nav-link { display: none; }
+  .business-identity { display: none; }
+  /* Tables become labelled cards on phones: every column (status, time, amount) stays visible. */
+  .data-table--stack { min-width: 0; }
+  .data-table--stack thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .data-table--stack tbody tr { display: block; padding: .875rem 1rem; border-bottom: 1px solid #e9ede7; }
+  .data-table--stack tbody tr:last-child { border-bottom: 0; }
+  .data-table--stack td { display: grid; grid-template-columns: 5.75rem minmax(0, 1fr); gap: .75rem; align-items: start; max-width: none; padding: .375rem 0; border: 0; text-align: left; }
+  .data-table--stack td::before { content: attr(data-label); color: var(--muted); font-size: .6875rem; font-weight: 650; letter-spacing: .025em; text-transform: uppercase; padding-top: .15rem; }
+  .data-table--stack td > * { grid-column: 2; }
+  .data-table--stack td:first-child { grid-template-columns: minmax(0, 1fr); padding-bottom: .5rem; }
+  .data-table--stack td:first-child > * { grid-column: 1; }
+  .data-table--stack td:first-child::before { content: none; }
+  .data-table--stack td.numeric { text-align: left; }
+  .data-table--stack td.nowrap { white-space: normal; }
 }
 
 @media (max-width: 400px) {
