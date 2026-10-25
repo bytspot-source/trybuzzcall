@@ -157,9 +157,9 @@ test('N2: in production, file storage logs a loud warning and alerts the owner; 
   withEnv(t, { REQUIRE_POSTGRES: '1' });
   const f = await initStorage({ retries: 1 });
   assert.equal(f.fatal, true);
-  assert.ok(errs.some((e) => /FATAL: REQUIRE_POSTGRES=1/.test(e)));
+  assert.ok(errs.some((e) => /FATAL: .*fail-closed storage \(REQUIRE_POSTGRES=1\)/.test(e)));
 });
-test('N2: real boot with unreachable DATABASE_URL: stays up on file storage by default, exits with REQUIRE_POSTGRES=1', async (t) => {
+test('N2/R2: real boot with unreachable DATABASE_URL: production fails closed (no flag needed); development stays up on files', async (t) => {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), 'buzzcall-n2c-'));
   t.after(() => fs.rmSync(d, { recursive: true, force: true }));
   const dead = await freePort(); // nothing listens here
@@ -167,7 +167,7 @@ test('N2: real boot with unreachable DATABASE_URL: stays up on file storage by d
     const port = await freePort();
     const child = spawn(process.execPath, [path.resolve(__dirname, '../src/server.js')], { cwd: d, stdio: ['ignore', 'pipe', 'pipe'],
       env: { PATH: process.env.PATH, NODE_ENV: 'production', DEMO_MODE: '1', PORT: String(port), DATA_DIR: d, PUBLIC_BASE_URL: `http://127.0.0.1:${port}`,
-        ADMIN_PASSWORD: 'x'.repeat(24), OWNER_PHONE: OWNER, DATABASE_URL: `postgres://u:p@127.0.0.1:${dead}/x`, DOTENV_CONFIG_PATH: '/nonexistent', ...extra } });
+        ADMIN_PASSWORD: 'x'.repeat(24), OWNER_PHONE: OWNER, DATABASE_URL: `postgres://u:p@127.0.0.1:${dead}/x`, DOTENV_CONFIG_PATH: '/nonexistent', REQUIRE_POSTGRES_RETRIES: '2', ...extra } });
     let out = ''; child.stdout.on('data', (c) => { out += c; }); child.stderr.on('data', (c) => { out += c; });
     t.after(() => child.kill('SIGKILL'));
     const exit = new Promise((r) => child.on('exit', (code) => r(code)));
@@ -176,14 +176,17 @@ test('N2: real boot with unreachable DATABASE_URL: stays up on file storage by d
     return { res, out, port, child };
   };
   const a = await boot({});
-  assert.equal(a.res, 'up', a.out);
-  assert.match(a.out, /WARNING: DATABASE_URL is set but Postgres is unreachable/);
-  assert.equal((await (await fetch(`http://127.0.0.1:${a.port}/health`)).json()).storage, 'file');
-  a.child.kill('SIGKILL');
-  const b = await boot({ REQUIRE_POSTGRES: '1', REQUIRE_POSTGRES_RETRIES: '2' });
+  assert.equal(a.res, 1, a.out);
+  assert.match(a.out, /attempt 1\/2/);
+  assert.match(a.out, /FATAL: .*fail-closed storage \(production with DATABASE_URL\)/);
+  assert.doesNotMatch(a.out, /postgres:\/\/u:p@/, 'connection string never logged');
+  const b = await boot({ REQUIRE_POSTGRES: '1' });
   assert.equal(b.res, 1, b.out);
-  assert.match(b.out, /attempt 1\/2/);
-  assert.match(b.out, /FATAL: REQUIRE_POSTGRES=1/);
+  const c = await boot({ NODE_ENV: 'development', DEMO_MODE: '' });
+  assert.equal(c.res, 'up', c.out);
+  assert.match(c.out, /fail-closed off \(development\)/);
+  assert.equal((await (await fetch(`http://127.0.0.1:${c.port}/health`)).json()).storageState, 'fallback');
+  c.child.kill('SIGKILL');
 });
 test('N2: an inbound STOP is recorded before the webhook answers', async (t) => {
   quiet(t);

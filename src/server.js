@@ -219,11 +219,44 @@ function textBackAllowed(phone) {
   t[phone] = new Date(now).toISOString();
   return true;
 }
+// Callers skipped only because of their area code (other NANP country, territory, or a code missing from
+// src/areaCodes.js) are counted per UTC day; the owner gets one summary per day (reportAreaSkips, at boot and daily)
+// so a new overlay or real customers from a blocked code are noticed. Only area codes are stored, never numbers.
+function recordAreaSkip(npa) {
+  if (!/^\d{3}$/.test(npa)) return;
+  const day = new Date().toISOString().slice(0, 10);
+  const t = (store.db.areaSkips = store.db.areaSkips || {});
+  const d = (t[day] = t[day] || {});
+  d[npa] = (d[npa] || 0) + 1;
+  store.save();
+}
+async function reportAreaSkips(now = Date.now()) {
+  const t = store.db.areaSkips || {}, today = new Date(now).toISOString().slice(0, 10), sent = [];
+  for (const day of Object.keys(t).sort()) {
+    if (day >= today) continue;
+    const counts = Object.entries(t[day] || {}).sort((a, b) => b[1] - a[1]);
+    const total = counts.reduce((a, [, n]) => a + n, 0);
+    delete t[day];
+    if (!total) continue;
+    const list = counts.slice(0, 8).map(([c, n]) => `${c} x${n}`).join(', ');
+    await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: ${total} missed call(s) on ${day} got no text-back because the caller's area code isn't on the US/Canada list (${list}). If any were real customers (a new area code, or e.g. Puerto Rico 787/939), add the code to TEXT_EXTRA_AREA_CODES.`);
+    sent.push({ day, total });
+  }
+  if (sent.length) store.save();
+  return sent;
+}
+app.locals.reportAreaSkips = reportAreaSkips;
 // Only valid US/Canada numbers get a text-back: anonymous/restricted/blank caller IDs and international or premium
 // numbers are skipped (SMS pumping / toll fraud). Returns true when a text was sent.
 async function startTextBack(phone) {
-  if (!sec.isNanp(phone)) { console.log(`[textback] skipped caller id ${phone ? sec.maskPhone(String(phone).slice(0, 20)) : '(blank)'}: ${sec.nanpReason(phone)}`); return false; }
+  if (!sec.isNanp(phone)) {
+    const why = sec.nanpReason(phone);
+    console.log(`[textback] skipped caller id ${phone ? sec.maskPhone(String(phone).slice(0, 20)) : '(blank)'}: ${why}`);
+    if (/area code/.test(why) && why !== 'premium area code') recordAreaSkip(String(phone).slice(2, 5));
+    return false;
+  }
   if (store.isOptedOut(phone)) { console.log(`[textback] skipped ${sec.maskPhone(phone)}: opted out`); return false; }
+  if (store.isPaused(phone)) { console.log(`[textback] skipped ${sec.maskPhone(phone)}: automated texts paused (possible opt-out)`); return false; }
   if (!billing.access().active) { await inactiveText(phone); return false; }
   if (!textBackAllowed(phone)) { console.log(`[textback] throttled ${sec.maskPhone(phone)} (already texted recently)`); return false; }
   let lead = store.findOpenLead(phone);
@@ -274,7 +307,7 @@ app.post('/twilio/sms', verifyTwilio, async (req, res) => {
     return twiml(res, '');
   }
   if (kw === 'optin' && (store.isOptedOut(from) || optout.letters(body) !== 'YES')) {
-    store.optIn(from); return twiml(res, ''); // Twilio sends the re-subscribe confirmation
+    store.optIn(from); store.resumeBot(from); return twiml(res, ''); // Twilio sends the re-subscribe confirmation
   }
   if (kw === 'help') {
     const contact = env.OWNER_PHONE && env.OWNER_PHONE !== sec.PLACEHOLDER_PHONE ? ` or call ${env.OWNER_PHONE}` : '';
@@ -282,6 +315,19 @@ app.post('/twilio/sms', verifyTwilio, async (req, res) => {
     return twiml(res, '');
   }
   if (store.isOptedOut(from)) return twiml(res, ''); // opted out: no conversation until START
+  if (kw === 'maybe') { // longer message mentioning stop with no job context: don't guess; pause the bot, ask the owner
+    const lead = store.findOpenLead(from);
+    if (lead) { lead.messages.push({ dir: 'in', body }); }
+    const already = store.isPaused(from);
+    store.pauseBot(from, body);
+    if (!already) await owner(lead ? lead.id : null, `BUZZ ${env.BUSINESS_NAME || ''}: possible opt-out from ${from}: "${body.trim().slice(0, 80)}". Automated texts to this number are paused for ${sec.num(process.env.BOT_PAUSE_HOURS, 72)}h. Please contact them yourself; they can reply START to get texts again.`);
+    return twiml(res, '');
+  }
+  if (store.isPaused(from)) { // paused after a possible opt-out: keep the message for the owner, no automated reply
+    const lead = store.findOpenLead(from);
+    if (lead) { lead.messages.push({ dir: 'in', body }); store.save(); }
+    return twiml(res, '');
+  }
   if (!billing.access().active) { await inactiveText(from); return twiml(res, ''); }
   let lead = store.findOpenLead(from) || store.createLead(from);
   lead.messages.push({ dir: 'in', body });
@@ -561,6 +607,14 @@ function connectHtml(esc) {
 <p>${btn}${sync}</p>`;
 }
 
+function storageHtml(esc) {
+  const st = store.status(), pol = storagePolicy();
+  const state = st.degraded ? `<b style="color:#b00">DEGRADED</b>: database writes failing since ${esc(st.failingSince)} (${esc(st.lastError)})`
+    : st.fallback ? '<b style="color:#b00">FALLBACK</b>: DATABASE_URL set but running on temporary file storage'
+      : st.backend === 'postgres' ? 'OK (Postgres)' : `file storage${sec.isProduction() ? ' <b style="color:#b00">(not durable on Render)</b>' : ''}`;
+  const paused = Object.keys(store.db.botPaused || {}).filter((p) => store.isPaused(p));
+  return `<p id="storage">Storage: ${state} · fail-closed ${pol.failClosed ? 'ON' : 'off'} (${esc(pol.why)})${st.spillPending ? ` · ${st.spillPending} opt-out record(s) waiting in the spill file` : ''}${paused.length ? ` · automated texts paused (possible opt-out): ${paused.map(esc).join(', ')}` : ''}</p>`;
+}
 // Admin (HTTP Basic auth; any username unless ADMIN_USERNAME is set)
 app.get('/admin', requireAdmin, (req, res) => {
   const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -572,7 +626,7 @@ app.get('/admin', requireAdmin, (req, res) => {
     return `<li>${esc(w.email)}${label ? ` · Business type: ${esc(label)}` : ''}</li>`;
   }).join('');
   res.send(`<!doctype html><meta charset="utf-8"><title>Admin</title><style>body{font-family:sans-serif;margin:2rem}td,th{border:1px solid #ccc;padding:4px 8px}table{border-collapse:collapse}</style>
-${billingHtml(esc)}${connectHtml(esc)}<h1>Leads</h1><table><tr><th>When</th><th>Phone</th><th>Name</th><th>Need</th><th>Callback</th><th>Status</th></tr>${rows}</table>
+${storageHtml(esc)}${billingHtml(esc)}${connectHtml(esc)}<h1>Leads</h1><table><tr><th>When</th><th>Phone</th><th>Name</th><th>Need</th><th>Callback</th><th>Status</th></tr>${rows}</table>
 <h2>Lead fees</h2><p><b>Total: $${money(lf.total)}</b> from ${lf.count} paid lead(s) (fee $${money(fc.leadFee)}/paid lead${fc.leadFeeWaived ? ', WAIVED' : ''}; ${fc.connectAccount ? 'Stripe Connect ' + esc(fc.connectAccount) + ' (application fee, capped at 1/3 of the deposit)' : 'no Stripe connected'})<br>Due (to invoice): $${money(lf.due)} · Collected via Connect: $${money(lf.collected)} · Waived (pilot): $${money(lf.waived)} · Under review (slot lost): $${money(lf.review)}</p>
 <h2>Bookings</h2><ul>${(store.db.bookings || []).slice(0, 50).map((b) => `<li>${esc(b.slotLabel)}: ${esc(b.name)} (${esc(b.phone)}) - ${esc(b.status)}${b.paid ? ' PAID $' + esc(b.amount) : ''}${b.depositSkipped ? ' · deposit off: Stripe not connected' : ''}${b.lead_fee_status ? ` · lead fee $${money(b.lead_fee || 0)} ${esc(b.lead_fee_status)}` : ''}</li>`).join('')}</ul><h2>Owner alerts</h2><ul>${alerts}</ul><h2>Waitlist (${store.db.waitlist.length})</h2><ul>${waitlist}</ul>
 ${setupPages.adminSetupsHtml(store.db.setups, config.effective(), config.override(), booking.cfg())}`);
@@ -585,7 +639,16 @@ billing.init({ notify: (msg) => owner(null, msg), BASE });
 app.get('/health', (req, res) => {
   const c = booking.cfg();
   const h = { ok: true, vertical: c.vertical, trade: c.trade, flow: c.flow, billing: billing.summary().mode, serviceActive: billing.access().active, twilio: live, booking: c.booking, deposit: c.deposit, stripe: !!env.STRIPE_SECRET_KEY, connect: connect.mode() !== 'mock' && connect.depositsReady(), connectStatus: connect.status(), storage: store.backend() };
-  if (req.headers.authorization && isAdmin(req)) Object.assign(h, { openai: !!env.OPENAI_API_KEY, leadFee: c.leadFee, leadFeeWaived: c.leadFeeWaived, demoMode: sec.demoAllowed() });
+  // storageState: ok | degraded (Postgres writes failing right now) | fallback (DATABASE_URL set, running on files)
+  //   | file (no DATABASE_URL). Details (no secrets) for admins only.
+  const st = store.status();
+  h.storageState = st.degraded ? 'degraded' : st.fallback ? 'fallback' : st.backend === 'postgres' ? 'ok' : 'file';
+  if (req.headers.authorization && isAdmin(req)) {
+    const pol = storagePolicy();
+    Object.assign(h, { openai: !!env.OPENAI_API_KEY, leadFee: c.leadFee, leadFeeWaived: c.leadFeeWaived, demoMode: sec.demoAllowed(),
+      storageDetail: { backend: st.backend, databaseConfigured: st.configured, failClosed: pol.failClosed, failClosedReason: pol.why, fallback: st.fallback,
+        degraded: st.degraded, failingSince: st.failingSince, lastError: st.lastError, optOutSpillPending: st.spillPending } });
+  }
   res.json(h);
 });
 // Retention, at boot and daily. RETENTION_DAYS (default 365; 0 = keep forever) drops leads (with their message threads,
@@ -605,6 +668,7 @@ function pruneInactiveTexts(now = Date.now()) {
 }
 function runRetention() {
   const stamps = pruneInactiveTexts();
+  for (const p of Object.keys(store.db.botPaused || {})) store.isPaused(p); // drops expired bot pauses
   const days = sec.num(process.env.RETENTION_DAYS, 365);
   const r = days ? store.purgeOlderThan(days) : { leads: 0, alerts: 0 };
   if (r.leads || r.alerts) console.log(`[retention] purged ${r.leads} lead(s) and ${r.alerts} alert(s) older than ${days} days`);
@@ -645,37 +709,54 @@ function bootChecks() {
 app.locals.bootChecks = bootChecks;
 
 // Storage durability check after store.init(). In production, file storage means opt-outs (and leads/settings) live on
-// Render's ephemeral disk and vanish on the next restart/deploy, so we log a loud warning and alert the owner once.
-// REQUIRE_POSTGRES=1 makes it fatal instead (retrying a few times first, so a brief Postgres blip at boot doesn't
-// crash-loop): Render then keeps the previous deploy live / restarts the service, rather than running without
-// durable opt-outs. Returns { ok, fatal, message }.
-async function initStorage({ retries, retryDelayMs = 3000 } = {}) {
+// Render's ephemeral disk and vanish on the next restart/deploy.
+//  - Production with DATABASE_URL set: always fail closed (exit) if Postgres can't be reached, after
+//    REQUIRE_POSTGRES_RETRIES attempts (default 5, 3s apart) so a brief blip doesn't crash-loop. Render then keeps the
+//    previous deploy live / restarts the service. No env flag needed; to run on files deliberately, unset DATABASE_URL.
+//  - REQUIRE_POSTGRES=1 also makes "no DATABASE_URL" fatal (and applies outside production).
+//  - Production without DATABASE_URL (and no flag): loud warning + one owner alert, keeps serving.
+// Returns { ok, fatal, message }.
+function storagePolicy() {
+  const configured = store.status().configured;
   const requirePg = sec.on(process.env.REQUIRE_POSTGRES);
-  const tries = requirePg ? Math.max(1, retries ?? sec.num(process.env.REQUIRE_POSTGRES_RETRIES, 5)) : 1;
+  if (requirePg) return { failClosed: true, why: 'REQUIRE_POSTGRES=1' };
+  if (configured && sec.isProduction()) return { failClosed: true, why: 'production with DATABASE_URL' };
+  return { failClosed: false, why: configured ? 'development' : 'no DATABASE_URL' };
+}
+async function initStorage({ retries, retryDelayMs = 3000 } = {}) {
+  const pol = storagePolicy();
+  const tries = pol.failClosed ? Math.max(1, retries ?? sec.num(process.env.REQUIRE_POSTGRES_RETRIES, 5)) : 1;
   for (let i = 1; ; i++) {
     await store.init();
-    if (store.backend() === 'postgres' || i >= tries || !env.DATABASE_URL) break;
-    console.error(`[store] postgres not reachable (attempt ${i}/${tries}); retrying in ${Math.round(retryDelayMs / 1000)}s (REQUIRE_POSTGRES=1)`);
+    if (store.backend() === 'postgres' || i >= tries || !store.status().configured) break;
+    console.error(`[store] postgres not reachable (attempt ${i}/${tries}); retrying in ${Math.round(retryDelayMs / 1000)}s (fail-closed: ${pol.why})`);
     await sec.sleep(retryDelayMs);
   }
-  return storageCheck();
+  const r = await storageCheck(pol);
+  console.log(`[store] storage ${store.backend()}; fail-closed ${pol.failClosed ? `ON (${pol.why})` : `off (${pol.why})`}`);
+  return r;
 }
-async function storageCheck() {
+async function storageCheck(pol = storagePolicy()) {
   const st = store.status();
   if (st.backend === 'postgres') return { ok: true };
-  const requirePg = sec.on(process.env.REQUIRE_POSTGRES);
   const why = st.configured ? `DATABASE_URL is set but Postgres is unreachable${st.lastError ? ` (${String(st.lastError).slice(0, 120)})` : ''}` : 'DATABASE_URL is not set';
-  if (requirePg) {
-    const message = `REQUIRE_POSTGRES=1 and ${why}: refusing to start on file storage.`;
+  if (pol.failClosed) {
+    const message = `${why}; fail-closed storage (${pol.why}): refusing to start on file storage.`;
     console.error(`[store] FATAL: ${message}`);
     return { ok: false, fatal: true, message };
   }
   if (!sec.isProduction()) return { ok: true, message: 'file storage (development)' };
   const message = `${why}: running on FILE storage. Opt-outs, leads and settings are NOT durable (lost on the next restart/deploy).`;
-  console.error(`[store] !!!!!!!!!! WARNING: ${message} Fix the database, then restart. Set REQUIRE_POSTGRES=1 to refuse to start instead.`);
+  console.error(`[store] !!!!!!!!!! WARNING: ${message} Set DATABASE_URL (the app then refuses to start without Postgres).`);
   await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: storage warning: ${why}. BuzzCall is running on temporary file storage, so opt-outs and leads may be lost on restart. Check the database and restart the service.`).catch(() => {});
   return { ok: false, fatal: false, message };
 }
+// Runtime Postgres write failures (after a good boot): one owner alert per outage (see store.js spill file).
+store.setDegradedAlert(({ reason, since }) => {
+  console.error(`[store] !!!!!!!!!! WARNING: postgres writes failing${since ? ` since ${since}` : ''} (${reason}); opt-outs are kept in memory and in the local spill file until it recovers.`);
+  return owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: storage problem: database writes are failing${since ? ` since ${since}` : ''}. Opt-outs are saved to a local backup file and will be merged when the database is back. Please check the database (Neon/Render).`);
+});
+app.locals.storagePolicy = storagePolicy;
 app.locals.initStorage = initStorage;
 
 module.exports = { app, onPaid, onBooked, bootChecks, runRetention, initStorage };
@@ -693,7 +774,9 @@ const port = env.PORT || 3000;
 initStorage().then((st) => {
 if (st.fatal) process.exit(1);
 config.applyTZ(); // the stored override may have just been loaded from Postgres
-runRetention(); setInterval(runRetention, 86400000).unref();
+const daily = () => { runRetention(); reportAreaSkips().catch((e) => console.error('area-code report failed:', e.message)); };
+daily(); setInterval(runRetention, 86400000).unref();
+setInterval(() => reportAreaSkips().catch(() => {}), 3600000).unref(); // reports each finished UTC day within the hour
 const server = app.listen(port, () => console.log(`missedcall-buzz on :${port} (vertical ${booking.cfg().vertical}, trade ${booking.cfg().trade}, twilio ${live ? 'LIVE' : 'LOG-ONLY'}, ai ${env.OPENAI_API_KEY ? 'openai' : 'templates'}, storage ${store.backend()})`));
 // Render sends SIGTERM on restart/redeploy: flush pending writes to Postgres before exiting.
 for (const sig of ['SIGTERM', 'SIGINT']) process.once(sig, () => { server.close(); store.close().finally(() => process.exit(0)); });

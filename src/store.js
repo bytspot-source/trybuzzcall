@@ -59,6 +59,39 @@ function createStore(opts = {}) {
   let backend = 'file';      // 'file' | 'postgres'
   let pool = null;
   let dbDirty = false, cfgDirty = false, timer = null, flushing = null, lastError = null;
+  // Runtime write failures (Postgres reachable at boot, then failing): opt-outs/opt-ins are also appended to a local
+  // spill file (DATA_DIR/optout-spill.jsonl) and merged at the next successful boot. The owner is alerted once per
+  // outage (on the first spill, or when writes keep failing for STORAGE_ALERT_MINUTES, default 5).
+  const SPILL = path.join(DIR, 'optout-spill.jsonl');
+  let failSince = null, degradedAlerted = false, onDegraded = null;
+  const alertMs = () => { const m = Number(process.env.STORAGE_ALERT_MINUTES); return (Number.isFinite(m) && m >= 0 ? m : 5) * 60000; };
+  const redact = (m) => (m == null ? m : String(m).replace(/postgres(?:ql)?:\/\/\S+/gi, 'postgres://[redacted]').slice(0, 200));
+  function degradedAlert(reason) {
+    if (degradedAlerted || !onDegraded) return;
+    degradedAlerted = true;
+    Promise.resolve().then(() => onDegraded({ reason, since: failSince ? new Date(failSince).toISOString() : null, error: redact(lastError) })).catch(() => {});
+  }
+  function spill(entry) {
+    try { fs.appendFileSync(SPILL, JSON.stringify(entry) + '\n'); console.error(`[store] postgres write failing: ${entry.op === 'out' ? 'opt-out' : 'opt-in'} also saved to ${path.basename(SPILL)}`); }
+    catch (e) { console.error('[store] spill write failed:', e.message); }
+    degradedAlert('spill');
+  }
+  const spillCount = () => { try { return fs.readFileSync(SPILL, 'utf8').split('\n').filter(Boolean).length; } catch { return 0; } };
+  // Apply spilled records (in order) to db. Returns the number applied.
+  function mergeSpill() {
+    let lines = [];
+    try { lines = fs.readFileSync(SPILL, 'utf8').split('\n').filter(Boolean); } catch { return 0; }
+    db.optOuts = db.optOuts || {};
+    let n = 0;
+    for (const l of lines) {
+      let e; try { e = JSON.parse(l); } catch { continue; }
+      if (!e || typeof e.phone !== 'string') continue;
+      if (e.op === 'out' && !db.optOuts[e.phone]) { db.optOuts[e.phone] = { at: e.at || new Date().toISOString(), source: String(e.source || 'spill').slice(0, 40) }; n++; }
+      if (e.op === 'in' && db.optOuts[e.phone] && Date.parse(e.at) >= Date.parse(db.optOuts[e.phone].at || 0)) { delete db.optOuts[e.phone]; n++; }
+    }
+    return n;
+  }
+  const clearSpill = () => { try { fs.rmSync(SPILL, { force: true }); } catch {} };
 
   const writeFiles = () => fs.writeFileSync(FILE, JSON.stringify(db, null, 2));
   const writeConfigFile = () => {
@@ -87,9 +120,16 @@ function createStore(opts = {}) {
     if (timer) { clearTimeout(timer); timer = null; }
     const run = async () => {
       while (dbDirty || cfgDirty) {
-        try { await pgWrite(); lastError = null; }
-        catch (e) {
-          lastError = e.message; console.error('[store] postgres write failed, will retry:', e.message);
+        try {
+          await pgWrite(); lastError = null;
+          if (!dbDirty && !cfgDirty && (failSince || fs.existsSync(SPILL))) {
+            if (failSince) console.log(`[store] postgres writes recovered after ${Math.round((Date.now() - failSince) / 1000)}s`);
+            failSince = null; degradedAlerted = false; clearSpill(); // everything (incl. spilled opt-outs) is now in Postgres
+          }
+        } catch (e) {
+          lastError = e.message; console.error('[store] postgres write failed, will retry:', redact(e.message));
+          failSince = failSince || Date.now();
+          if (Date.now() - failSince >= alertMs()) degradedAlert('writes_failing');
           timer = setTimeout(() => { timer = null; flush().catch(() => {}); }, RETRY_DELAY_MS); timer.unref?.();
           return;
         }
@@ -110,7 +150,8 @@ function createStore(opts = {}) {
 
   // Load state from Postgres (if configured). Always resolves; may be called again to retry after a failed attempt.
   async function init() {
-    if (!databaseUrl || backend === 'postgres') return { backend };
+    if (!databaseUrl) { if (mergeSpill()) writeFiles(); clearSpill(); return { backend }; } // file backend: db.json now has them
+    if (backend === 'postgres') return { backend };
     try {
       pool = poolFactory(databaseUrl);
       await pool.query(`CREATE TABLE IF NOT EXISTS ${TABLE} (key text PRIMARY KEY, value jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`);
@@ -125,12 +166,15 @@ function createStore(opts = {}) {
       // First run on this database: seed it from whatever the file backend had (migration), so nothing is lost.
       if (!byKey.db) dbDirty = true;
       if (!byKey.config && Object.keys(override).length) cfgDirty = true;
+      const merged = mergeSpill();
+      if (merged) { dbDirty = true; console.error(`[store] merged ${merged} opt-out record(s) from ${path.basename(SPILL)} (saved during a postgres outage)`); }
       await flush();
       console.log(`[store] postgres backend ready (${byKey.db ? 'loaded existing data' : 'seeded new database'})`);
     } catch (e) {
-      console.error('[store] !!! DATABASE_URL set but postgres unavailable; falling back to FILE storage in DATA_DIR (opt-outs, leads and settings are NOT durable on Render):', e.message);
+      console.error('[store] DATABASE_URL set but postgres unavailable (the server decides: fail closed in production, file storage otherwise):', redact(e.message));
       backend = 'file';
       lastError = e.message;
+      if (mergeSpill()) writeFiles(); // honour spilled opt-outs; the spill file is kept until Postgres has them
       try { await pool?.end(); } catch {}
       pool = null;
     }
@@ -142,7 +186,10 @@ function createStore(opts = {}) {
     db, WAITLIST_TYPES, init, flush, close, createStore,
     backend: () => backend,
     // fallback = DATABASE_URL is configured but we are running on the file backend (Postgres was unreachable at boot).
-    status: () => ({ backend, lastError, configured: !!databaseUrl, fallback: !!databaseUrl && backend !== 'postgres' }),
+    // degraded = Postgres backend but writes are currently failing (data since then lives in memory + the spill file).
+    status: () => ({ backend, lastError: redact(lastError), configured: !!databaseUrl, fallback: !!databaseUrl && backend !== 'postgres',
+      degraded: backend === 'postgres' && !!failSince, failingSince: failSince ? new Date(failSince).toISOString() : null, spillPending: spillCount() }),
+    setDegradedAlert(fn) { onDegraded = fn || null; },
     findOpenLead: (phone) => db.leads.find((l) => l.phone === phone && l.status !== 'done' && l.status !== 'opted_out'),
     findBooking: (id) => db.bookings.find((b) => b.id === id),
     createLead(phone) {
@@ -180,13 +227,34 @@ function createStore(opts = {}) {
       for (const l of db.leads) if (l.phone === phone && l.status !== 'done' && l.status !== 'opted_out') { l.status = 'opted_out'; changed = true; }
       if (!changed) return Promise.resolve();
       save();
-      return flush().catch(() => {});
+      const entry = { op: 'out', phone, at: db.optOuts[phone].at, source: db.optOuts[phone].source };
+      return flush().catch(() => {}).then(() => { if (backend === 'postgres' && failSince) spill(entry); });
     },
     optIn(phone) {
       if (!(db.optOuts && db.optOuts[phone])) return false;
-      delete db.optOuts[phone]; save(); flush().catch(() => {});
+      delete db.optOuts[phone]; save();
+      const entry = { op: 'in', phone, at: new Date().toISOString() };
+      flush().catch(() => {}).then(() => { if (backend === 'postgres' && failSince) spill(entry); });
       return true;
     },
+    // Bot pause: a possible (ambiguous) opt-out stops automated texts to that number for BOT_PAUSE_HOURS (default 72)
+    // so the owner can check by hand. START/UNSTOP or the expiry lifts it. Never purged early by retention.
+    pauseBot(phone, text) {
+      if (!phone) return;
+      db.botPaused = db.botPaused || {};
+      db.botPaused[phone] = { at: new Date().toISOString(), text: String(text || '').slice(0, 80) };
+      save();
+    },
+    isPaused(phone, now = Date.now()) {
+      const p = phone && db.botPaused && db.botPaused[phone];
+      if (!p) return false;
+      const hours = Number(process.env.BOT_PAUSE_HOURS);
+      const ms = (Number.isFinite(hours) && hours >= 0 ? hours : 72) * 3600000;
+      if (now - Date.parse(p.at) < ms) return true;
+      delete db.botPaused[phone]; save();
+      return false;
+    },
+    resumeBot(phone) { if (db.botPaused && db.botPaused[phone]) { delete db.botPaused[phone]; save(); return true; } return false; },
     // Retention: drop leads (with their message threads) and owner alerts older than `days`. Bookings (payment records)
     // and opt-outs are kept. Returns counts.
     purgeOlderThan(days, now = Date.now()) {

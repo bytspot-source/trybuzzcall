@@ -9,8 +9,16 @@
 //     requires honouring revocation "by any reasonable means"). The app sends exactly one confirmation. (If Twilio did
 //     block the number after all, our confirmation is refused with 21610, so the person never gets two.)
 // Text is NFKC-normalized first (fullwidth/compatibility letters fold to ASCII), and smart quotes become '.
-// Phrase rules are deliberately narrow so job descriptions don't count: "stop leak under sink", "Stop valve is broken",
-// "stop, I meant Saturday", "opt out of the 3pm slot" are ordinary replies.
+// Short messages (5 words or fewer) with a stop-word anywhere ("please stop", "pls stop", "I said stop", "STOP STOP",
+// "who is this? stop", "stop sending these") are opt-outs, UNLESS they also contain a clear job/scheduling word
+// ("stop leak under sink", "Stop valve is broken", "stop by at 3", "stop, I meant Saturday"). A message that is only
+// stop-words plus filler never hits that guard. Explicit phrases ("quit texting me", "wrong number", "lose my number",
+// "stop sending these") always count. Longer messages with a stop-word and no job word -> 'maybe': the app pauses
+// automated replies to that number and asks the owner to check, instead of guessing either way.
+// Trade-off: a 5-word real opt-out that also names a job word ("stop texting about the leak" is still caught by the
+// phrase rule, but e.g. "stop, leak fixed already" is not) goes to the bot; a job reply with no job word ("stop, it's
+// fine now") is treated as an opt-out. We prefer erring toward opt-out for short texts, because texting someone who
+// said stop is the costlier mistake, and keep the guard list to words that clearly describe the job or a time.
 const OPT_OUT = ['STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT', 'OPTOUT', 'REVOKE'];
 const OPT_IN = ['START', 'UNSTOP', 'YES'];
 const HELP = ['HELP', 'INFO'];
@@ -39,7 +47,27 @@ const PHRASES = [
   new RegExp(String.raw`^\W*stop(?:\s+(?:it|that|this|now|please|pls|plz))?${END}`, 'i'),
 ];
 
-// -> 'optout' (exact Twilio keyword) | 'revoke' (any other opt-out; app confirms once) | 'optin' | 'help' | null
+// Always an opt-out, anywhere in a message of any length.
+const STRONG = [
+  /\b(?:quit|stop)\s+(?:\w+\s+){0,2}?(?:texting|txting|messaging|contacting|calling|sending\s+(?:me\s+)?(?:these|this|texts?|messages?|msgs?|them))\b/i,
+  /\bwrong\s+(?:number|#|person)\b/i,
+  /\blose\s+(?:my|this)\s+(?:number|#)\b/i,
+  /\b(?:delete|erase)\s+(?:my|this)\s+(?:number|#)\b/i,
+];
+const STOP_WORDS = new Set(['stop', 'stopall', 'unsubscribe', 'optout']);
+// Words that make a short "stop ..." message a job description or scheduling reply, not an opt-out.
+const JOB_WORDS = new Set(`leak leaks leaking leaky valve valves drip drips dripping water drain drains clog clogged toilet toilets
+sink sinks faucet faucets pipe pipes tap taps cock heater hvac ac furnace thermostat breaker outlet wire wiring light lights
+gas smell noise running flooding flood roof gutter shower tub hose sump pump meter bleeding braids hair appointment appt
+tech technician plumber electrician by over meant saturday sunday monday tuesday wednesday
+thursday friday today tonight tomorrow morning afternoon evening noon oclock`.split(/\s+/));
+const words = (t) => normalize(t).toLowerCase().replace(/[’']/g, '').match(/[a-z]+/g) || [];
+const hasStopWord = (w) => w.some((x) => STOP_WORDS.has(x));
+const TIME_RE = /\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a|p)\b|\b\d{1,2}:\d{2}\b|\b(?:at|after|before|around|until)\s+\d/i;
+const hasJobWord = (w, raw) => w.some((x) => JOB_WORDS.has(x)) || TIME_RE.test(raw);
+
+// -> 'optout' (exact Twilio keyword) | 'revoke' (any other opt-out; app confirms once) | 'optin' | 'help'
+//    | 'maybe' (longer message mentioning stop, no job word: pause the bot, ask the owner) | null
 function classify(text) {
   const raw = String(text ?? '');
   const exact = exactKeyword(raw);
@@ -49,7 +77,10 @@ function classify(text) {
   if (OPT_IN.includes(k)) return 'optin';
   if (HELP.includes(k)) return 'help';
   const t = normalize(raw);
-  if (PHRASES.some((re) => re.test(t))) return 'revoke';
-  return null;
+  if (STRONG.some((re) => re.test(t)) || PHRASES.some((re) => re.test(t))) return 'revoke';
+  const w = words(raw);
+  if (!hasStopWord(w)) return null;
+  if (hasJobWord(w, normalize(raw))) return null;
+  return w.length <= 5 ? 'revoke' : 'maybe';
 }
-module.exports = { classify, letters, normalize, OPT_OUT, OPT_IN, HELP };
+module.exports = { classify, letters, normalize, words, OPT_OUT, OPT_IN, HELP };

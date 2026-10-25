@@ -57,6 +57,7 @@ async function sendSms(to, body, opts = {}) {
       return { ok: false, skipped: 'placeholder_owner' };
     }
     if (!opts.force && store.isOptedOut(to)) { console.log(`[sms] skipped ${maskPhone(to)}: opted out`); return { ok: false, skipped: 'opted_out' }; }
+    if (kind === 'caller' && !opts.force && store.isPaused && store.isPaused(to)) { console.log(`[sms] skipped ${maskPhone(to)}: automated texts paused (possible opt-out)`); return { ok: false, skipped: 'paused' }; }
     if (kind === 'caller') {
       const name = capCheck();
       if (name) {
