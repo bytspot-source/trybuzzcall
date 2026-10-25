@@ -259,29 +259,32 @@ test('mock pay/checkout pages: on locally, off in production unless DEMO_MODE=1'
   assert.equal(store.findBooking(b.id).paid, true);
   delete process.env.DEMO_MODE;
 });
-test('phone masking: stdout always masked; sms.log full locally, masked in production', async (t) => {
+test('SMS logs: stdout has no bodies and masked phones; sms.log keeps bodies locally, metadata only in production', async (t) => {
   assert.equal(sec.maskPhone('SMS -> +14705550123: call tel:+14045550100'), 'SMS -> +1******0123: call tel:+1******0100');
   const lines = []; const o = console.log; console.log = (x) => lines.push(String(x)); t.after(() => { console.log = o; });
   const { sendSms } = require('../src/sms');
-  await sendSms('+14705559876', 'hello');
+  await sendSms('+14705559876', 'hello secret body');
   assert.ok(lines.some((l) => l.includes('+1******9876')) && !lines.some((l) => l.includes('+14705559876')));
-  assert.match(smsLog(), /SMS -> \+14705559876: hello/);
+  assert.ok(!lines.some((l) => l.includes('secret body')), 'no SMS body on stdout');
+  assert.match(smsLog(), /SMS -> \+14705559876: hello secret body/);
   withEnv(t, { NODE_ENV: 'production' });
-  await sendSms('+14705554321', 'prod');
-  assert.match(smsLog(), /SMS -> \+1\*{6}4321: prod/);
-  assert.doesNotMatch(smsLog(), /\+14705554321/);
+  await sendSms('+14705554321', 'prod body text');
+  assert.match(smsLog(), /SMS -> \+1\*{6}4321 \(caller, 14 chars\)/);
+  assert.doesNotMatch(smsLog(), /\+14705554321|prod body text/);
 });
 test('lead ids are random (16 hex chars), not timestamps', () => {
   const a = store.createLead('+15550001111'), b = store.createLead('+15550002222');
   assert.match(a.id, /^[0-9a-f]{16}$/); assert.notEqual(a.id, b.id);
 });
-test('clientIp: True-Client-IP (Render/Cloudflare) in production, socket/trust-proxy IP otherwise', (t) => {
+test('clientIp: True-Client-IP only on Render (RENDER set) or when CLIENT_IP_HEADER names it', (t) => {
   const r = { headers: { 'true-client-ip': '203.0.113.7' }, ip: '10.0.0.1' };
-  assert.equal(sec.clientIp(r), '10.0.0.1');
-  withEnv(t, { NODE_ENV: 'production' });
+  withEnv(t, { NODE_ENV: 'production', RENDER: undefined, CLIENT_IP_HEADER: undefined });
+  assert.equal(sec.clientIp(r), '10.0.0.1', 'production off Render: header not trusted');
+  process.env.RENDER = 'true';
   assert.equal(sec.clientIp(r), '203.0.113.7');
   assert.equal(sec.clientIp({ headers: {}, ip: '10.0.0.2' }), '10.0.0.2');
   process.env.CLIENT_IP_HEADER = 'none';
   assert.equal(sec.clientIp(r), '10.0.0.1');
-  delete process.env.CLIENT_IP_HEADER;
+  delete process.env.RENDER; process.env.CLIENT_IP_HEADER = 'true-client-ip';
+  assert.equal(sec.clientIp(r), '203.0.113.7', 'explicit opt-in');
 });

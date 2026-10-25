@@ -4,7 +4,9 @@ config.applyTZ(); // slot math uses local time (BUSINESS_TZ)
 const express = require('express');
 const path = require('path');
 const store = require('./store');
-const { sendSms, live } = require('./sms');
+const sms = require('./sms');
+const { sendSms, live } = sms;
+const optout = require('./optout');
 const agent = require('./agent');
 const booking = require('./booking');
 const billing = require('./billing');
@@ -16,6 +18,14 @@ const sec = require('./security');
 
 const app = express();
 app.disable('x-powered-by');
+// Express 4 doesn't catch rejected async handlers (an unhandled rejection used to kill the process). Every route and
+// middleware registered below is wrapped so a rejection goes to next(err) and the error handler at the bottom.
+const wrap = (fn) => (typeof fn !== 'function' || fn.length === 4 ? fn
+  : function wrapped(req, res, next) { try { const r = fn.call(this, req, res, next); if (r && typeof r.catch === 'function') r.catch(next); } catch (e) { next(e); } });
+for (const m of ['get', 'post', 'put', 'patch', 'delete', 'use']) {
+  const orig = app[m].bind(app);
+  app[m] = (...args) => (m === 'get' && args.length === 1 && typeof args[0] === 'string' ? orig(...args) : orig(...args.map(wrap)));
+}
 // Behind Render's proxy: trust one hop so req.ip is the client (used by the rate limiters). TRUST_PROXY overrides
 // (a hop count, or 0/false to disable). Off by default outside production.
 { const tp = process.env.TRUST_PROXY; app.set('trust proxy', tp !== undefined && tp !== '' ? (/^\d+$/.test(tp) ? Number(tp) : sec.on(tp)) : (sec.isProduction() ? 1 : false)); }
@@ -99,7 +109,9 @@ const BASE = env.PUBLIC_BASE_URL || `http://localhost:${env.PORT || 3000}`;
 // Admin = HTTP Basic auth against ADMIN_PASSWORD (constant-time). Username: any, unless ADMIN_USERNAME is set.
 // Brute-force protection: ADMIN_MAX_FAILS (default 10) wrong passwords per client IP per ADMIN_LOCKOUT_MINUTES
 // (default 15) lock that IP out; a global cap (ADMIN_GLOBAL_MAX_FAILS, default 100 per window) stops distributed guessing.
-// While locked, even the right password gets 429 so there is no oracle.
+// While an IP is locked, even the right password gets 429 from it so there is no oracle. The global cap does NOT
+// hard-block (that would let anyone lock the owner out): past it every admin request is delayed
+// (ADMIN_GLOBAL_DELAY_MS, default 3000) and the owner is alerted once per window.
 const adminWindowMs = sec.num(process.env.ADMIN_LOCKOUT_MINUTES, 15) * 60000;
 const adminFails = sec.limiter({ windowMs: adminWindowMs, max: Math.max(1, sec.num(process.env.ADMIN_MAX_FAILS, 10)) });
 const adminGlobalFails = sec.limiter({ windowMs: adminWindowMs, max: Math.max(1, sec.num(process.env.ADMIN_GLOBAL_MAX_FAILS, 100)) });
@@ -110,7 +122,17 @@ function basicCreds(req) {
   const i = raw.indexOf(':');
   return i < 0 ? { user: raw, pass: '' } : { user: raw.slice(0, i), pass: raw.slice(i + 1) };
 }
-function adminLocked(req) { return adminFails.blocked(sec.clientIp(req)) || adminGlobalFails.blocked('all'); }
+function adminLocked(req) { return adminFails.blocked(sec.clientIp(req)); }
+let adminAlertedAt = 0;
+function adminUnderAttack() {
+  if (!adminGlobalFails.blocked('all')) return false;
+  if (Date.now() - adminAlertedAt > adminWindowMs) {
+    adminAlertedAt = Date.now();
+    console.error('[security] many failed admin logins from many clients: slowing down admin requests');
+    owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: many failed admin password attempts in the last ${Math.round(adminWindowMs / 60000)} min. Admin logins are slowed down. Use a long ADMIN_PASSWORD and consider setting ADMIN_USERNAME.`).catch(() => {});
+  }
+  return true;
+}
 function checkAdmin(req) {
   const c = basicCreds(req);
   if (!c) return false;
@@ -126,13 +148,14 @@ function isAdmin(req) {
   if (!ok) { adminFails.hit(sec.clientIp(req)); adminGlobalFails.hit('all'); }
   return (req._admin = ok);
 }
-function requireAdmin(req, res, next) {
+async function requireAdmin(req, res, next) {
+  if (adminUnderAttack()) await sec.sleep(sec.num(process.env.ADMIN_GLOBAL_DELAY_MS, 3000));
   const locked = adminLocked(req);
   if (locked) return res.set('Retry-After', String(locked)).status(429).send('too many failed logins, try again later');
   if (!isAdmin(req)) return res.set('WWW-Authenticate', 'Basic realm="admin"').status(401).send('auth required');
   next();
 }
-app.locals.resetAdminLockout = () => { adminFails.reset(); adminGlobalFails.reset(); };
+app.locals.resetAdminLockout = () => { adminFails.reset(); adminGlobalFails.reset(); adminAlertedAt = 0; };
 function billingHtml(esc) {
   const x = billing.summary(), s = x.subscription;
   const d = (v) => (v ? new Date(v).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }) : '-');
@@ -158,13 +181,14 @@ function verifyTwilio(req, res, next) {
   return ok ? next() : res.status(403).send('bad signature');
 }
 
+const missedSayNoText = () => (agent.isAppointments() && agent.solo() ? 'Sorry I missed you. Please try again later.' : 'Sorry we missed you. Please try again later.');
 const missedSay = () => (!agent.isAppointments() ? 'Sorry we missed you. We just texted you and will call back shortly.'
   : agent.solo() ? 'Sorry I missed you. I just sent you a text so we can get you booked.' : 'Sorry we missed you. We just sent you a text so we can get you booked.');
 
 // When the shop's subscription lapsed (past_due/canceled, see billing.access), callers get one polite generic text
 // (at most once per number per 24h; INACTIVE_MODE=silent sends nothing) and no booking/deposit flow.
 async function inactiveText(phone) {
-  if (!phone || billing.cfg().inactiveMode === 'silent') return;
+  if (!sec.isNanp(phone) || store.isOptedOut(phone) || billing.cfg().inactiveMode === 'silent') return;
   store.db.inactiveTexts = store.db.inactiveTexts || {};
   const last = store.db.inactiveTexts[phone];
   if (last && Date.now() - Date.parse(last) < 86400000) return;
@@ -189,15 +213,18 @@ function textBackAllowed(phone) {
   t[phone] = new Date(now).toISOString();
   return true;
 }
+// Only valid US/Canada numbers get a text-back: anonymous/restricted/blank caller IDs and international or premium
+// numbers are skipped (SMS pumping / toll fraud). Returns true when a text was sent.
 async function startTextBack(phone) {
-  if (!phone) return;
-  if (!billing.access().active) return inactiveText(phone);
-  if (!textBackAllowed(phone)) { console.log(`[textback] throttled ${sec.maskPhone(phone)} (already texted recently)`); return; }
+  if (!sec.isNanp(phone)) { console.log(`[textback] skipped caller id ${phone ? sec.maskPhone(String(phone).slice(0, 20)) : '(blank)'}: not a US/Canada number`); return false; }
+  if (store.isOptedOut(phone)) { console.log(`[textback] skipped ${sec.maskPhone(phone)}: opted out`); return false; }
+  if (!billing.access().active) { await inactiveText(phone); return false; }
+  if (!textBackAllowed(phone)) { console.log(`[textback] throttled ${sec.maskPhone(phone)} (already texted recently)`); return false; }
   let lead = store.findOpenLead(phone);
   if (!lead) lead = store.createLead(phone);
   const msg = agent.firstMessage();
   lead.messages.push({ dir: 'out', body: msg }); store.save();
-  await sendSms(phone, msg);
+  return (await sendSms(phone, msg)).ok;
 }
 
 // 1) Incoming call: forward to owner if configured, else treat as missed
@@ -205,24 +232,47 @@ app.post('/twilio/voice', verifyTwilio, async (req, res) => {
   if (env.FORWARD_TO_PHONE) {
     return twiml(res, `<Dial timeout="${env.RING_TIMEOUT_SECONDS || 20}" action="${BASE}/twilio/voice/status">${env.FORWARD_TO_PHONE}</Dial>`);
   }
-  await startTextBack(req.body.From);
-  twiml(res, `<Say>${missedSay()}</Say><Hangup/>`);
+  const texted = await startTextBack(req.body.From);
+  twiml(res, `<Say>${texted ? missedSay() : missedSayNoText()}</Say><Hangup/>`);
 });
 
 // 2) Dial result: no-answer/busy/failed => missed call
 app.post('/twilio/voice/status', verifyTwilio, async (req, res) => {
   const s = req.body.DialCallStatus;
   if (['no-answer', 'busy', 'failed', 'canceled'].includes(s)) {
-    await startTextBack(req.body.From);
-    return twiml(res, `<Say>${missedSay()}</Say><Hangup/>`);
+    const texted = await startTextBack(req.body.From);
+    return twiml(res, `<Say>${texted ? missedSay() : missedSayNoText()}</Say><Hangup/>`);
   }
   twiml(res, '<Hangup/>');
 });
 
 // 3) Caller SMS replies
 app.post('/twilio/sms', verifyTwilio, async (req, res) => {
-  const from = req.body.From, body = req.body.Body || '';
-  if (/^(stop|unsubscribe|cancel|end|quit)$/i.test(body.trim())) return twiml(res, ''); // Twilio handles opt-out
+  const from = req.body.From, body = String(req.body.Body || '');
+  if (!sec.isNanp(from)) return twiml(res, ''); // never text non-US/CA or anonymous senders
+  const kw = optout.classify(body);
+  const biz = env.BUSINESS_NAME || 'us';
+  if (kw === 'optout') { // Twilio's own opt-out handling sends the confirmation; we just stop texting this number
+    store.optOut(from, 'keyword'); await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: ${from} replied ${body.trim().slice(0, 20)} and is opted out of texts.`);
+    return twiml(res, '');
+  }
+  if (kw === 'revoke') { // plain-language opt-out Twilio doesn't recognise: one confirmation, then silence
+    if (!store.isOptedOut(from)) {
+      store.optOut(from, 'message');
+      await sendSms(from, `${biz}: You're unsubscribed and won't get more texts from us. Reply START to resubscribe.`, { force: true });
+      await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: ${from} asked not to be texted ("${body.trim().slice(0, 60)}") and is opted out.`);
+    }
+    return twiml(res, '');
+  }
+  if (kw === 'optin' && (store.isOptedOut(from) || !/^yes$/i.test(body.replace(/[^a-z]/gi, '')))) {
+    store.optIn(from); return twiml(res, ''); // Twilio sends the re-subscribe confirmation
+  }
+  if (kw === 'help') {
+    const contact = env.OWNER_PHONE && env.OWNER_PHONE !== sec.PLACEHOLDER_PHONE ? ` or call ${env.OWNER_PHONE}` : '';
+    await sendSms(from, env.HELP_MESSAGE || `${biz}: Missed-call text line for booking and callbacks. Reply STOP to opt out${contact}. Msg & data rates may apply.`, { force: true });
+    return twiml(res, '');
+  }
+  if (store.isOptedOut(from)) return twiml(res, ''); // opted out: no conversation until START
   if (!billing.access().active) { await inactiveText(from); return twiml(res, ''); }
   let lead = store.findOpenLead(from) || store.createLead(from);
   lead.messages.push({ dir: 'in', body });
@@ -235,7 +285,8 @@ app.post('/twilio/sms', verifyTwilio, async (req, res) => {
 });
 
 const tag = (lead) => `${lead.urgent ? '🚨 URGENT ' : ''}`;
-const owner = async (leadId, msg) => { store.addAlert({ leadId, to: env.OWNER_PHONE, body: msg }); await sendSms(env.OWNER_PHONE || '+10000000000', msg); };
+const owner = async (leadId, msg) => { store.addAlert({ leadId, to: env.OWNER_PHONE, body: msg }); await sendSms(env.OWNER_PHONE || sec.PLACEHOLDER_PHONE, msg, { kind: 'owner' }); };
+sms.setCapAlert((max) => owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: outbound text limit reached (${max}/hour). Text-backs are paused until the hour resets. If this wasn't a real rush, it may be SMS pumping: check Twilio logs. Raise OUTBOUND_MAX_PER_HOUR if needed.`));
 
 async function onBooked(lead, b) {
   let msg;
@@ -294,7 +345,7 @@ async function buzzOwner(lead) {
     ? `BUZZ ${env.BUSINESS_NAME || ''}: ${lead.name} (${lead.phone}) wants: ${lead.need}. Call back: ${lead.window}. tel:${lead.phone}`
     : `${lead.urgent ? '🚨 URGENT ' : ''}BUZZ ${env.BUSINESS_NAME || ''}: ${lead.name} (${lead.phone}) needs: ${lead.need}. Callback: ${lead.window}. Tap to call: tel:${lead.phone}`;
   store.addAlert({ leadId: lead.id, to: env.OWNER_PHONE, body: msg });
-  await sendSms(env.OWNER_PHONE || '+10000000000', msg);
+  await sendSms(env.OWNER_PHONE || sec.PLACEHOLDER_PHONE, msg, { kind: 'owner' });
 }
 
 // Public form throttles (per client IP).
@@ -404,18 +455,35 @@ app.post('/setup', setupLimit, (req, res) => {
   const message = "We'll review your setup and text you within 1 business day.";
   return json ? res.json({ ok: true, id: s.id, message }) : res.type('html').send(setupPages.thanksHtml(saved));
 });
-// Admin POSTs: refuse cross-site form posts (basic-auth credentials ride along automatically).
+// Admin POSTs: refuse cross-site form posts (basic-auth credentials ride along automatically). Browsers send Origin on
+// every POST; a missing or "null" Origin falls back to Referer, and with neither the request is refused.
+// Scripts calling admin POSTs must send an Origin header matching the host.
 function sameOrigin(req, res, next) {
+  const host = req.get('host');
+  const same = (u) => { try { return new URL(u).host === host; } catch { return false; } };
   const o = req.get('origin');
-  if (o && o !== 'null') { try { if (new URL(o).host !== req.get('host')) return res.status(403).send('cross-origin request refused'); } catch { return res.status(403).send('bad origin'); } }
-  next();
+  if (o && o !== 'null') return same(o) ? next() : res.status(403).send('cross-origin request refused');
+  const ref = req.get('referer');
+  if (ref && same(ref)) return next();
+  return res.status(403).send('cross-origin request refused (missing Origin)');
 }
 app.post('/admin/setups/:id/apply', requireAdmin, sameOrigin, (req, res) => {
   const s = store.findSetup(req.params.id);
   if (!s) return res.status(404).json({ error: 'setup not found' });
   const { values, errors } = setupRules.validate(s.values);
   if (errors.length) return res.status(422).json({ error: 'setup has errors; fix before applying', errors });
-  const applied = config.apply(setupRules.toEnv(values), { setupId: s.id });
+  // Changing where calls ring or where lead alerts go needs an explicit second confirmation (confirm_phones=1).
+  const next = setupRules.toEnv(values);
+  const changes = ['OWNER_PHONE', 'FORWARD_TO_PHONE'].filter((k) => (next[k] || '') !== (env[k] || '')).map((k) => ({ key: k, from: env[k] || '', to: next[k] || '' }));
+  if (changes.length && !/^(1|true|yes)$/i.test(String(req.body.confirm_phones || ''))) {
+    if (wantsJson(req)) return res.status(409).json({ ok: false, needsConfirm: true, phoneChanges: changes, hint: 'resend with confirm_phones=1' });
+    const lbl = { OWNER_PHONE: 'Lead alerts go to', FORWARD_TO_PHONE: 'Calls ring first at' };
+    return res.status(409).type('html').send(`<!doctype html><meta charset="utf-8"><title>Confirm phone change</title><body style="font-family:sans-serif;margin:2rem;max-width:40rem">
+<h1>Confirm phone number change</h1><p>Applying setup <code>${escH(s.id)}</code> (${escH(values.businessName || '')}) changes:</p><ul>${changes.map((c) => `<li>${lbl[c.key]}: <b>${escH(c.from || '(none)')}</b> &rarr; <b>${escH(c.to || '(none)')}</b></li>`).join('')}</ul>
+<p>Only continue if you recognise these numbers. Anyone can submit the public setup form.</p>
+<form method="post" action="/admin/setups/${escH(s.id)}/apply"><input type="hidden" name="confirm_phones" value="1"><label><input type="checkbox" required> These are the shop's own numbers</label><br><br><button>Apply with these numbers</button> <a href="/admin#setups">Cancel</a></form>`);
+  }
+  const applied = config.apply(next, { setupId: s.id });
   for (const x of store.db.setups) if (x.status === 'applied' && x.id !== s.id) x.status = 'replaced';
   s.status = 'applied'; s.appliedAt = new Date().toISOString(); store.save();
   if (wantsJson(req)) return res.json({ ok: true, id: s.id, config: applied });
@@ -439,7 +507,12 @@ async function startOnboarding(req, res) {
   } catch (e) { console.error('connect onboarding failed:', e.message); res.status(502).type('text').send('Could not start Stripe onboarding. Check the server logs and try again.'); }
 }
 app.post('/admin/connect/onboard', requireAdmin, sameOrigin, startOnboarding);
-app.get('/admin/connect/refresh', requireAdmin, startOnboarding); // Stripe sends the owner here when a link expired
+// Stripe sends the owner here when an onboarding link expired. GET must not create anything: with an existing account
+// it only mints a fresh onboarding link for it; with none it goes back to the admin page (creating is POST onboard).
+app.get('/admin/connect/refresh', requireAdmin, async (req, res) => {
+  if (!connect.accountId() || connect.mode() === 'mock') return res.redirect(303, '/admin#connect');
+  return startOnboarding(req, res);
+});
 app.get('/admin/connect/return', requireAdmin, async (req, res) => { // returning does NOT mean onboarding is complete
   try { await connect.refresh(); } catch (e) { console.error('connect status refresh failed:', e.message); }
   if (wantsJson(req)) return res.json(connect.summary());
@@ -502,12 +575,63 @@ app.get('/health', (req, res) => {
   if (req.headers.authorization && isAdmin(req)) Object.assign(h, { openai: !!env.OPENAI_API_KEY, leadFee: c.leadFee, leadFeeWaived: c.leadFeeWaived, demoMode: sec.demoAllowed() });
   res.json(h);
 });
-module.exports = { app, onPaid, onBooked };
+// Retention (off by default): RETENTION_DAYS=N drops leads (with their message threads) and owner alerts older than N
+// days, at boot and daily. Bookings and opt-outs are kept.
+function runRetention() {
+  const days = sec.num(process.env.RETENTION_DAYS, 0);
+  if (!days) return null;
+  const r = store.purgeOlderThan(days);
+  if (r.leads || r.alerts) console.log(`[retention] purged ${r.leads} lead(s) and ${r.alerts} alert(s) older than ${days} days`);
+  return r;
+}
+app.locals.runRetention = runRetention;
+
+// Last-resort error handler: log, generic reply, never echo internals. Twilio webhooks get empty TwiML so Twilio
+// doesn't play an error to the caller.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  const status = err && (err.status || err.statusCode) >= 400 && (err.status || err.statusCode) < 500 ? (err.status || err.statusCode) : 500;
+  if (status >= 500) console.error(`[error] ${req.method} ${req.path}:`, err && err.stack ? err.stack.split('\n').slice(0, 3).join(' | ') : err);
+  if (res.headersSent) return;
+  if (req.path.startsWith('/twilio/') && status >= 500) return twiml(res, '');
+  res.status(status).type('text').send(status >= 500 ? 'server error' : 'bad request');
+});
+
+// Boot-time checks (warnings only, so the live line keeps answering). ADMIN_PASSWORD_STRICT=1 makes a weak admin
+// password fatal in production.
+function placeholderPasswords() {
+  const out = new Set(['change-me']);
+  try { const m = require('fs').readFileSync(path.join(__dirname, '..', '.env.example'), 'utf8').match(/^ADMIN_PASSWORD=([^\s#]*)/m); if (m && m[1]) out.add(m[1]); } catch {}
+  return out;
+}
+function bootChecks() {
+  const mode = sec.modeInfo(), problems = [];
+  console.log(`[mode] ${mode.production ? `production (${mode.reasons.join(', ')})` : 'development'}; demo/mock routes ${sec.demoAllowed() ? 'ON' : 'OFF'}${mode.production && sec.demoAllowed() ? ' (DEMO_MODE=1)' : ''}; twilio ${live ? 'live' : 'log-only'}; stripe ${env.STRIPE_SECRET_KEY ? 'on' : 'mock'}`);
+  if (!mode.production) return problems;
+  const pw = env.ADMIN_PASSWORD || '';
+  if (!pw) problems.push('ADMIN_PASSWORD is not set (admin disabled)');
+  else if (pw.length < 16 || [...placeholderPasswords()].some((p) => sec.safeEqual(p, pw))) problems.push('ADMIN_PASSWORD is weak (shorter than 16 characters or the .env.example placeholder)');
+  if (!env.OWNER_PHONE || env.OWNER_PHONE === sec.PLACEHOLDER_PHONE) console.error('[security] WARNING: OWNER_PHONE is not set: owner alerts are recorded on /admin but not texted.');
+  for (const p of problems) console.error(`[security] WARNING: ${p}. Set a long random ADMIN_PASSWORD (20+ chars).`);
+  return problems;
+}
+app.locals.bootChecks = bootChecks;
+
+module.exports = { app, onPaid, onBooked, bootChecks, runRetention };
 if (require.main !== module) return; // required by tests: no listener, no signal handlers
+// Never let one stray rejection kill the line: log it and keep serving. An uncaught exception leaves the process in an
+// unknown state, so it is logged and the process exits (Render restarts it).
+process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e && e.stack ? e.stack.split('\n').slice(0, 3).join(' | ') : e));
+process.on('uncaughtException', (e) => { console.error('[uncaughtException]', e && e.stack ? e.stack : e); process.exit(1); });
+{
+  const problems = bootChecks();
+  if (problems.length && sec.isProduction() && sec.on(process.env.ADMIN_PASSWORD_STRICT)) { console.error('[security] ADMIN_PASSWORD_STRICT=1: refusing to start.'); process.exit(1); }
+}
 const port = env.PORT || 3000;
 // Load persisted state first (Postgres when DATABASE_URL is set; no-op for file storage), then accept traffic.
 store.init().then(() => {
 config.applyTZ(); // the stored override may have just been loaded from Postgres
+runRetention(); setInterval(runRetention, 86400000).unref();
 const server = app.listen(port, () => console.log(`missedcall-buzz on :${port} (vertical ${booking.cfg().vertical}, trade ${booking.cfg().trade}, twilio ${live ? 'LIVE' : 'LOG-ONLY'}, ai ${env.OPENAI_API_KEY ? 'openai' : 'templates'}, storage ${store.backend()})`));
 // Render sends SIGTERM on restart/redeploy: flush pending writes to Postgres before exiting.
 for (const sig of ['SIGTERM', 'SIGINT']) process.once(sig, () => { server.close(); store.close().finally(() => process.exit(0)); });

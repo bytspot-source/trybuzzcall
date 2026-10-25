@@ -48,8 +48,10 @@ async function start(t) {
   return {
     dir, pass, base, auth,
     get: (p, headers = {}) => fetch(base + p, { headers, redirect: 'manual' }),
-    json: (p, body, headers = {}) => fetch(base + p, { method: 'POST', redirect: 'manual', headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...headers }, body: JSON.stringify(body) }),
-    form: (p, body, headers = {}) => fetch(base + p, { method: 'POST', redirect: 'manual', headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...headers }, body: new URLSearchParams(body).toString() }),
+    // Same-origin like a browser (admin POSTs require Origin); pass Origin: undefined-free headers to override.
+    json: (p, body, headers = {}) => fetch(base + p, { method: 'POST', redirect: 'manual', headers: { 'Content-Type': 'application/json', Accept: 'application/json', Origin: base, ...headers }, body: JSON.stringify(body) }),
+    form: (p, body, headers = {}) => fetch(base + p, { method: 'POST', redirect: 'manual', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: base, ...headers }, body: new URLSearchParams(body).toString() }),
+    raw: (p, body, headers = {}) => fetch(base + p, { method: 'POST', redirect: 'manual', headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...headers }, body: JSON.stringify(body) }),
     db: () => JSON.parse(fs.readFileSync(path.join(dir, 'db.json'), 'utf8')),
     setups: () => { try { return JSON.parse(fs.readFileSync(path.join(dir, 'db.json'), 'utf8')).setups || []; } catch { return []; } },
   };
@@ -164,6 +166,9 @@ test('setup form over HTTP', { timeout: 60000 }, async (t) => {
     assert.equal((await s.json(`/admin/setups/${id}/apply`, {})).status, 401);
     assert.equal((await s.json(`/admin/setups/${id}/apply`, {}, s.auth('wrong'))).status, 401);
     assert.equal((await s.json(`/admin/setups/${id}/apply`, {}, { ...s.auth(s.pass), Origin: 'https://evil.example' })).status, 403);
+    assert.equal((await s.raw(`/admin/setups/${id}/apply`, { confirm_phones: 1 }, s.auth(s.pass))).status, 403, 'missing Origin is refused');
+    assert.equal((await s.raw(`/admin/setups/${id}/apply`, { confirm_phones: 1 }, { ...s.auth(s.pass), Origin: 'null' })).status, 403, 'Origin: null is refused');
+    assert.equal((await s.raw(`/admin/setups/${id}/apply`, { confirm_phones: 1 }, { ...s.auth(s.pass), Origin: 'null', Referer: 'https://evil.example/x' })).status, 403);
     assert.equal((await s.json('/admin/setups/nope/apply', {}, s.auth(s.pass))).status, 404);
     assert.equal(fs.existsSync(path.join(s.dir, 'config.json')), false);
     assert.equal((await s.get('/admin')).status, 401);
@@ -176,7 +181,17 @@ test('setup form over HTTP', { timeout: 60000 }, async (t) => {
     assert.match(adminPage, /Current effective config/);
     assert.match(adminPage, /\$250 deposit is high/, 'warnings are listed with the submission');
     const target = s.setups().find((x) => x.id === cleanId);
-    const r = await s.json(`/admin/setups/${target.id}/apply`, {}, s.auth(s.pass));
+    const first = await s.json(`/admin/setups/${target.id}/apply`, {}, s.auth(s.pass));
+    assert.equal(first.status, 409, 'changing the phones needs an explicit confirmation');
+    const fj = await first.json();
+    assert.equal(fj.needsConfirm, true);
+    assert.deepEqual(fj.phoneChanges.map((c) => c.key).sort(), ['FORWARD_TO_PHONE', 'OWNER_PHONE']);
+    assert.equal(fs.existsSync(path.join(s.dir, 'config.json')), false, 'nothing applied before confirming');
+    const page = await s.form(`/admin/setups/${target.id}/apply`, {}, s.auth(s.pass));
+    assert.equal(page.status, 409);
+    assert.match(await page.text(), /name="confirm_phones" value="1"/);
+    // Referer fallback: a browser form post that omitted Origin but has a same-host Referer is accepted
+    const r = await s.raw(`/admin/setups/${target.id}/apply`, { confirm_phones: 1 }, { ...s.auth(s.pass), Referer: `${s.base}/admin` });
     assert.equal(r.status, 200);
     const j = await r.json();
     assert.equal(j.config.VERTICAL, 'braiders');
@@ -196,7 +211,7 @@ test('setup form over HTTP', { timeout: 60000 }, async (t) => {
 
   await t.test('form-style apply redirects to /admin; reset clears the override back to env', async () => {
     const target = s.setups().find((x) => x.status === 'pending');
-    const r = await s.form(`/admin/setups/${target.id}/apply`, {}, s.auth(s.pass));
+    const r = await s.form(`/admin/setups/${target.id}/apply`, { confirm_phones: '1' }, s.auth(s.pass));
     assert.equal(r.status, 303);
     assert.equal(r.headers.get('location'), '/admin#setups');
     assert.equal(s.setups().filter((x) => x.status === 'applied').length, 1, 'only one applied at a time');
@@ -217,7 +232,7 @@ test('setup form over HTTP', { timeout: 60000 }, async (t) => {
     const { id } = await r.json();
     const admin = await (await s.get('/admin', s.auth(s.pass))).text();
     assert.match(admin, /Sudsy Paws · Atlanta, GA · Pet groomer \(clients pick a service and time\)/);
-    const ap = await s.json(`/admin/setups/${id}/apply`, {}, s.auth(s.pass));
+    const ap = await s.json(`/admin/setups/${id}/apply`, { confirm_phones: 1 }, s.auth(s.pass));
     assert.equal(ap.status, 200);
     const j = await ap.json();
     assert.equal(j.config.BUSINESS_TYPE, 'pet_grooming');
@@ -242,7 +257,7 @@ test('setup form over HTTP', { timeout: 60000 }, async (t) => {
     const o = await s.json('/setup', other);
     assert.equal(o.status, 200);
     const oid = (await o.json()).id;
-    assert.equal((await s.json(`/admin/setups/${oid}/apply`, {}, s.auth(s.pass))).status, 200);
+    assert.equal((await s.json(`/admin/setups/${oid}/apply`, { confirm_phones: 1 }, s.auth(s.pass))).status, 200);
     const h2 = await (await s.get('/health')).json();
     assert.equal(h2.trade, 'other');
     assert.equal(h2.flow, 'jobs');

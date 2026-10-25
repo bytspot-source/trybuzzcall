@@ -8,6 +8,7 @@ const biz = () => env.BUSINESS_NAME || 'our team';
 const city = () => (env.BUSINESS_CITY || '').trim();
 const inCity = () => (city() ? ` in ${city()}` : '');
 const booking = require('./booking');
+const { escapeRe } = require('./security'); // service names come from the public /setup form
 const isBraiders = () => booking.trade().key === 'braiders';
 
 const COMPLIANCE = 'Reply STOP to opt out, HELP for help. Msg & data rates may apply.';
@@ -55,11 +56,11 @@ function pickService(text) {
   if (!svc) {
     const low = text.toLowerCase();
     svc = list.find((s) => low.includes(s.name.toLowerCase()))
-      || list.find((s) => { const w = s.name.toLowerCase().split(/\s+/)[0].replace(/s$/, ''); return w.length >= 3 && new RegExp(`\\b${w}`).test(low); });
+      || list.find((s) => { const w = s.name.toLowerCase().split(/\s+/)[0].replace(/s$/, ''); return w.length >= 3 && new RegExp(`\\b${escapeRe(w)}`).test(low); });
   }
   if (!svc) return null;
   let rest = n ? text.replace(n[0], '') : text;
-  if (!n) for (const w of svc.name.toLowerCase().split(/\s+/)) rest = rest.replace(new RegExp(`\\b${w.replace(/s$/, '')}s?\\b`, 'i'), '');
+  if (!n) for (const w of svc.name.toLowerCase().split(/\s+/)) rest = rest.replace(new RegExp(`\\b${escapeRe(w.replace(/s$/, ''))}s?\\b`, 'i'), '');
   const details = rest.replace(/\b(please|pls|plz|thanks|thank you|i want|i'?d like|looking for)\b/gi, '').replace(/\s{2,}/g, ' ').replace(/^[\s,.:;-]+|[\s,.;-]+$/g, '').trim();
   return { svc, details };
 }

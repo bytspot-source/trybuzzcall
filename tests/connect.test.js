@@ -67,7 +67,7 @@ test.before(async () => {
 test.after(() => { server.close(); fs.rmSync(dir, { recursive: true, force: true }); });
 const auth = { authorization: 'Basic ' + Buffer.from('admin:' + ADMIN).toString('base64') };
 const req = (p, opts = {}) => fetch(BASE + p, { redirect: 'manual', ...opts, headers: { ...(opts.headers || {}) } });
-const post = (p, body, headers = {}) => req(p, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json', ...auth, ...headers }, body: JSON.stringify(body || {}) });
+const post = (p, body, headers = {}) => req(p, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json', origin: BASE, ...auth, ...headers }, body: JSON.stringify(body || {}) });
 const signed = (event, secret) => {
   const payload = JSON.stringify(event);
   return { body: payload, headers: { 'content-type': 'application/json', 'stripe-signature': Stripe.webhooks.generateTestHeaderString({ payload, secret }) } };
@@ -207,7 +207,7 @@ test('onboarding routes require admin auth and same origin', async (t) => {
 test('live/test onboarding: creates a default-controller (Standard-equivalent) account once, then an Account Link', async (t) => {
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY });
   const f = fakeStripe(); connect.setStripe(f);
-  const r1 = await req('/admin/connect/onboard', { method: 'POST', headers: auth });
+  const r1 = await req('/admin/connect/onboard', { method: 'POST', headers: { ...auth, origin: BASE } });
   assert.equal(r1.status, 303);
   assert.equal(r1.headers.get('location'), 'https://connect.stripe.com/setup/s/test_link');
   assert.equal(f.calls.create.length, 1);
@@ -244,7 +244,7 @@ test('admin shows Not connected + Connect Stripe button; mock onboarding enables
   let html = await (await req('/admin', { headers: auth })).text();
   assert.match(html, /Status: <b>Not connected<\/b>/);
   assert.match(html, /action="\/admin\/connect\/onboard"/);
-  const r = await req('/admin/connect/onboard', { method: 'POST', headers: auth });
+  const r = await req('/admin/connect/onboard', { method: 'POST', headers: { ...auth, origin: BASE } });
   assert.equal(r.status, 303); assert.equal(r.headers.get('location'), 'https://shop.example/admin/connect/mock');
   assert.match(connect.accountId(), /^acct_mock_/);
   assert.equal(connect.status(), 'pending');

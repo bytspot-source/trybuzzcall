@@ -14,7 +14,7 @@ const FLUSH_DELAY_MS = 200;
 const RETRY_DELAY_MS = 5000;
 const TABLE = 'buzz_kv';
 
-const defaultDb = () => ({ leads: [], alerts: [], waitlist: [], bookings: [], billing: {}, setups: [] });
+const defaultDb = () => ({ leads: [], alerts: [], waitlist: [], bookings: [], billing: {}, setups: [], optOuts: {} });
 
 function pgConfig(url) {
   const cfg = { connectionString: url, max: 3, connectionTimeoutMillis: 10000, idleTimeoutMillis: 30000 };
@@ -140,7 +140,7 @@ function createStore(opts = {}) {
     db, WAITLIST_TYPES, init, flush, close, createStore,
     backend: () => backend,
     status: () => ({ backend, lastError }),
-    findOpenLead: (phone) => db.leads.find((l) => l.phone === phone && l.status !== 'done'),
+    findOpenLead: (phone) => db.leads.find((l) => l.phone === phone && l.status !== 'done' && l.status !== 'opted_out'),
     findBooking: (id) => db.bookings.find((b) => b.id === id),
     createLead(phone) {
       const lead = { id: require('crypto').randomBytes(8).toString('hex'), phone, name: null, need: null, window: null,
@@ -165,6 +165,27 @@ function createStore(opts = {}) {
       save(); return s;
     },
     findSetup: (id) => (db.setups || []).find((s) => s.id === id),
+    // SMS opt-outs (STOP keywords, plain-language revocations, Twilio 21610). Persisted; never purged by retention.
+    isOptedOut: (phone) => !!(phone && db.optOuts && db.optOuts[phone]),
+    optOut(phone, source) {
+      if (!phone) return;
+      db.optOuts = db.optOuts || {};
+      if (!db.optOuts[phone]) { db.optOuts[phone] = { at: new Date().toISOString(), source: String(source || 'unknown').slice(0, 40) }; save(); }
+      for (const l of db.leads) if (l.phone === phone && l.status !== 'done') l.status = 'opted_out';
+    },
+    optIn(phone) { if (db.optOuts && db.optOuts[phone]) { delete db.optOuts[phone]; save(); return true; } return false; },
+    // Retention: drop leads (with their message threads) and owner alerts older than `days`. Bookings (payment records)
+    // and opt-outs are kept. Returns counts.
+    purgeOlderThan(days, now = Date.now()) {
+      if (!(days > 0)) return { leads: 0, alerts: 0 };
+      const cutoff = now - days * 86400000, old = (x) => Date.parse(x.createdAt || x.at || '') < cutoff;
+      const before = { leads: db.leads.length, alerts: db.alerts.length };
+      const keepLeads = db.leads.filter((l) => !old(l)), keepAlerts = db.alerts.filter((a) => !old(a));
+      db.leads.length = 0; db.leads.push(...keepLeads); db.alerts.length = 0; db.alerts.push(...keepAlerts);
+      const out = { leads: before.leads - db.leads.length, alerts: before.alerts - db.alerts.length };
+      if (out.leads || out.alerts) save();
+      return out;
+    },
     getOverride: () => override,
     setOverride(o) {
       override = o || {};

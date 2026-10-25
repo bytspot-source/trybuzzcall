@@ -2,8 +2,18 @@
 const crypto = require('crypto');
 
 const on = (v) => /^(1|true|yes|on)$/i.test(String(v || '').trim());
-// Render sets NODE_ENV=production at runtime for Node services.
-const isProduction = () => process.env.NODE_ENV === 'production';
+// Production = NODE_ENV=production, or running on Render (RENDER is set by Render on every service, Docker included),
+// or, when NODE_ENV isn't set at all, an https PUBLIC_BASE_URL. An explicit non-production NODE_ENV (test,
+// development) off Render stays non-production so local runs and tests keep demo behaviour.
+const onRender = () => !!String(process.env.RENDER || '').trim();
+function modeInfo() {
+  const e = process.env, reasons = [];
+  if (e.NODE_ENV === 'production') reasons.push('NODE_ENV=production');
+  if (onRender()) reasons.push('RENDER');
+  if (!e.NODE_ENV && /^https:\/\//i.test(e.PUBLIC_BASE_URL || '')) reasons.push('https PUBLIC_BASE_URL');
+  return { production: reasons.length > 0, reasons };
+}
+const isProduction = () => modeInfo().production;
 // Mock/demo behaviour (unsigned mock webhooks, unvalidated Twilio posts without a Twilio token, mock pay/checkout pages)
 // is always available outside production; in production it needs an explicit DEMO_MODE=1.
 const demoAllowed = () => !isProduction() || on(process.env.DEMO_MODE);
@@ -34,10 +44,12 @@ function limiter({ windowMs, max, maxKeys = 10000 }) {
   };
 }
 // Client IP for rate limits. On Render, traffic passes Cloudflare + Render proxies (several hops), and Render documents
-// True-Client-IP (set/overwritten at the edge) as the real client address, so in production that header wins.
+// True-Client-IP (set/overwritten at the edge) as the real client address.
 // CLIENT_IP_HEADER overrides the header name ('none' = only req.ip, which honours the 'trust proxy' setting).
+// The header is only trusted on Render (RENDER set) unless CLIENT_IP_HEADER names one explicitly; anywhere else a client
+// could send it and dodge the per-IP limits.
 function clientIp(req) {
-  const name = (process.env.CLIENT_IP_HEADER || (isProduction() ? 'true-client-ip' : 'none')).toLowerCase();
+  const name = (process.env.CLIENT_IP_HEADER || (onRender() ? 'true-client-ip' : 'none')).toLowerCase();
   const h = name !== 'none' ? String(req.headers[name] || '').split(',')[0].trim() : '';
   return h || req.ip || 'unknown';
 }
@@ -77,4 +89,11 @@ function securityHeaders(base) {
   };
 }
 
-module.exports = { clientIp, on, num, isProduction, demoAllowed, safeEqual, limiter, rateLimit, maskPhone, securityHeaders };
+// US/Canada (NANP) E.164 only: +1, area code and exchange starting 2-9. Rejects anonymous/restricted placeholders
+// Twilio sends (e.g. +266696687, +7378742833, 'anonymous') and international/premium numbers.
+const isNanp = (p) => /^\+1[2-9]\d{2}[2-9]\d{6}$/.test(String(p || ''));
+const PLACEHOLDER_PHONE = '+10000000000';
+const escapeRe = (x) => String(x).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+module.exports = { modeInfo, onRender, isNanp, PLACEHOLDER_PHONE, escapeRe, sleep, clientIp, on, num, isProduction, demoAllowed, safeEqual, limiter, rateLimit, maskPhone, securityHeaders };
