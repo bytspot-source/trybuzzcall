@@ -12,8 +12,18 @@ const connect = require('./connect');
 const setupRules = require('./setupRules');
 const setupPages = require('./setupPages');
 const crypto = require('crypto');
+const sec = require('./security');
 
 const app = express();
+app.disable('x-powered-by');
+// Behind Render's proxy: trust one hop so req.ip is the client (used by the rate limiters). TRUST_PROXY overrides
+// (a hop count, or 0/false to disable). Off by default outside production.
+{ const tp = process.env.TRUST_PROXY; app.set('trust proxy', tp !== undefined && tp !== '' ? (/^\d+$/.test(tp) ? Number(tp) : sec.on(tp)) : (sec.isProduction() ? 1 : false)); }
+app.use(sec.securityHeaders(process.env.PUBLIC_BASE_URL));
+// Unsigned (mock) Stripe events are only accepted with no STRIPE_SECRET_KEY (mock mode) AND outside production unless
+// DEMO_MODE=1. Everything else needs a verified signature.
+const unsignedStripeOk = () => !process.env.STRIPE_SECRET_KEY && sec.demoAllowed();
+if (process.env.STRIPE_SECRET_KEY && !process.env.STRIPE_WEBHOOK_SECRET) console.error('[security] STRIPE_SECRET_KEY is set but STRIPE_WEBHOOK_SECRET is not: /stripe/webhook will refuse events (503) until it is set.');
 // Stripe webhook needs the raw body for signature verification, so it's registered before the JSON parser.
 app.post('/stripe/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   let event;
@@ -21,8 +31,10 @@ app.post('/stripe/webhook', express.raw({ type: '*/*' }), async (req, res) => {
     if (process.env.STRIPE_WEBHOOK_SECRET) {
       const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY || 'sk_unused');
       event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'] || '', process.env.STRIPE_WEBHOOK_SECRET);
-    } else event = JSON.parse(req.body.toString('utf8'));
-  } catch (e) { return res.status(400).send(`Webhook error: ${e.message}`); }
+    } else if (unsignedStripeOk()) event = JSON.parse(req.body.toString('utf8')); // dev/mock only
+    else return res.status(503).send('Webhook not configured');
+  } catch (e) { console.error('stripe webhook rejected:', e.message); return res.status(400).send('Webhook error'); }
+  if (!event || typeof event !== 'object' || !event.type) return res.status(400).send('Webhook error');
   // Shop subscription events (and subscription-mode checkout) -> billing.js. Deposit checkouts fall through.
   try { if (await billing.handleEvent(event)) return res.json({ received: true }); }
   catch (e) { console.error('billing webhook error:', e.message); return res.status(500).send('billing handler error'); }
@@ -42,9 +54,9 @@ app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, re
   try {
     const secret = process.env.STRIPE_CONNECT_WEBHOOK_SECRET;
     if (secret) event = require('stripe').webhooks.constructEvent(req.body, req.headers['stripe-signature'] || '', secret);
-    else if (connect.mode() === 'mock') event = JSON.parse(req.body.toString('utf8')); // dev/mock only
-    else return res.status(503).send('Connect webhook not configured (STRIPE_CONNECT_WEBHOOK_SECRET)');
-  } catch (e) { return res.status(400).send(`Webhook error: ${e.message}`); }
+    else if (connect.mode() === 'mock' && sec.demoAllowed()) event = JSON.parse(req.body.toString('utf8')); // dev/mock only
+    else return res.status(503).send('Connect webhook not configured');
+  } catch (e) { console.error('connect webhook rejected:', e.message); return res.status(400).send('Webhook error'); }
   const ignore = (why) => res.json({ received: true, ignored: why });
   const acct = connect.accountId();
   if (!event || !event.account || !acct || event.account !== acct) return ignore('account mismatch');
@@ -76,21 +88,51 @@ app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, re
   } catch (e) { console.error('connect webhook error:', e.message); return res.status(500).send('connect handler error'); }
   res.json({ received: true });
 });
-app.use(express.urlencoded({ extended: false }));
-app.use(express.json());
+app.use(express.urlencoded({ extended: false, limit: '100kb' }));
+app.use(express.json({ limit: '100kb' }));
+// Never serve editor/backup leftovers (e.g. public/terms.html.bak-*) or dotfiles from public/.
+app.use((req, res, next) => (/\.(bak|orig|swp)\b|~$|\/\./i.test(req.path) ? res.status(404).send('Not found') : next()));
 // Public site. `extensions` gives clean URLs (/privacy, /terms, /refunds, /sms-consent) as well as the .html paths.
 app.use(express.static(path.join(__dirname, '..', 'public'), { extensions: ['html'] }));
 const env = config.env;
 const BASE = env.PUBLIC_BASE_URL || `http://localhost:${env.PORT || 3000}`;
+// Admin = HTTP Basic auth against ADMIN_PASSWORD (constant-time). Username: any, unless ADMIN_USERNAME is set.
+// Brute-force protection: ADMIN_MAX_FAILS (default 10) wrong passwords per client IP per ADMIN_LOCKOUT_MINUTES
+// (default 15) lock that IP out; a global cap (ADMIN_GLOBAL_MAX_FAILS, default 100 per window) stops distributed guessing.
+// While locked, even the right password gets 429 so there is no oracle.
+const adminWindowMs = sec.num(process.env.ADMIN_LOCKOUT_MINUTES, 15) * 60000;
+const adminFails = sec.limiter({ windowMs: adminWindowMs, max: Math.max(1, sec.num(process.env.ADMIN_MAX_FAILS, 10)) });
+const adminGlobalFails = sec.limiter({ windowMs: adminWindowMs, max: Math.max(1, sec.num(process.env.ADMIN_GLOBAL_MAX_FAILS, 100)) });
+function basicCreds(req) {
+  const [scheme, b64] = (req.headers.authorization || '').split(' ');
+  if (!/^basic$/i.test(scheme || '') || !b64) return null;
+  const raw = Buffer.from(b64, 'base64').toString();
+  const i = raw.indexOf(':');
+  return i < 0 ? { user: raw, pass: '' } : { user: raw.slice(0, i), pass: raw.slice(i + 1) };
+}
+function adminLocked(req) { return adminFails.blocked(sec.clientIp(req)) || adminGlobalFails.blocked('all'); }
+function checkAdmin(req) {
+  const c = basicCreds(req);
+  if (!c) return false;
+  if (!env.ADMIN_PASSWORD) return false;
+  const userOk = env.ADMIN_USERNAME ? sec.safeEqual(c.user, env.ADMIN_USERNAME) : true;
+  return sec.safeEqual(c.pass, env.ADMIN_PASSWORD) && userOk;
+}
+// Side-effect free check (also used to read optional admin flags on public routes). Counts failed attempts.
 function isAdmin(req) {
-  const [, b64] = (req.headers.authorization || '').split(' ');
-  const pass = b64 ? Buffer.from(b64, 'base64').toString().split(':').slice(1).join(':') : '';
-  return !!env.ADMIN_PASSWORD && pass === env.ADMIN_PASSWORD;
+  if (req._admin !== undefined) return req._admin;
+  if (!basicCreds(req) || adminLocked(req)) return (req._admin = false);
+  const ok = checkAdmin(req);
+  if (!ok) { adminFails.hit(sec.clientIp(req)); adminGlobalFails.hit('all'); }
+  return (req._admin = ok);
 }
 function requireAdmin(req, res, next) {
+  const locked = adminLocked(req);
+  if (locked) return res.set('Retry-After', String(locked)).status(429).send('too many failed logins, try again later');
   if (!isAdmin(req)) return res.set('WWW-Authenticate', 'Basic realm="admin"').status(401).send('auth required');
   next();
 }
+app.locals.resetAdminLockout = () => { adminFails.reset(); adminGlobalFails.reset(); };
 function billingHtml(esc) {
   const x = billing.summary(), s = x.subscription;
   const d = (v) => (v ? new Date(v).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }) : '-');
@@ -103,10 +145,16 @@ function billingHtml(esc) {
 }
 const twiml = (res, xml) => res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?><Response>${xml}</Response>`);
 
-// Optional Twilio signature check when live
+// Twilio signature check. With TWILIO_AUTH_TOKEN set, every webhook must carry a valid X-Twilio-Signature
+// (SKIP_TWILIO_VALIDATION=1 is honored outside production only). Without a token there is nothing to validate
+// against: allowed for local/demo use (SMS are then log-only), refused in production unless DEMO_MODE=1.
+// Signatures are computed over PUBLIC_BASE_URL + path, so PUBLIC_BASE_URL must be exactly the URL Twilio calls.
+if (sec.isProduction() && env.SKIP_TWILIO_VALIDATION === '1') console.error('[security] SKIP_TWILIO_VALIDATION=1 is ignored in production.');
 function verifyTwilio(req, res, next) {
-  if (!live || env.SKIP_TWILIO_VALIDATION === '1') return next();
-  const ok = require('twilio').validateRequest(env.TWILIO_AUTH_TOKEN, req.headers['x-twilio-signature'] || '', BASE + req.originalUrl, req.body);
+  const token = process.env.TWILIO_AUTH_TOKEN;
+  if (!token) return sec.demoAllowed() ? next() : res.status(503).send('twilio webhook not configured');
+  if (env.SKIP_TWILIO_VALIDATION === '1' && !sec.isProduction()) return next();
+  const ok = require('twilio').validateRequest(token, req.headers['x-twilio-signature'] || '', BASE + req.originalUrl, req.body || {});
   return ok ? next() : res.status(403).send('bad signature');
 }
 
@@ -128,9 +176,23 @@ async function inactiveText(phone) {
   await sendSms(phone, msg);
 }
 
+// Per-number throttle on the first text-back: at most one per TEXTBACK_COOLDOWN_MINUTES (default 60) per caller,
+// so repeated (or forged) calls from one number can't make the shop's line text it over and over.
+// 0 disables. Timestamps live in db.textBacks (pruned as they expire).
+const textBackCooldownMs = () => sec.num(process.env.TEXTBACK_COOLDOWN_MINUTES, 60) * 60000;
+function textBackAllowed(phone) {
+  const ms = textBackCooldownMs();
+  if (!ms) return true;
+  const t = (store.db.textBacks = store.db.textBacks || {}), now = Date.now();
+  for (const [k, v] of Object.entries(t)) if (now - Date.parse(v) >= ms) delete t[k];
+  if (t[phone]) return false;
+  t[phone] = new Date(now).toISOString();
+  return true;
+}
 async function startTextBack(phone) {
   if (!phone) return;
   if (!billing.access().active) return inactiveText(phone);
+  if (!textBackAllowed(phone)) { console.log(`[textback] throttled ${sec.maskPhone(phone)} (already texted recently)`); return; }
   let lead = store.findOpenLead(phone);
   if (!lead) lead = store.createLead(phone);
   const msg = agent.firstMessage();
@@ -218,9 +280,9 @@ async function onPaid(id) {
   return b;
 }
 
-// Mock deposit page (only when Stripe isn't configured): visiting marks it paid.
+// Mock deposit page (only when Stripe isn't configured, and in production only with DEMO_MODE=1): visiting marks it paid.
 app.get('/pay/mock/:id', async (req, res) => {
-  if (env.STRIPE_SECRET_KEY) return res.status(404).send('mock payments disabled');
+  if (env.STRIPE_SECRET_KEY || !sec.demoAllowed()) return res.status(404).send('mock payments disabled');
   const b0 = store.findBooking(req.params.id);
   if (!b0) return res.status(404).send('booking not found');
   const b = await onPaid(b0.id);
@@ -235,28 +297,40 @@ async function buzzOwner(lead) {
   await sendSms(env.OWNER_PHONE || '+10000000000', msg);
 }
 
+// Public form throttles (per client IP).
+const formLimit = (name, max) => sec.rateLimit({ windowMs: sec.num(process.env.FORM_RATE_WINDOW_MINUTES, 10) * 60000, max: sec.num(process.env[name], max) });
+const waitlistLimit = formLimit('WAITLIST_RATE_MAX', 30), setupLimit = formLimit('SETUP_RATE_MAX', 20), checkoutLimit = formLimit('CHECKOUT_RATE_MAX', 30);
+app.locals.resetFormLimits = () => { waitlistLimit.reset(); setupLimit.reset(); checkoutLimit.reset(); };
 // Waitlist
-app.post('/api/waitlist', (req, res) => {
+app.post('/api/waitlist', waitlistLimit, (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'invalid email' });
   const { businessType } = req.body;
   if (businessType !== undefined && businessType !== '' && !store.WAITLIST_TYPES.includes(businessType)) {
     return res.status(400).json({ error: 'invalid business type' });
   }
-  store.addWaitlist(email, businessType); res.json({ ok: true });
+  if (!store.addWaitlist(email, businessType)) return res.status(503).json({ error: 'waitlist is full' });
+  res.json({ ok: true });
 });
 
 // ---------- Shop subscription billing (see src/billing.js) ----------
 // Signup: Stripe Checkout mode=subscription, card required, TRIAL_DAYS free trial (cancels if no card at trial end),
 // setup price on monthly only. Without STRIPE_SECRET_KEY returns a mock checkout URL.
 const planParam = (v) => (v === 'annual' ? 'annual' : v === 'monthly' || v === undefined || v === '' ? 'monthly' : null);
-const apiErr = (res, e) => res.status(e.status || (e.type && e.type.startsWith('Stripe') ? 502 : 500)).json({ error: e.message });
-app.post('/api/checkout', async (req, res) => {
+// Client errors (4xx/501 thrown on purpose) keep their message; unexpected/Stripe errors are logged, not echoed.
+const apiErr = (res, e) => {
+  const status = e.status || (e.type && e.type.startsWith('Stripe') ? 502 : 500);
+  if (status >= 500 && status !== 501) { console.error('api error:', e.message); return res.status(status).json({ error: status === 502 ? 'payment provider error' : 'server error' }); }
+  return res.status(status).json({ error: e.message });
+};
+app.post('/api/checkout', checkoutLimit, async (req, res) => {
+  if (!env.STRIPE_SECRET_KEY && !sec.demoAllowed()) return res.status(503).json({ error: 'checkout not available' });
   const plan = planParam(req.body.plan); if (!plan) return res.status(400).json({ error: 'plan must be monthly or annual' });
   const email = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(req.body.email || '')) ? String(req.body.email).trim() : undefined;
   // Per-shop setup-fee override: a matching SETUP_WAIVER_CODE, or setup_waived=1 from an admin-authenticated request.
   const code = billing.cfg().setupWaiverCode;
-  const setupWaived = (!!code && String(req.body.setup_waiver_code || '') === code) || (isAdmin(req) && /^(1|true|yes)$/i.test(String(req.body.setup_waived || '')));
+  const given = String(req.body.setup_waiver_code || '');
+  const setupWaived = (!!code && !!given && sec.safeEqual(given, code)) || (/^(1|true|yes)$/i.test(String(req.body.setup_waived || '')) && isAdmin(req));
   try { res.json(await billing.createCheckout({ plan, email, BASE, setupWaived })); } catch (e) { apiErr(res, e); }
 });
 // Shop-owner billing actions: admin auth (single-tenant: the shop owner is the admin).
@@ -275,7 +349,8 @@ app.post('/api/billing/resume', requireAdmin, async (req, res) => { try { res.js
 app.get('/billing/portal', requireAdmin, async (req, res) => { try { res.redirect(303, await billing.portalUrl(BASE)); } catch (e) { apiErr(res, e); } });
 
 // Mock billing (only without STRIPE_SECRET_KEY): checkout page, portal page, and a clock to simulate the lifecycle.
-const mockOnly = (req, res, next) => (env.STRIPE_SECRET_KEY ? res.status(404).send('mock billing disabled (Stripe live)') : next());
+const mockOnly = (req, res, next) => (env.STRIPE_SECRET_KEY ? res.status(404).send('mock billing disabled (Stripe live)')
+  : !sec.demoAllowed() ? res.status(404).send('mock billing disabled (set DEMO_MODE=1)') : next());
 const escH = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 app.get('/billing/mock/checkout/:id', mockOnly, (req, res) => {
   const sess = billing.mockSessionInfo(req.params.id); if (!sess) return res.status(404).send('session not found');
@@ -314,7 +389,7 @@ app.get('/trades.js', (req, res) => res.type('application/javascript').sendFile(
 // POST /setup (JSON or form). 422 = errors, 409 = warnings not confirmed (send confirm=1), 200 = saved as 'pending'.
 // Never touches the live config: an admin reviews it and clicks 'Apply to this line'.
 const wantsJson = (req) => req.is('application/json') || /application\/json/.test(req.get('accept') || '');
-app.post('/setup', (req, res) => {
+app.post('/setup', setupLimit, (req, res) => {
   const body = req.body && typeof req.body === 'object' ? req.body : {};
   const json = wantsJson(req);
   const { values, issues, errors, warnings } = setupRules.validate(body);
@@ -377,7 +452,8 @@ app.post('/admin/connect/sync', requireAdmin, sameOrigin, async (req, res) => {
 });
 app.get('/admin/connect/status', requireAdmin, (req, res) => res.json(connect.summary()));
 // Mock mode only (no STRIPE_SECRET_KEY): simulated Stripe onboarding.
-const connectMockOnly = (req, res, next) => (connect.mode() !== 'mock' ? res.status(404).send('mock onboarding disabled (Stripe configured)') : next());
+const connectMockOnly = (req, res, next) => (connect.mode() !== 'mock' ? res.status(404).send('mock onboarding disabled (Stripe configured)')
+  : !sec.demoAllowed() ? res.status(404).send('mock onboarding disabled (set DEMO_MODE=1)') : next());
 app.get('/admin/connect/mock', connectMockOnly, requireAdmin, (req, res) => {
   const x = connect.summary();
   res.type('html').send(`<!doctype html><meta charset="utf-8"><title>MOCK Stripe onboarding</title><body style="font-family:sans-serif;margin:2rem;max-width:40rem">
@@ -399,7 +475,7 @@ function connectHtml(esc) {
 <p>${btn}${sync}</p>`;
 }
 
-// Admin (HTTP Basic auth, any username)
+// Admin (HTTP Basic auth; any username unless ADMIN_USERNAME is set)
 app.get('/admin', requireAdmin, (req, res) => {
   const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   const rows = store.db.leads.slice(0, 100).map((l) => `<tr><td>${esc(l.createdAt)}</td><td>${esc(l.phone)}</td><td>${esc(l.name)}</td><td>${l.urgent ? '🚨 ' : ''}${esc(l.need)}</td><td>${esc(l.window)}</td><td>${esc(l.status)}</td></tr>`).join('');
@@ -418,7 +494,14 @@ ${setupPages.adminSetupsHtml(store.db.setups, config.effective(), config.overrid
 
 setInterval(() => booking.expireHolds(), 60000).unref();
 billing.init({ notify: (msg) => owner(null, msg), BASE });
-app.get('/health', (_, res) => res.json({ ok: true, vertical: booking.cfg().vertical, trade: booking.cfg().trade, flow: booking.cfg().flow, billing: billing.summary().mode, serviceActive: billing.access().active, twilio: live, openai: !!env.OPENAI_API_KEY, booking: booking.cfg().booking, deposit: booking.cfg().deposit, stripe: !!env.STRIPE_SECRET_KEY, leadFee: booking.cfg().leadFee, leadFeeWaived: booking.cfg().leadFeeWaived, connect: connect.mode() !== 'mock' && connect.depositsReady(), connectStatus: connect.status(), storage: store.backend() }));
+// Public health: status fields only (ops checks use ok/storage/billing/serviceActive/...). Pricing config and the
+// OpenAI flag are admin-only (send Basic auth to get them too).
+app.get('/health', (req, res) => {
+  const c = booking.cfg();
+  const h = { ok: true, vertical: c.vertical, trade: c.trade, flow: c.flow, billing: billing.summary().mode, serviceActive: billing.access().active, twilio: live, booking: c.booking, deposit: c.deposit, stripe: !!env.STRIPE_SECRET_KEY, connect: connect.mode() !== 'mock' && connect.depositsReady(), connectStatus: connect.status(), storage: store.backend() };
+  if (req.headers.authorization && isAdmin(req)) Object.assign(h, { openai: !!env.OPENAI_API_KEY, leadFee: c.leadFee, leadFeeWaived: c.leadFeeWaived, demoMode: sec.demoAllowed() });
+  res.json(h);
+});
 module.exports = { app, onPaid, onBooked };
 if (require.main !== module) return; // required by tests: no listener, no signal handlers
 const port = env.PORT || 3000;

@@ -75,6 +75,7 @@ function launchServer(port, cwd, adminPassword) {
       BOOKING_ENABLED: '0',
       DEPOSIT_ENABLED: '0',
       TRIAL_DAYS: '14',
+      WAITLIST_RATE_MAX: '1000', // this suite posts many waitlist entries from one IP; the limiter has its own test
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -213,9 +214,11 @@ async function startSite(t) {
   const health = JSON.parse(response.body);
   assert.equal(health.ok, true);
   assert.equal(health.billing, 'mock');
-  for (const key of ['twilio', 'openai', 'stripe', 'connect', 'booking', 'deposit']) {
+  for (const key of ['twilio', 'stripe', 'connect', 'booking', 'deposit']) {
     assert.equal(health[key], false, `${key} must be disabled`);
   }
+  for (const key of ['openai', 'leadFee', 'leadFeeWaived']) assert.equal(key in health, false, `public /health must not expose ${key}`);
+  assert.equal(typeof health.storage, 'string');
 
   const cache = new Map();
   function publicResource(target) {

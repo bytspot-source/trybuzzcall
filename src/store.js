@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 
 const MAX_SETUPS = 500;
+const MAX_WAITLIST = Number(process.env.MAX_WAITLIST) > 0 ? Number(process.env.MAX_WAITLIST) : 5000; // public form: bounded
 const WAITLIST_TYPES = ['home_services', 'braiders', 'other']; // landing-page segments (other = any other local business)
 const FLUSH_DELAY_MS = 200;
 const RETRY_DELAY_MS = 5000;
@@ -15,15 +16,22 @@ const TABLE = 'buzz_kv';
 
 const defaultDb = () => ({ leads: [], alerts: [], waitlist: [], bookings: [], billing: {}, setups: [] });
 
-function defaultPoolFactory(url) {
-  const { Pool } = require('pg');
+function pgConfig(url) {
   const cfg = { connectionString: url, max: 3, connectionTimeoutMillis: 10000, idleTimeoutMillis: 30000 };
   let host = '';
   try { host = new URL(url).hostname; } catch {}
   const local = ['localhost', '127.0.0.1', '::1', ''].includes(host);
   const explicit = /[?&]sslmode=/.test(url);
-  if (!local && !explicit && process.env.DATABASE_SSL !== 'disable') cfg.ssl = { rejectUnauthorized: false };
-  const pool = new Pool(cfg);
+  // Remote hosts get TLS WITH certificate verification (Neon/Render/Supabase present publicly trusted certs).
+  // DATABASE_SSL=disable = no TLS; DATABASE_SSL=no-verify = TLS without verification (old behaviour, MITM-able; only
+  // for a provider with a self-signed cert). An explicit sslmode=... in the URL is left to pg's own parsing.
+  const mode = (process.env.DATABASE_SSL || '').toLowerCase();
+  if (!local && !explicit && mode !== 'disable') cfg.ssl = { rejectUnauthorized: mode !== 'no-verify' };
+  return cfg;
+}
+function defaultPoolFactory(url) {
+  const { Pool } = require('pg');
+  const pool = new Pool(pgConfig(url));
   pool.on('error', (e) => console.error('[store] postgres pool error:', e.message));
   return pool;
 }
@@ -135,7 +143,7 @@ function createStore(opts = {}) {
     findOpenLead: (phone) => db.leads.find((l) => l.phone === phone && l.status !== 'done'),
     findBooking: (id) => db.bookings.find((b) => b.id === id),
     createLead(phone) {
-      const lead = { id: Date.now().toString(36), phone, name: null, need: null, window: null,
+      const lead = { id: require('crypto').randomBytes(8).toString('hex'), phone, name: null, need: null, window: null,
         step: 'name', status: 'collecting', messages: [], createdAt: new Date().toISOString() };
       db.leads.unshift(lead); save(); return lead;
     },
@@ -143,11 +151,12 @@ function createStore(opts = {}) {
     addWaitlist(email, businessType) {
       let entry = db.waitlist.find((w) => w.email === email);
       if (!entry) {
+        if (db.waitlist.length >= MAX_WAITLIST) return false;
         entry = { email, at: new Date().toISOString() };
         db.waitlist.push(entry);
       }
       if (WAITLIST_TYPES.includes(businessType)) entry.businessType = businessType;
-      save();
+      save(); return true;
     },
     addSetup(s) {
       db.setups = db.setups || [];
@@ -166,4 +175,5 @@ function createStore(opts = {}) {
 }
 
 const store = createStore({ dir: process.env.DATA_DIR || undefined, databaseUrl: process.env.DATABASE_URL || '' });
+store.pgConfig = pgConfig;
 module.exports = store;

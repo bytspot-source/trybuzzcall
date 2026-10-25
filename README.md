@@ -58,7 +58,9 @@ bash scripts/demo_simulate.sh  # in a second terminal: booking + mock deposit, t
 bash scripts/demo_billing.sh   # shop subscription lifecycle (mock Stripe; own temp server on :3077)
 bash scripts/demo_braiders.sh  # braider flow (stop the server above first, or it will refuse if that server isn't VERTICAL=braiders)
 ```
-SMS output goes to the console and `data/sms.log`. Admin page: http://localhost:3000/admin (any username, password `ADMIN_PASSWORD`).
+SMS output goes to the console and `data/sms.log`. Admin page: http://localhost:3000/admin (any username unless `ADMIN_USERNAME` is set, password `ADMIN_PASSWORD`; repeated wrong passwords lock the client out for 15 min).
+
+**Production vs demo:** Render sets `NODE_ENV=production`. There, mock/demo behaviour (unsigned mock Stripe webhooks, Twilio webhooks without `TWILIO_AUTH_TOKEN`, `/pay/mock/*`, `/billing/mock/*`, mock checkout) is refused unless `DEMO_MODE=1`. With `STRIPE_SECRET_KEY` set, `/stripe/webhook` requires `STRIPE_WEBHOOK_SECRET` (503 without it). With `TWILIO_AUTH_TOKEN` set, every Twilio webhook must be signed for `PUBLIC_BASE_URL`. See the Security block in `.env.example`.
 
 ## Env vars
 See `.env.example`. Key ones: `BUSINESS_NAME`, `VERTICAL` (home_services|braiders), `BUSINESS_VERTICAL` (plumber|hvac), braiders: `SERVICES`, `SLOT_STEP_MINUTES`, `BOOKING_LINK`; `OWNER_PHONE`, `FORWARD_TO_PHONE`, `TWILIO_*`, `OPENAI_API_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_PRICE_ID_BASE_MONTHLY/_ANNUAL`, `STRIPE_PRICE_ID_SETUP`, `TRIAL_DAYS`, `ANNUAL_UPGRADE_PRORATION`, `MONTHLY_DOWNGRADE_PRORATION`, `BILLING_PORTAL_RETURN_URL`, `BILLING_ENFORCE`, `BILLING_REQUIRE_SUBSCRIPTION`, `PAST_DUE_GRACE_DAYS`, `INACTIVE_MODE`, `INACTIVE_MESSAGE`, `MOCK_PRICE_*`, `DATA_DIR`, `LEAD_FEE`, `LEAD_FEE_WAIVED`, `STRIPE_CONNECT_ACCOUNT_ID`, `STRIPE_CONNECT_WEBHOOK_SECRET`, `ADMIN_PASSWORD`, `PUBLIC_BASE_URL`; booking: `BOOKING_ENABLED`, `BUSINESS_TZ`, `BUSINESS_HOURS`, `BUSINESS_DAYS`, `SLOT_MINUTES`, `BOOKING_LEAD_MINUTES`, `DEPOSIT_ENABLED`, `DEPOSIT_AMOUNT`, `HOLD_MINUTES`, `STRIPE_WEBHOOK_SECRET`.
