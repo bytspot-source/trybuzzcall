@@ -117,7 +117,7 @@ test('platform roster shows actual counts and only explicitly selected registry 
       { id: 'setup-applied', status: 'applied', values: { businessName: 'DO_NOT_SHOW_APPLIED' } }],
     storage: { backend: 'postgres', degraded: true, lastError: 'INTERNAL_MARKER', pathWarnings: ['Platform storage-path warning'] }, legacyName: 'Old business' });
   assert.match(html, /<title>Platform admin \| BuzzCall<\/title>/);
-  for (const value of ['Vendor roster', 'owner@example.test', 'trialing', '+14045550101', 'pending', 'Degraded', 'Postgres'.toLowerCase(), 'Pending business', 'Old business']) assert.ok(html.includes(value), value);
+  for (const value of ['Vendor roster', 'owner@example.test', 'trialing', '(404) 555-0101', 'pending', 'Degraded', 'Postgres'.toLowerCase(), 'Pending business', 'Old business']) assert.ok(html.includes(value), value);
   for (const value of [2, 1, 8, 11]) assert.ok(html.includes(`<strong class="metric-value">${value}</strong>`));
   assert.match(html, /href="\/admin\/vendors\/shop-own"/);
   const approval = form(html, '/admin/vendors/approve');
@@ -196,7 +196,7 @@ test('vendor settings posts only allowed settings and leaves phone routing read-
   const html = pages.settings({ shop, values, error: { field: 'BUSINESS_CITY', message: 'Check the city.' } });
   const settings = form(html, '/vendor/settings');
   const names = [...settings.matchAll(/name="([^"]+)"/g)].map(match => match[1]);
-  assert.deepEqual(names.sort(), Object.keys(values).filter(name => !['OWNER_PHONE', 'FORWARD_TO_PHONE', 'STRIPE_SECRET_KEY', 'PRICE_MONTHLY'].includes(name)).sort());
+  assert.deepEqual(names.sort(), [...Object.keys(values).filter(name => !['OWNER_PHONE', 'FORWARD_TO_PHONE', 'STRIPE_SECRET_KEY', 'PRICE_MONTHLY'].includes(name)), 'BUSINESS_TYPE', 'BUSINESS_TRADE_LABEL'].sort());
   assert.match(html, /name="OWNER_PHONE"[^>]+readonly disabled/);
   assert.match(html, /name="FORWARD_TO_PHONE"[^>]+readonly disabled/);
   assert.match(html, /name="BUSINESS_CITY"[^>]+aria-invalid="true"/);

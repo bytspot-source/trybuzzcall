@@ -12,8 +12,7 @@ const script = new vm.Script(readFileSync(path.join(publicDir, 'site.js'), 'utf8
   filename: path.join(publicDir, 'site.js'),
 });
 const origin = 'https://landing.example.test';
-const mockCheckout = '/billing/mock/checkout/test-session';
-const stripeCheckout = 'https://checkout.stripe.com/c/pay/test-session';
+const mockCheckout = '/billing/mock/checkout/test-session'; // a success-shaped body some failure cases return
 
 // These helpers inspect this page's static markup, not arbitrary HTML or rendering.
 function attributes(source) {
@@ -136,7 +135,7 @@ class TimerDouble {
 
 function harness(t, fetchImpl = async () => jsonResponse({ ok: true })) {
   const nodes = Object.fromEntries([
-    'waitlist-form', 'waitlist-email', 'waitlist-business', 'waitlist-status', 'checkout-status',
+    'waitlist-form', 'waitlist-email', 'waitlist-business', 'waitlist-status',
   ].map((id) => [id, new ElementDouble(byId(id).attrs)]));
   const form = nodes['waitlist-form'];
   const email = nodes['waitlist-email'];
@@ -147,8 +146,6 @@ function harness(t, fetchImpl = async () => jsonResponse({ ok: true })) {
   const submitTag = tags(formMarkup.content, 'button').find(({ attrs }) => attrs.type === 'submit');
   assert.ok(submitTag, 'Waitlist submit button must exist');
   const submit = new ElementDouble(submitTag.attrs);
-  const checkoutButtons = elements.filter(({ attrs }) => Object.hasOwn(attrs, 'data-checkout'))
-    .map(({ attrs }) => new ElementDouble(attrs));
   const audienceLinks = elements.filter(({ attrs }) => Object.hasOwn(attrs, 'data-audience'))
     .map(({ attrs }) => new ElementDouble(attrs));
   form.valid = true;
@@ -167,7 +164,6 @@ function harness(t, fetchImpl = async () => jsonResponse({ ok: true })) {
     document: {
       getElementById: (id) => nodes[id] ?? null,
       querySelectorAll(selector) {
-        if (selector === '[data-checkout]') return checkoutButtons;
         if (selector === '[data-audience]') return audienceLinks;
         assert.fail(`Unexpected selector: ${selector}`);
       },
@@ -187,10 +183,8 @@ function harness(t, fetchImpl = async () => jsonResponse({ ok: true })) {
     assert.equal(timers.cleared.length, requests.length, 'Every request must clear its timeout');
   });
   return {
-    form, email, business, submit, checkoutButtons, audienceLinks, requests, redirects, timers,
+    form, email, business, submit, audienceLinks, requests, redirects, timers,
     waitlistStatus: nodes['waitlist-status'],
-    checkoutStatus: nodes['checkout-status'],
-    checkout: (plan) => checkoutButtons.find((button) => button.dataset.checkout === plan),
   };
 }
 
@@ -210,14 +204,6 @@ function assertWaitlistControls(h, busy) {
   assert.equal(h.form.getAttribute('aria-busy'), busy ? 'true' : null);
 }
 
-function assertCheckoutControls(h, busy, activePlan) {
-  for (const button of h.checkoutButtons) {
-    assert.equal(button.disabled, busy);
-    assert.equal(button.getAttribute('aria-busy'),
-      busy && button.dataset.checkout === activePlan ? 'true' : null);
-  }
-}
-
 function assertWaitlistError(h) {
   assert.equal(h.waitlistStatus.dataset.state, 'error');
   assert.match(h.waitlistStatus.textContent, /try again/i);
@@ -226,17 +212,9 @@ function assertWaitlistError(h) {
   assert.equal(h.form.resetCount, 0);
 }
 
-function assertCheckoutError(h) {
-  assert.equal(h.checkoutStatus.dataset.state, 'error');
-  assert.match(h.checkoutStatus.textContent, /try again/i);
-  assert.equal(h.redirects.length, 0);
-  assertCheckoutControls(h, false);
-}
-
-test('startup enables the initially disabled waitlist and checkout controls', (t) => {
+test('startup enables the initially disabled waitlist controls (there is no public checkout)', (t) => {
   const h = harness(t);
   assertWaitlistControls(h, false);
-  assertCheckoutControls(h, false);
   assert.equal(h.requests.length, 0);
 });
 
@@ -247,7 +225,6 @@ test('waitlist submits a trimmed email, shows pending state, and resets on succe
   h.email.setAttribute('aria-invalid', 'true');
   const submission = h.form.dispatch('submit');
   assertWaitlistControls(h, true);
-  assertCheckoutControls(h, false);
   assert.equal(h.form.validityChecks, 1);
   assert.equal(h.email.getAttribute('aria-invalid'), null);
   assert.match(h.waitlistStatus.textContent, /adding/i);
@@ -448,122 +425,12 @@ test('duplicate waitlist submissions are suppressed until the first request sett
   assertPost(h.requests[1], '/api/waitlist', { email: 'another-shop@example.test', businessType: 'home_services' });
 });
 
-test('approval-based checkout sends the owner to the fixed vendor sign-in route', async (t) => {
-  const h = harness(t, () => jsonResponse({ error: 'Sign in', next: 'https://untrusted.example/' }, 401));
-  await h.checkout('monthly').dispatch('click');
-  assert.deepEqual(h.redirects, ['/vendor/login']);
-  assert.match(h.checkoutStatus.textContent, /approved vendor account/);
-  assertCheckoutControls(h, false);
-});
-
-for (const [plan, destination, label] of [
-  ['monthly', mockCheckout, 'relative local mock'],
-  ['annual', stripeCheckout, 'Stripe'],
-  ['annual', `${origin}${mockCheckout}?plan=annual`, 'absolute local mock'],
-]) {
-  test(`${plan} checkout sends its plan and redirects to ${label}`, async (t) => {
-    const pending = deferred();
-    const h = harness(t, () => pending.promise);
-    const checkout = h.checkout(plan).dispatch('click');
-    assert.equal(h.requests.length, 1);
-    assertPost(h.requests[0], '/api/checkout', { plan });
-    assertCheckoutControls(h, true, plan);
-    assertWaitlistControls(h, false);
-    assert.match(h.checkoutStatus.textContent, /opening secure checkout/i);
-    assert.equal(h.checkoutStatus.dataset.state, '');
-    pending.resolve(jsonResponse({ url: destination }));
-    await checkout;
-    assert.deepEqual(h.redirects, [new URL(destination, origin).href]);
-    assert.match(h.checkoutStatus.textContent, /checkout is ready/i);
-    assert.equal(h.checkoutStatus.dataset.state, '');
-    assertCheckoutControls(h, false);
-    assert.equal(h.requests[0].options.signal.aborted, false);
-  });
-}
-
-for (const [name, fail] of [
-  ...transportFailures,
-  ['HTTP 400 with a trusted URL', () => jsonResponse({ url: mockCheckout }, 400)],
-  ['null JSON body', () => jsonResponse(null)],
-]) {
-  test(`checkout recovers from ${name} and permits another plan`, async (t) => {
-    let attempts = 0;
-    const h = harness(t, (...args) => ++attempts === 1 ? fail(...args) : jsonResponse({ url: mockCheckout }));
-    await h.checkout('monthly').dispatch('click');
-    assertCheckoutError(h);
-    assert.equal(h.timers.pending.size, 0);
-    await h.checkout('annual').dispatch('click');
-    assert.equal(h.requests.length, 2);
-    assertPost(h.requests[1], '/api/checkout', { plan: 'annual' });
-    assert.deepEqual(h.redirects, [`${origin}${mockCheckout}`]);
-    assert.equal(h.checkoutStatus.dataset.state, '');
-    assertCheckoutControls(h, false);
-  });
-}
-
-const rejectedRedirects = [
-  ['missing URL', undefined],
-  ['null URL', null],
-  ['numeric URL', 42],
-  ['object URL', { href: stripeCheckout }],
-  ['empty URL', ''],
-  ['whitespace URL', '   '],
-  ['unrelated relative path', 'not-a-checkout-url'],
-  ['malformed URL', 'https://[invalid'],
-  ['external origin', 'https://untrusted.example/billing/mock/checkout/session'],
-  ['protocol-relative external origin', '//untrusted.example/checkout'],
-  ['Stripe lookalike origin', 'https://checkout.stripe.com.untrusted.example/pay'],
-  ['Stripe over HTTP', 'http://checkout.stripe.com/pay'],
-  ['Stripe on another port', 'https://checkout.stripe.com:444/pay'],
-  ['URL with user information', 'https://example-user@checkout.stripe.com/pay'],
-  ['URL with a synthetic password', 'https://:example-password@checkout.stripe.com/pay'],
-  ['script URL', 'javascript:alert(1)'],
-  ['data URL', 'data:text/html,not-a-checkout'],
-  ['unrelated same-origin URL', `${origin}/account`],
-  ['incomplete local checkout prefix', '/billing/mock/checkout'],
-  ['lookalike local checkout prefix', '/billing/mock/checkout-other/session'],
-  ['path traversal outside checkout', '/billing/mock/checkout/../account'],
-];
-
-for (const [name, url] of rejectedRedirects) {
-  test(`checkout rejects ${name} without navigating and can retry`, async (t) => {
-    let attempts = 0;
-    const h = harness(t, () => jsonResponse({ url: ++attempts === 1 ? url : stripeCheckout }));
-    await h.checkout('monthly').dispatch('click');
-    assertCheckoutError(h);
-    assert.equal(h.timers.pending.size, 0);
-    await h.checkout('monthly').dispatch('click');
-    assert.equal(h.requests.length, 2);
-    assert.deepEqual(h.redirects, [stripeCheckout]);
-    assert.equal(h.checkoutStatus.dataset.state, '');
-    assertCheckoutControls(h, false);
-  });
-}
-
-test('checkout suppresses repeated clicks on either plan and unlocks both controls', async (t) => {
-  const pending = deferred();
-  const h = harness(t, () => pending.promise);
-  const first = h.checkout('monthly').dispatch('click');
-  await h.checkout('monthly').dispatch('click');
-  await h.checkout('annual').dispatch('click');
-  assert.equal(h.requests.length, 1);
-  assertCheckoutControls(h, true, 'monthly');
-  pending.resolve(jsonResponse({ url: mockCheckout }));
-  await first;
-  assertCheckoutControls(h, false);
-  assert.equal(h.redirects.length, 1);
-  await h.checkout('annual').dispatch('click');
-  assert.equal(h.requests.length, 2);
-  assertPost(h.requests[1], '/api/checkout', { plan: 'annual' });
-  assert.equal(h.redirects.length, 2);
-});
-
-for (const flow of ['waitlist', 'checkout']) {
+for (const flow of ['waitlist']) {
   for (const phase of ['fetch', 'JSON body']) {
     test(`${flow} aborts a stalled ${phase} at 12 seconds, recovers, and retries`, async (t) => {
       const bodyStarted = deferred();
       let attempts = 0;
-      const success = flow === 'waitlist' ? { ok: true } : { url: mockCheckout };
+      const success = { ok: true };
       const h = harness(t, (_url, { signal }) => {
         if (++attempts > 1) return jsonResponse(success);
         const stalled = () => new Promise((_resolve, reject) => {
@@ -577,8 +444,7 @@ for (const flow of ['waitlist', 'checkout']) {
         return phase === 'fetch' ? stalled() : { ...jsonResponse({}), json: stalled };
       });
       h.email.value = 'shop@example.test';
-      const start = () => flow === 'waitlist'
-        ? h.form.dispatch('submit') : h.checkout('monthly').dispatch('click');
+      const start = () => h.form.dispatch('submit');
       const pending = start();
       await bodyStarted.promise;
       assert.equal(h.timers.pending.size, 1);
@@ -588,25 +454,15 @@ for (const flow of ['waitlist', 'checkout']) {
       h.timers.fire(timerId);
       assert.equal(h.requests[0].options.signal.aborted, true);
       await pending;
-      if (flow === 'waitlist') {
-        assertWaitlistError(h);
-        assert.equal(h.email.value, 'shop@example.test');
-      } else {
-        assertCheckoutError(h);
-      }
+      assertWaitlistError(h);
+      assert.equal(h.email.value, 'shop@example.test');
       assert.ok(h.timers.cleared.includes(timerId));
       await start();
       assert.equal(h.requests.length, 2);
       assert.equal(h.requests[1].options.signal.aborted, false);
       assertWaitlistControls(h, false);
-      assertCheckoutControls(h, false);
-      if (flow === 'waitlist') {
-        assert.equal(h.waitlistStatus.dataset.state, 'success');
-        assert.equal(h.form.resetCount, 1);
-      } else {
-        assert.deepEqual(h.redirects, [`${origin}${mockCheckout}`]);
-        assert.equal(h.checkoutStatus.dataset.state, '');
-      }
+      assert.equal(h.waitlistStatus.dataset.state, 'success');
+      assert.equal(h.form.resetCount, 1);
     });
   }
 }
@@ -617,7 +473,7 @@ test('markup has unique expected IDs and a labelled native email form', () => {
   for (const id of [
     'main', 'for-your-business', 'home-services', 'braiders', 'how-it-works', 'pricing', 'faq', 'waitlist', 'waitlist-form',
     'home-services-pricing', 'braider-pricing', 'waitlist-business',
-    'waitlist-email', 'waitlist-status', 'waitlist-privacy', 'checkout-status', 'checkout-terms',
+    'waitlist-email', 'waitlist-status', 'waitlist-privacy', 'signup-terms',
   ]) byId(id);
   assert.equal(byId('main').tag, 'main');
   const form = byId('waitlist-form');
@@ -639,21 +495,20 @@ test('markup has unique expected IDs and a labelled native email form', () => {
   assert.ok(Object.hasOwn(submit[0].attrs, 'disabled'), 'Submission must wait for JS initialization');
 });
 
-test('both status messages are accessible live regions and both checkout actions are labelled', () => {
-  for (const id of ['waitlist-status', 'checkout-status']) {
-    const { attrs } = byId(id);
-    assert.equal(attrs.role, 'status');
-    assert.equal(attrs['aria-live'], 'polite');
-    assert.equal(attrs['aria-atomic'], 'true');
-  }
-  const buttons = blocks(html, 'button').filter(({ attrs }) => Object.hasOwn(attrs, 'data-checkout'));
-  assert.deepEqual(buttons.map(({ attrs }) => attrs['data-checkout']).sort(), ['annual', 'monthly']);
-  for (const button of buttons) {
-    assert.equal(button.attrs.type, 'button');
-    assert.ok(Object.hasOwn(button.attrs, 'disabled'), 'Checkout must wait for JS initialization');
-    assert.ok(text(button.content), 'Checkout must have a text label');
-    describedBy(button, 'checkout-status', 'checkout-terms');
-  }
+test('the waitlist status is a live region and pricing CTAs go to /setup or the pilot list, never a checkout', () => {
+  const { attrs } = byId('waitlist-status');
+  assert.equal(attrs.role, 'status');
+  assert.equal(attrs['aria-live'], 'polite');
+  assert.equal(attrs['aria-atomic'], 'true');
+  assert.equal(elements.filter(({ attrs: a }) => Object.hasOwn(a, 'data-checkout')).length, 0, 'No checkout buttons');
+  assert.equal(elements.filter(({ attrs: a }) => a.id === 'checkout-status').length, 0);
+  assert.doesNotMatch(readFileSync(path.join(publicDir, 'site.js'), 'utf8'), /\/api\/checkout/);
+  const homePricing = blocks(html, 'article').find(({ attrs: a }) => a.id === 'home-services-pricing');
+  const links = tags(homePricing.content, 'a').map(({ attrs: a }) => a.href);
+  assert.ok(links.includes('/setup'), 'Home Services CTA opens the setup form');
+  assert.ok(links.includes('#waitlist'), 'Secondary CTA joins the pilot list');
+  assert.equal(tags(homePricing.content, 'button').length, 0);
+  describedBy(tags(homePricing.content, 'a').find(({ attrs: a }) => a.href === '/setup'), 'signup-terms');
 });
 
 test('business select has a visible label, an empty initial choice and only supported audiences', () => {
@@ -669,7 +524,7 @@ test('business select has a visible label, an empty initial choice and only supp
   assert.ok(tags(select.content, 'option').every(({ attrs }) => !Object.hasOwn(attrs, 'selected')));
 });
 
-test('audiences have separate examples and only Home Services offers checkout', () => {
+test('audiences have separate examples and no pricing card offers a checkout', () => {
   const articles = blocks(html, 'article');
   for (const id of ['home-services', 'braiders']) {
     const audience = articles.find(({ attrs }) => attrs.id === id);
@@ -684,7 +539,7 @@ test('audiences have separate examples and only Home Services offers checkout', 
   assert.match(text(homePricing.content), /\$49/);
   assert.match(text(homePricing.content), /Per-booking fee: waived for founding shops \(pilot\)/);
   assert.doesNotMatch(text(homePricing.content), /\$12/);
-  assert.equal(tags(homePricing.content, 'button').filter(({ attrs }) => attrs['data-checkout']).length, 2);
+  assert.equal(tags(homePricing.content, 'button').length, 0);
   assert.equal(tags(braiderPricing.content, 'button').length, 0);
   assert.match(text(braiderPricing.content), /Home Services rates do not automatically apply/);
   assert.match(text(braiderPricing.content), /No card or payment/);
@@ -693,7 +548,7 @@ test('audiences have separate examples and only Home Services offers checkout', 
   assert.match(text(braiderPricing.content), /Typically \$50, set by your studio/);
   assert.match(text(braiderPricing.content), /confirmed before activation/);
   assert.match(text(braiderPricing.content), /estimate/i);
-  for (const { content } of blocks(homePricing.content, 'button')) assert.match(text(content), /Home Services/);
+  for (const { content } of blocks(homePricing.content, 'a').slice(0, 1)) assert.match(text(content), /Home Services/);
   assert.doesNotMatch(text(html), /Weekly recap|1–5 trucks/);
   assert.match(text(html), /not a live sync/);
 });
@@ -778,7 +633,9 @@ test('deferred frontend script, stylesheet, and all local asset/link targets exi
         byId(decodeURIComponent(url.hash.slice(1)));
         continue;
       }
-      const target = path.resolve(publicDir, `.${decodeURIComponent(url.pathname === '/' ? '/index.html' : url.pathname)}`);
+      // Express static serves extensionless paths with .html (e.g. /setup -> setup.html).
+      const local = url.pathname === '/' ? '/index.html' : path.extname(url.pathname) ? url.pathname : `${url.pathname}.html`;
+      const target = path.resolve(publicDir, `.${decodeURIComponent(local)}`);
       const relative = path.relative(publicDir, target);
       assert.ok(relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative),
         `Local reference must remain in public/: ${reference}`);

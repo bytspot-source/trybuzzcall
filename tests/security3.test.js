@@ -71,7 +71,7 @@ test('N1: every admin/billing POST refuses a cross-site Origin and a missing Ori
 test('N1: same-origin admin/billing POSTs still work (Origin or same-host Referer)', async (t) => {
   quiet(t);
   const o = { origin: BASE };
-  const co = await (await form('/api/checkout', { plan: 'monthly' }, o)).json();
+  const co = await (await form('/api/checkout', { plan: 'monthly' }, { ...auth, ...o })).json();
   const done = await form(`/billing/mock/checkout/${co.id}/complete`, {}, o);
   assert.equal(done.status, 200);
   const sub = (await done.json()).subscription.id;
@@ -97,10 +97,14 @@ test('N1: guard covers every registered POST under /admin, /api/billing, /billin
     assert.equal((await form(url, {}, { ...auth, origin: 'https://evil.example' })).status, 403, url);
   }
 });
-test('N1: /api/checkout honours setup_waived from an admin only when same-origin', async (t) => {
+test('N1: /api/checkout (admin-only legacy tool) honours setup_waived only when same-origin', async (t) => {
   quiet(t);
-  const evil = await (await form('/api/checkout', { plan: 'monthly', setup_waived: '1' }, { ...auth, origin: 'https://evil.example' })).json();
-  assert.equal(billing.mockSessionInfo(evil.id).setupWaived, false, 'cross-site admin waiver ignored');
+  const before = Object.keys(store.db.billing?.mock?.sessions || {}).length;
+  const evil = await form('/api/checkout', { plan: 'monthly', setup_waived: '1' }, { ...auth, origin: 'https://evil.example' });
+  assert.equal(evil.status, 410, 'cross-site admin request gets no checkout');
+  const anon = await form('/api/checkout', { plan: 'monthly', setup_waived: '1' }, { origin: BASE });
+  assert.equal(anon.status, 410, 'public checkout is retired');
+  assert.equal(Object.keys(store.db.billing?.mock?.sessions || {}).length, before, 'no checkout created');
   const same = await (await form('/api/checkout', { plan: 'monthly', setup_waived: '1' }, { ...auth, origin: BASE })).json();
   assert.equal(billing.mockSessionInfo(same.id).setupWaived, true);
 });
@@ -251,7 +255,8 @@ test('N3: daily outbound cap (OUTBOUND_MAX_PER_DAY) stops caller texts and alert
 test('N3: daily cap default is 500, 0 disables', async (t) => {
   quiet(t);
   sms.resetCap(); t.after(() => sms.resetCap());
-  withEnv(t, { OUTBOUND_MAX_PER_HOUR: '0', OUTBOUND_MAX_PER_DAY: undefined });
+  // Platform-wide caps only: per-line caps (OUTBOUND_SHOP_MAX_*) are off here and covered in sms-caps.test.js.
+  withEnv(t, { OUTBOUND_MAX_PER_HOUR: '0', OUTBOUND_MAX_PER_DAY: undefined, OUTBOUND_SHOP_MAX_PER_HOUR: '0', OUTBOUND_SHOP_MAX_PER_DAY: '0' });
   let ok = 0; for (let i = 0; i < 501; i++) if ((await sms.sendSms('+14045559' + String(i).padStart(3, '0'), 'x')).ok) ok++;
   assert.equal(ok, 500);
   sms.resetCap(); withEnv(t, { OUTBOUND_MAX_PER_DAY: '0' });

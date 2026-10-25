@@ -235,7 +235,7 @@ async function fixture(t) {
   const shops = [];
   for (const [index, name] of ['Aster fixture shop', 'Birch fixture shop'].entries()) {
     const email = `vendor-${index}@example.com`, password = makeSecret();
-    const response = await post('/admin/vendors', { admin: true, json: false, invitation: true, body: { name, email } });
+    const response = await post('/admin/vendors', { admin: true, json: false, invitation: true, body: { name, email, businessType: 'plumbing' } });
     const token = invitationCode(response);
     const shop = vendors.all().find(candidate => candidate.email === email);
     check(!!shop, 'Platform creation registered the vendor');
@@ -325,8 +325,9 @@ test('vendor isolation and verified provider routing over local HTTP', { timeout
     status(await f.request('/vendor', { cookie: `${a.cookie}; ${b.cookie}`, headers: { accept: 'application/json' } }), 401);
     // No ambient cookie jar: a prior successful request cannot authenticate this one.
     status(await f.request('/vendor/billing/status'), 303);
-    status(await f.post('/api/checkout', { body: { plan: 'monthly' } }), 401);
-    status(await f.post('/api/checkout', { admin: true, cookie: a.cookie, body: { plan: 'annual' } }), 401);
+    // Public checkout is retired (signup is /setup); with vendors enrolled even the admin legacy tool refuses.
+    status(await f.post('/api/checkout', { body: { plan: 'monthly' } }), 410);
+    status(await f.post('/api/checkout', { admin: true, cookie: a.cookie, body: { plan: 'annual' } }), 409);
     const before = f.snapshot();
     status(await f.request('/vendor/login'), 200);
     status(await f.request('/vendor/activate'), 200);
@@ -721,5 +722,116 @@ test('vendor isolation and verified provider routing over local HTTP', { timeout
     f.unchanged(before);
     check(!own.paid && !other.paid, 'GET and HEAD cannot mark either booking paid');
     assert.equal(f.messages.length, sent, 'Opening payment capabilities sends no notifications');
+  });
+  // 2026-10-25 review fixes (H1, H2, M1).
+  const settle = async (predicate, label) => {
+    for (let i = 0; i < 100 && !predicate(); i++) await new Promise(resolve => setImmediate(resolve));
+    check(predicate(), label);
+  };
+  const missedCall = async (f, To, From) => {
+    const call = { From, To, CallSid: `CA${randomBytes(16).toString('hex')}` };
+    status(await f.signed('/twilio/voice', call), 200);
+    status(await f.signed('/twilio/voice/status', { ...call, DialCallStatus: 'no-answer' }), 200);
+  };
+  const forwardAll = async f => {
+    await f.assignNumbers();
+    for (const shop of [f.a, f.b]) await f.vendors.run(shop.id, async () => {
+      f.config.apply({ ...f.store.getOverride().values, FORWARD_TO_PHONE: '+14705550199' });
+      await f.vendors.persist(f.context.current().store);
+    });
+  };
+
+  await t.test('H2: an admin-created braider vendor texts like a braider and never saves a sentence as the name', async t => {
+    const f = await fixture(t);
+    status(await f.post('/admin/vendors', { admin: true, json: false, invitation: true,
+      body: { name: 'Crown fixture braids', email: 'crown@example.com' } }), 400);
+    const created = await f.post('/admin/vendors', { admin: true, json: false, invitation: true,
+      body: { name: 'Crown fixture braids', email: 'crown@example.com', businessType: 'braiders', services: 'Knotless braids:360\nLocs retwist:150' } });
+    status(created, 200);
+    const shop = f.vendors.all().find(candidate => candidate.email === 'crown@example.com');
+    check(!!shop, 'Braider vendor registered');
+    const values = await f.vendors.run(shop.id, () => f.store.getOverride().values, { suspended: true });
+    assert.equal(values.BUSINESS_TYPE, 'braiders');
+    assert.equal(values.VERTICAL, 'braiders');
+    const token = invitationCode(created), password = f.makeSecret();
+    status(await f.post('/vendor/activate', { json: false, body: { token, password, passwordConfirm: password } }), 303);
+    const number = '+14705550160';
+    status(await f.post(`/admin/vendors/${shop.id}/phone`, { admin: true, body: { phoneNumber: number, confirm_phones: '1' } }), 200);
+    await f.vendors.run(shop.id, async () => {
+      f.config.apply({ ...f.store.getOverride().values, BUSINESS_NAME: 'Crown fixture braids', OWNER_PHONE: '+14705550193', FORWARD_TO_PHONE: '+14705550199' });
+      await f.vendors.persist(f.context.current().store);
+    });
+    await missedCall(f, number, CALLER);
+    const first = f.messages.filter(m => m.from === number && m.to === CALLER);
+    assert.equal(first.length, 1);
+    assert.match(first[0].body, /in the middle of a client's hair/);
+    assert.doesNotMatch(first[0].body, /leak|clog|water heater/i);
+    status(await f.signed('/twilio/sms', { From: CALLER, To: number, Body: 'Hi I want knotless braids' }), 200);
+    let lead = await f.vendors.run(shop.id, () => f.store.findOpenLead(CALLER));
+    assert.equal(lead.name, null, 'A request sentence is not a name');
+    assert.equal(lead.intro, 'Hi I want knotless braids');
+    const second = f.messages.filter(m => m.from === number && m.to === CALLER).at(-1);
+    assert.match(second.body, /Which style are you looking for\?/);
+    assert.match(second.body, /Knotless braids/);
+    assert.doesNotMatch(second.body, /Hi I want|leak|clog/i);
+    const other = '+14705550124';
+    await missedCall(f, number, other);
+    status(await f.signed('/twilio/sms', { From: other, To: number, Body: "Hi I want knotless braids, I'm Keisha" }), 200);
+    lead = await f.vendors.run(shop.id, () => f.store.findOpenLead(other));
+    assert.equal(lead.name, 'Keisha');
+    // The owner can change the business type from vendor settings later.
+    const cookie = await f.login({ email: 'crown@example.com', password });
+    const page = html(await f.request('/vendor/settings', { cookie }));
+    check(page.includes('name="BUSINESS_TYPE"') && page.includes('value="braiders" selected'), 'Settings show the business type');
+  });
+
+  await t.test('H1: per-shop text caps isolate vendors, alert the platform, and admins can set a vendor limit', async t => {
+    const f = await fixture(t), { a, b } = f;
+    await forwardAll(f);
+    process.env.OUTBOUND_SHOP_MAX_PER_HOUR = '2';
+    require('../src/sms').resetCap();
+    for (const caller of ['+14705550131', '+14705550132', '+14705550133']) await missedCall(f, a.number, caller);
+    const fromA = () => f.messages.filter(m => m.from === a.number && m.to !== '+14705550191');
+    assert.equal(fromA().length, 2, 'Vendor A stops at its own hourly cap');
+    await settle(() => f.store.root.db.alerts.some(x => /per-line text limit \(2\/hour\)/.test(x.body)), 'Platform admin is alerted');
+    const platform = f.store.root.db.alerts.find(x => /per-line text limit/.test(x.body));
+    check(platform.body.includes(a.name) && platform.body.includes('OUTBOUND_SHOP_MAX_PER_HOUR'), 'Platform alert names the vendor and the setting');
+    await settle(() => f.messages.some(m => m.to === '+14705550191' && /automatic texting limit/.test(m.body)), 'Vendor owner hears a plain message');
+    for (const m of f.messages.filter(m => m.to === '+14705550191')) assert.doesNotMatch(m.body, /OUTBOUND|Twilio|pumping/);
+    const aCalls = await f.vendors.run(a.id, () => f.store.db.calls);
+    assert.equal(aCalls.length, 3, 'Capped calls still appear in the vendor dashboard');
+    await missedCall(f, b.number, '+14705550134');
+    assert.equal(f.messages.filter(m => m.from === b.number && m.to === '+14705550134').length, 1, 'Vendor B still texts while A is capped');
+    status(await f.post(`/admin/vendors/${b.id}/sms-caps`, { admin: true, body: { hour: '1', day: '' } }), 409);
+    status(await f.post(`/admin/vendors/${b.id}/sms-caps`, { body: { hour: '1', day: '', confirm_caps: '1' } }), 401);
+    status(await f.post(`/admin/vendors/${b.id}/sms-caps`, { admin: true, body: { hour: '1', day: '', confirm_caps: '1' } }), 200);
+    assert.deepEqual(f.vendors.get(b.id).smsCaps, { hour: 1 });
+    await missedCall(f, b.number, '+14705550135');
+    assert.equal(f.messages.filter(m => m.from === b.number && m.to === '+14705550135').length, 0, 'Admin vendor limit applies');
+    // Platform total still sits on top of the per-shop caps.
+    process.env.OUTBOUND_SHOP_MAX_PER_HOUR = '0'; process.env.OUTBOUND_MAX_PER_HOUR = '1';
+    status(await f.post(`/admin/vendors/${b.id}/sms-caps`, { admin: true, body: { hour: '', day: '', confirm_caps: '1' } }), 200);
+    require('../src/sms').resetCap();
+    await missedCall(f, a.number, '+14705550136');
+    await missedCall(f, b.number, '+14705550137');
+    assert.equal(f.messages.filter(m => m.to === '+14705550136').length, 1);
+    assert.equal(f.messages.filter(m => m.to === '+14705550137').length, 0, 'Platform total blocks every line');
+    await settle(() => f.store.root.db.alerts.some(x => /across all lines/.test(x.body)), 'Platform-wide cap alerts the platform');
+  });
+
+  await t.test('M1: vendor sign-in limits are per account and per IP, so a few IPs cannot lock everyone out', async t => {
+    const f = await fixture(t), { a, b } = f;
+    process.env.CLIENT_IP_HEADER = 'x-test-ip';
+    const attempt = (email, password, ip) => f.post('/vendor/login', { json: false, body: { email, password }, headers: { 'x-test-ip': ip } });
+    for (let i = 0; i < 10; i++) check((await attempt(a.email, 'wrong-password-guess', '198.51.100.1')).status !== 429, 'Below the pair limit');
+    status(await attempt(a.email, a.password, '198.51.100.1'), 429);
+    status(await attempt(a.email, a.password, '198.51.100.2'), 303);
+    status(await attempt(b.email, b.password, '198.51.100.1'), 303);
+    for (const ip of ['203.0.113.1', '203.0.113.2', '203.0.113.3']) {
+      for (let i = 0; i < 30; i++) check((await attempt(`spray-${i}@example.com`, 'wrong-password-guess', ip)).status !== 429, 'Below the IP limit');
+      status(await attempt(b.email, b.password, ip), 429);
+    }
+    status(await attempt(a.email, a.password, '198.51.100.9'), 303);
+    status(await attempt(b.email, b.password, '198.51.100.9'), 303);
   });
 });

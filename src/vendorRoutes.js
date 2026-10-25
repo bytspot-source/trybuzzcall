@@ -11,15 +11,41 @@ const adminPages = require('./adminPages');
 const paymentPages = require('./paymentPages');
 const setupRules = require('./setupRules');
 const sec = require('./security');
+const trades = require('./trades');
 const root = vendors.root;
 const json = req => req.is('application/json') || /application\/json/i.test(req.get('accept') || '');
 const bool = value => /^(1|true|yes|on)$/i.test(String(value || ''));
 const plan = value => ['monthly','annual'].includes(value) ? value : null;
-const editable = ['BUSINESS_NAME','BUSINESS_CITY','BUSINESS_TZ','BUSINESS_DAYS','BUSINESS_HOURS','SERVICES','BOOKING_ENABLED',
+const editable = ['BUSINESS_NAME','BUSINESS_TYPE','BUSINESS_TRADE_LABEL','BUSINESS_FLOW','BUSINESS_CITY','BUSINESS_TZ','BUSINESS_DAYS','BUSINESS_HOURS','SERVICES','BOOKING_ENABLED',
   'DEPOSIT_ENABLED','DEPOSIT_AMOUNT','SLOT_MINUTES','HOLD_MINUTES','BOOKING_LEAD_MINUTES','BOOKING_LINK'];
+const SERVICE_RE = /^.{1,100}:\d+$/;
+const validServices = value => !value.split(',').some(s => !SERVICE_RE.test(s.trim()) || +s.split(':').at(-1) < 15 || +s.split(':').at(-1) > 720);
+// Business type from the shared trade catalog (src/trades.js). It selects the caller conversation (braider vs plumber...).
+// Returns the config values that pin the trade, so a vendor never falls back to the default plumbing texts.
+function tradeValues({ businessType, tradeName = '', flow = '' } = {}) {
+  const key = trades.keyOf(typeof businessType === 'string' ? businessType : '');
+  if (!key) throw vendors.error('Choose a business type from the list.');
+  const label = typeof tradeName === 'string' ? tradeName.trim().replace(/[\u0000-\u001F\u007F]/g, '').slice(0, 60) : '';
+  if (key === 'other' && !label) throw vendors.error('For "Other", enter the kind of business, such as "dog walker".');
+  const chosenFlow = key === 'other' ? (trades.flowOf(flow) || 'appointments') : '';
+  const t = trades.get(key, { flow: chosenFlow, label });
+  return { BUSINESS_TYPE: key, BUSINESS_FLOW: t.flow, BUSINESS_TRADE_LABEL: key === 'other' ? label : '',
+    VERTICAL: key === 'braiders' ? 'braiders' : t.flow === 'appointments' ? 'appointments' : 'home_services' };
+}
+function createValues(body) {
+  const values = tradeValues({ businessType: body.businessType, tradeName: body.tradeName, flow: body.flow });
+  const services = typeof body.services === 'string' ? body.services.trim().replace(/\s*\n\s*/g, ',').replace(/,+/g, ',').replace(/^,|,$/g, '') : '';
+  if (values.BUSINESS_FLOW === 'appointments') {
+    const t = trades.get(values.BUSINESS_TYPE, { flow: values.BUSINESS_FLOW, label: values.BUSINESS_TRADE_LABEL });
+    const chosen = services || trades.servicesString(t);
+    if (chosen.length > 2000 || !validServices(chosen)) throw vendors.error('Services must use name:minutes, with durations from 15 to 720 minutes (for example "Knotless braids:360").');
+    values.SERVICES = chosen;
+  }
+  return values;
+}
 function settingsValues() {
   const c = booking.cfg(), hm = n => `${String(Math.floor(n / 60)).padStart(2,'0')}:${String(n % 60).padStart(2,'0')}`;
-  return { BUSINESS_NAME: context.current().shop.name, BUSINESS_TZ: 'America/New_York', BUSINESS_DAYS: c.days.join(','),
+  return { BUSINESS_NAME: context.current().shop.name, BUSINESS_TYPE: c.trade, BUSINESS_TRADE_LABEL: '', BUSINESS_TZ: 'America/New_York', BUSINESS_DAYS: c.days.join(','),
     BUSINESS_HOURS: `${hm(c.open)}-${hm(c.close)}`, SLOT_MINUTES: c.slotMin, HOLD_MINUTES: c.holdMin,
     BOOKING_LEAD_MINUTES: c.leadMin, DEPOSIT_AMOUNT: c.amount, SERVICES: c.services.map(s => `${s.name}:${s.minutes}`).join(','),
     ...store.getOverride().values };
@@ -48,17 +74,25 @@ function validateSettings(body) {
     const number = Number(values[key]);
     if (!Number.isFinite(number) || number < min || number > max || key !== 'DEPOSIT_AMOUNT' && !Number.isInteger(number)) throw vendors.error(`Invalid ${key.toLowerCase().replaceAll('_',' ')}.`);
   }
-  if (values.SERVICES && values.SERVICES.split(',').some(s => !/^.{1,100}:\d+$/.test(s.trim()) || +s.split(':').at(-1) < 15 || +s.split(':').at(-1) > 720)) throw vendors.error('Services must use name:minutes, with durations from 15 to 720 minutes.');
+  if (values.SERVICES && !validServices(values.SERVICES)) throw vendors.error('Services must use name:minutes, with durations from 15 to 720 minutes.');
+  if (values.BUSINESS_TYPE !== undefined && values.BUSINESS_TYPE !== '') Object.assign(values, tradeValues({ businessType: values.BUSINESS_TYPE, tradeName: values.BUSINESS_TRADE_LABEL, flow: values.BUSINESS_FLOW }));
   if (values.BOOKING_LINK) { try { const url = new URL(values.BOOKING_LINK); if (url.protocol !== 'https:' || url.username || url.password) throw Error(); } catch { throw vendors.error('Booking links must use HTTPS without embedded credentials.'); } }
   for (const key of ['BOOKING_ENABLED','DEPOSIT_ENABLED']) if (values[key] !== undefined && !['0','1'].includes(values[key])) throw vendors.error('Booking and deposit settings must be on or off.');
   if (values.DEPOSIT_ENABLED === '1' && (values.BOOKING_ENABLED !== '1' || !(Number(values.DEPOSIT_AMOUNT) > 0))) throw vendors.error('Enable booking and set a positive deposit amount first.');
   return values;
 }
 function register(app, { requireAdmin, BASE, sameOrigin }) {
-  const attempts = sec.limiter({ windowMs: 600000, max: 30 });
-  const globalAttempts = sec.limiter({ windowMs: 600000, max: 200 });
+  // Sign-in throttles. Failures are counted per account+IP (VENDOR_LOGIN_MAX_FAILS, default 10 / 15 min), per account
+  // across all IPs (VENDOR_ACCOUNT_MAX_FAILS, default 100 / 15 min: slows distributed guessing of one account without
+  // letting a few IPs lock its owner out) and per IP (VENDOR_IP_MAX_FAILS, default 30 / 10 min). The global limit
+  // (VENDOR_GLOBAL_MAX_ATTEMPTS, default 5000 / 10 min) is only a backstop, so a few IPs cannot lock every vendor out.
+  const limit = (name, def) => Math.max(1, sec.num(process.env[name], def));
+  const pairFails = sec.limiter({ windowMs: 900000, max: limit('VENDOR_LOGIN_MAX_FAILS', 10) });
+  const accountFails = sec.limiter({ windowMs: 900000, max: limit('VENDOR_ACCOUNT_MAX_FAILS', 100) });
+  const ipFails = sec.limiter({ windowMs: 600000, max: limit('VENDOR_IP_MAX_FAILS', 30) });
+  const globalAttempts = sec.limiter({ windowMs: 600000, max: limit('VENDOR_GLOBAL_MAX_ATTEMPTS', 5000) });
   let deriving = 0;
-  app.locals.resetVendorLimits = () => { attempts.reset(); globalAttempts.reset(); };
+  app.locals.resetVendorLimits = () => { pairFails.reset(); accountFails.reset(); ipFails.reset(); globalAttempts.reset(); };
   const safe = fn => async (req,res,next) => {
     try { await fn(req,res,next); }
     catch (e) {
@@ -76,11 +110,23 @@ function register(app, { requireAdmin, BASE, sameOrigin }) {
   });
   const reply = (req,res,data,destination='/vendor#payments') => json(req) ? res.json(data) : res.redirect(303,destination);
   const show = (res,html) => res.type('html').send(html);
+  // The account key is the submitted email (login) or a hash of the activation code (activation); never logged.
+  const accountKey = req => {
+    if (req.path === '/vendor/login') return 'e:' + String(req.body?.email || '').trim().toLowerCase().slice(0, 254);
+    return 't:' + require('crypto').createHash('sha256').update(String(req.body?.token || '')).digest('hex').slice(0, 32);
+  };
+  const tooMany = res => res.status(429).set('Retry-After', '600').send('Too many attempts. Try again later.');
   const authAttempt = fn => safe(async (req,res) => {
-    const ip = sec.clientIp(req);
-    if (attempts.blocked(ip) || globalAttempts.blocked('all') || deriving >= 8) return res.status(429).send('Too many attempts. Try again later.');
-    attempts.hit(ip); globalAttempts.hit('all'); deriving++;
-    try { await fn(req,res); } finally { deriving--; }
+    const ip = sec.clientIp(req), account = accountKey(req), pair = `${account}|${ip}`;
+    if (ipFails.blocked(ip) || pairFails.blocked(pair) || accountFails.blocked(account) || globalAttempts.blocked('all') || deriving >= 8) return tooMany(res);
+    globalAttempts.hit('all'); deriving++;
+    try { await fn(req,res); }
+    catch (e) {
+      if (e && (e.status === 400 || e.status === 401)) { ipFails.hit(ip); pairFails.hit(pair); accountFails.hit(account); }
+      throw e;
+    } finally { deriving--; }
+    // A successful sign-in clears this browser's failures for the account.
+    pairFails.reset(pair);
   });
   // Cookie-based actions require the browser's actual origin, including protocol, not only a matching hostname.
   app.use('/vendor', (req,res,next) => {
@@ -105,7 +151,7 @@ function register(app, { requireAdmin, BASE, sameOrigin }) {
   app.get('/vendor', requireVendor, safe(async (req,res) => {
     show(res, adminPages.renderVendor({ businessName: config.env.BUSINESS_NAME || req.vendor.name, ownerEmail: req.vendor.email,
       shop:req.vendor, leads:store.db.leads, calls:store.db.calls || [], bookings:store.db.bookings, alerts:store.db.alerts,
-      billing:billing.summary(),connect:connect.summary(),cfg:booking.cfg(),fees:booking.leadFeeTotals(), demoAllowed:sec.demoAllowed() }));
+      billing:billing.summary(),connect:connect.summary(),cfg:booking.cfg(),fees:booking.leadFeeTotals(), demoAllowed:sec.demoAllowed(), optedOut:phone=>store.isOptedOut(phone) }));
   }));
   app.get('/vendor/settings', requireVendor, safe(async (req,res) => show(res,pages.settings({shop:req.vendor,values:settingsValues()}))));
   app.post('/vendor/settings', requireVendor, safe(async (req,res) => {
@@ -175,7 +221,7 @@ function register(app, { requireAdmin, BASE, sameOrigin }) {
       legacyBilling:billing.summary(),mode:connect.mode()}));
   }));
   app.post('/admin/vendors',requireAdmin,safe(async(req,res)=>{
-    const result = await vendors.create({name:req.body.name,email:req.body.email});
+    const result = await vendors.create({name:req.body.name,email:req.body.email,values:createValues(req.body)});
     show(res,pages.invitation(result));
   }));
   app.post('/admin/vendors/approve',requireAdmin,safe(async(req,res)=>{
@@ -191,13 +237,19 @@ function register(app, { requireAdmin, BASE, sameOrigin }) {
   app.get('/admin/vendors/:id',requireAdmin,safe(async(req,res)=>{
     const shop = vendors.get(req.params.id); if (!shop) throw vendors.error('Vendor not found',404);
     const stats = await summary(shop), child = await vendors.scopedStore(shop);
-    show(res,pages.vendorDetail({shop:{...vendors.publicShop(shop),subscriptionStatus:stats.subscriptionStatus,payoutStatus:stats.payoutStatus},stats,settings:child.getOverride().values || {}}));
+    const sms = require('./sms');
+    show(res,pages.vendorDetail({shop:{...vendors.publicShop(shop),subscriptionStatus:stats.subscriptionStatus,payoutStatus:stats.payoutStatus},stats,settings:child.getOverride().values || {},
+      smsCaps:shop.smsCaps || {},capDefaults:{hour:sms.shopMax('hour',null),day:sms.shopMax('day',null)}}));
   }));
   app.post('/admin/vendors/:id/invite',requireAdmin,safe(async(req,res)=>show(res,pages.invitation(await vendors.invite(req.params.id)))));
   app.post('/admin/vendors/:id/status',requireAdmin,safe(async(req,res)=>reply(req,res,await vendors.setStatus(req.params.id,req.body.status),`/admin/vendors/${encodeURIComponent(req.params.id)}`)));
   app.post('/admin/vendors/:id/phone',requireAdmin,safe(async(req,res)=>{
     if (!bool(req.body.confirm_phones)) throw vendors.error('Confirm the phone routing change before saving.',409);
     reply(req,res,await vendors.assignPhone(req.params.id,req.body.phoneNumber),`/admin/vendors/${encodeURIComponent(req.params.id)}`);
+  }));
+  app.post('/admin/vendors/:id/sms-caps',requireAdmin,safe(async(req,res)=>{
+    if (!bool(req.body.confirm_caps)) throw vendors.error('Confirm the texting volume change before saving.',409);
+    reply(req,res,await vendors.setSmsCaps(req.params.id,{hour:req.body.hour,day:req.body.day}),`/admin/vendors/${encodeURIComponent(req.params.id)}`);
   }));
   app.post('/admin/vendors/:id/contacts',requireAdmin,safe(async(req,res)=>{
     if (!bool(req.body.confirm_phones)) throw vendors.error('Confirm the phone routing change before saving.',409);

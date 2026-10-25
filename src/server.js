@@ -18,6 +18,7 @@ const paymentPages = require('./paymentPages');
 const crypto = require('crypto');
 const sec = require('./security');
 const vendors = require('./vendors');
+const mail = require('./email');
 const shopContext = require('./shopContext');
 
 const app = express();
@@ -384,7 +385,25 @@ app.post('/twilio/sms', verifyTwilio, routeTwilio(), async (req, res) => {
 
 const tag = (lead) => `${lead.urgent ? '🚨 URGENT ' : ''}`;
 const owner = async (leadId, msg) => { store.addAlert({ leadId, to: env.OWNER_PHONE, body: msg }); await sendSms(env.OWNER_PHONE || sec.PLACEHOLDER_PHONE, msg, { kind: 'owner' }); };
-sms.setCapAlert((max, per = 'hour') => owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: outbound text limit reached (${max}/${per}). Text-backs are paused until the ${per === 'day' ? '24-hour window' : 'hour'} resets. If this wasn't a real rush, it may be SMS pumping: check Twilio logs. Raise ${per === 'day' ? 'OUTBOUND_MAX_PER_DAY' : 'OUTBOUND_MAX_PER_HOUR'} if needed.`));
+// Outbound caps (src/sms.js). The platform administrator always hears about it (platform OWNER_PHONE, the platform
+// alert log and ADMIN_ALERT_EMAIL); a vendor whose own line hit its limit also gets a plain-language note.
+const capWindow = (per) => (per === 'day' ? '24-hour window' : 'hour');
+async function platformAlert(msg, subject) {
+  await shopContext.run(null, () => owner(null, msg));
+  mail.adminAlert(subject, msg);
+}
+sms.setCapAlert(async ({ scope, per = 'hour', max, shopId, shopName } = {}) => {
+  if (scope === 'shop' && shopId) {
+    const who = `${String(shopName || 'Vendor').slice(0, 80)} (vendor ${shopId.slice(0, 8)})`;
+    await platformAlert(`BUZZ platform: ${who} reached its per-line text limit (${max}/${per}). Its text-backs are paused until the ${capWindow(per)} resets. If this wasn't a real rush, it may be SMS pumping: check Twilio logs. Adjust the vendor's limit in /admin or OUTBOUND_SHOP_MAX_PER_${per === 'day' ? 'DAY' : 'HOUR'} if needed.`,
+      `BuzzCall: text limit reached for ${String(shopName || 'a vendor').slice(0, 60)}`);
+    await owner(null, `BuzzCall: your line reached its automatic texting limit for ${per === 'day' ? 'today' : 'this hour'}, so new missed-call texts are paused until it resets. Missed calls still show in your dashboard. BuzzCall has been notified and will follow up.`);
+    return;
+  }
+  const line = scope === 'shop' ? 'per-line' : 'platform-wide';
+  await platformAlert(`BUZZ ${env.BUSINESS_NAME || ''}: outbound text limit reached (${max}/${per}) ${line === 'per-line' ? 'on this line' : 'across all lines'}. Text-backs are paused until the ${capWindow(per)} resets. If this wasn't a real rush, it may be SMS pumping: check Twilio logs. Raise ${scope === 'shop' ? `OUTBOUND_SHOP_MAX_PER_${per === 'day' ? 'DAY' : 'HOUR'}` : per === 'day' ? 'OUTBOUND_MAX_PER_DAY' : 'OUTBOUND_MAX_PER_HOUR'} if needed.`,
+    'BuzzCall: outbound text limit reached');
+});
 
 async function onBooked(lead, b) {
   let msg;
@@ -402,8 +421,8 @@ async function onBooked(lead, b) {
   await sendSms(lead.phone, msg);
   const status = b.status === 'held' ? `slot held, deposit pending ($${b.amount}, hold expires ${new Date(b.holdExpiresAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })})`
     : b.depositSkipped ? 'BOOKED (no deposit; deposit off: Stripe not connected)' : 'BOOKED (no deposit)';
-  if (b.service) await owner(lead.id, `BUZZ ${env.BUSINESS_NAME || ''}: ${status.replace('slot held', 'time held')}: ${lead.name}, ${lead.need}, ${b.slotLabel}. tel:${lead.phone}`);
-  else await owner(lead.id, `${tag(lead)}BUZZ ${env.BUSINESS_NAME || ''}: ${status}: ${lead.name}, ${lead.need}, ${b.slotLabel}. Tap to call: tel:${lead.phone}`);
+  if (b.service) await owner(lead.id, `BUZZ ${env.BUSINESS_NAME || ''}: ${status.replace('slot held', 'time held')}: ${lead.name || 'Caller (name not given)'}, ${lead.need}, ${b.slotLabel}. tel:${lead.phone}`);
+  else await owner(lead.id, `${tag(lead)}BUZZ ${env.BUSINESS_NAME || ''}: ${status}: ${lead.name || 'Caller (name not given)'}, ${lead.need}, ${b.slotLabel}. Tap to call: tel:${lead.phone}`);
 }
 
 const money = (n) => (Number.isInteger(n) ? String(n) : Number(n).toFixed(2));
@@ -417,15 +436,15 @@ async function onPaid(id) {
   const lead = store.db.leads.find((l) => l.id === b.leadId) || { id: b.leadId, phone: b.phone, name: b.name, need: b.need };
   if (conflict) {
     await sendSms(b.phone, agent.texts.paidConflict(b));
-    await owner(b.leadId, `⚠️ PAID BUT SLOT LOST $${b.amount}: ${b.name}, ${b.need}, ${b.slotLabel} (hold expired). Reschedule/refund (lead fee on hold for review). Tap to call: tel:${b.phone}`);
+    await owner(b.leadId, `⚠️ PAID BUT SLOT LOST $${b.amount}: ${b.name || 'Caller (name not given)'}, ${b.need}, ${b.slotLabel} (hold expired). Reschedule/refund (lead fee on hold for review). Tap to call: tel:${b.phone}`);
     return b;
   }
   const msg = agent.texts.paid(b);
   if (lead.messages) { lead.messages.push({ dir: 'out', body: msg }); store.save(); }
   await sendSms(b.phone, msg);
   if (b.service) { // appointment trades: 'BOOKED + PAID: <name>, <service>, <time>, $50 deposit'
-    await owner(b.leadId, `BOOKED + PAID: ${b.name}, ${b.service}, ${b.slotLabel}, $${money(b.amount)} deposit${b.details ? `. Notes: ${b.details}` : ''}. tel:${b.phone}${refundNote(b)}`);
-  } else await owner(b.leadId, `${tag(lead)}BOOKED + PAID $${b.amount}: ${b.name}, ${b.need}, ${b.slotLabel}, ${feeNote(b)}, tel:${b.phone}${refundNote(b)}`);
+    await owner(b.leadId, `BOOKED + PAID: ${b.name || 'Caller (name not given)'}, ${b.service}, ${b.slotLabel}, $${money(b.amount)} deposit${b.details ? `. Notes: ${b.details}` : ''}. tel:${b.phone}${refundNote(b)}`);
+  } else await owner(b.leadId, `${tag(lead)}BOOKED + PAID $${b.amount}: ${b.name || 'Caller (name not given)'}, ${b.need}, ${b.slotLabel}, ${feeNote(b)}, tel:${b.phone}${refundNote(b)}`);
   return b;
 }
 
@@ -461,8 +480,8 @@ for (const [route, kind] of [['/payment/return', 'deposit'], ['/billing/return',
 
 async function buzzOwner(lead) {
   const msg = agent.isAppointments()
-    ? `BUZZ ${env.BUSINESS_NAME || ''}: ${lead.name} (${lead.phone}) wants: ${lead.need}. Call back: ${lead.window}. tel:${lead.phone}`
-    : `${lead.urgent ? '🚨 URGENT ' : ''}BUZZ ${env.BUSINESS_NAME || ''}: ${lead.name} (${lead.phone}) needs: ${lead.need}. Callback: ${lead.window}. Tap to call: tel:${lead.phone}`;
+    ? `BUZZ ${env.BUSINESS_NAME || ''}: ${lead.name || 'Caller (name not given)'} (${lead.phone}) wants: ${lead.need}. Call back: ${lead.window}. tel:${lead.phone}`
+    : `${lead.urgent ? '🚨 URGENT ' : ''}BUZZ ${env.BUSINESS_NAME || ''}: ${lead.name || 'Caller (name not given)'} (${lead.phone}) needs: ${lead.need}. Callback: ${lead.window}. Tap to call: tel:${lead.phone}`;
   store.addAlert({ leadId: lead.id, to: env.OWNER_PHONE, body: msg });
   await sendSms(env.OWNER_PHONE || sec.PLACEHOLDER_PHONE, msg, { kind: 'owner' });
 }
@@ -480,6 +499,7 @@ app.post('/api/waitlist', waitlistLimit, (req, res) => {
     return res.status(400).json({ error: 'invalid business type' });
   }
   if (!store.addWaitlist(email, businessType)) return res.status(503).json({ error: 'waitlist is full' });
+  mail.signup('waitlist', { email, businessType }); // async, never blocks or fails the form
   res.json({ ok: true });
 });
 
@@ -493,8 +513,13 @@ const apiErr = (res, e) => {
   if (status >= 500 && status !== 501) { console.error('api error:', e.message); return res.status(status).json({ error: status === 502 ? 'payment provider error' : 'server error' }); }
   return res.status(status).json({ error: e.message });
 };
+// Public self-serve checkout is retired: every new business signs up through /setup and is reviewed before activation.
+// What remains is a platform-admin tool for the retained single-shop (legacy) mode only: Basic auth + same Origin.
 app.post('/api/checkout', checkoutLimit, async (req, res) => {
-  if (vendors.all().length) return res.status(401).json({ error: 'Sign in to your vendor dashboard to choose a subscription.', next: '/vendor/login' });
+  if (!(req.headers.authorization && isAdmin(req) && originCheck(req) === 'ok')) {
+    return res.status(410).json({ error: 'Sign up through the setup form. We review every setup before activation.', next: '/setup' });
+  }
+  if (vendors.all().length) return res.status(409).json({ error: 'Vendor subscriptions are started from the vendor dashboard.', next: '/vendor/login' });
   if (!env.STRIPE_SECRET_KEY && !sec.demoAllowed()) return res.status(503).json({ error: 'checkout not available' });
   const plan = planParam(req.body.plan); if (!plan) return res.status(400).json({ error: 'plan must be monthly or annual' });
   const email = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(req.body.email || '')) ? String(req.body.email).trim() : undefined;
@@ -566,6 +591,7 @@ app.post('/setup', setupLimit, (req, res) => {
   const { confirm, ...saved } = values;
   const s = store.addSetup({ id: crypto.randomBytes(6).toString('hex'), createdAt: new Date().toISOString(), status: 'pending',
     values: saved, warningsConfirmed: warnings, consentAt: new Date().toISOString() });
+  mail.signup('setup', { email: saved.email, businessType: saved.businessType, businessName: saved.businessName }); // async
   const message = "We'll review your setup and text you within 1 business day.";
   return json ? res.json({ ok: true, id: s.id, message }) : res.type('html').send(setupPages.thanksHtml(saved));
 });
@@ -655,7 +681,7 @@ app.post('/admin/connect/mock/complete', connectMockOnly, requireAdmin, (req, re
 app.get('/admin/legacy', requireAdmin, (req, res) => {
   res.type('html').send(adminPages.render({
     businessName: env.BUSINESS_NAME || 'Your business',
-    leads: store.db.leads, bookings: store.db.bookings || [], alerts: store.db.alerts, waitlist: store.db.waitlist,
+    leads: store.db.leads, bookings: store.db.bookings || [], alerts: store.db.alerts, waitlist: store.db.waitlist, optedOut: (phone) => store.isOptedOut(phone),
     billing: billing.summary(), connect: connect.summary(), cfg: booking.cfg(), fees: booking.leadFeeTotals(),
     storage: store.status(), policy: storagePolicy(), production: sec.isProduction(), demoAllowed: sec.demoAllowed(),
     paused: Object.keys(store.db.botPaused || {}).filter(phone => store.isPaused(phone)), twilioLive: live,

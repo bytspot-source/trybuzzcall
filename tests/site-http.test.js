@@ -427,8 +427,10 @@ test('public site over real local HTTP', { timeout: 60000 }, async (t) => {
     assertResponse(signup, 200, /^application\/json$/i, 'escaped admin signup');
     assert.deepEqual(JSON.parse(signup.body), { ok: true });
     const before = await site.readStore();
-    const response = await site.request('/admin/legacy');
-    assertResponse(response, 200, /^text\/html$/i, '/admin/legacy');
+    const raw = await site.request('/admin/legacy');
+    assertResponse(raw, 200, /^text\/html$/i, '/admin/legacy');
+    // Cells carry data-label attributes for the stacked mobile layout; compare the cell text.
+    const response = { ...raw, body: raw.body.replace(/<td data-label="[^"]*"/g, '<td') };
     assert.ok(response.body.includes('<td>home_services@example.com</td><td>Home services</td>'));
     assert.ok(response.body.includes('<td>braiders@example.com</td><td>Braiders</td>'));
     assert.ok(response.body.includes('<td>other@example.com</td><td>Other local business</td>'));
@@ -439,28 +441,12 @@ test('public site over real local HTTP', { timeout: 60000 }, async (t) => {
   });
 
   for (const plan of ['monthly', 'annual']) {
-    await t.test(`${plan} checkout returns a local mock page without completing or charging`, async () => {
-      const response = await site.request('/api/checkout', { plan });
-      assertResponse(response, 200, /^application\/json$/i, `${plan} checkout`);
-      const checkout = JSON.parse(response.body);
-      assert.equal(checkout.mock, true);
-      assert.match(checkout.id, /^cs_mock_[a-f0-9]+$/);
-      const url = new URL(checkout.url);
-      assert.equal(url.origin, site.origin);
-      assert.equal(url.pathname, `/billing/mock/checkout/${checkout.id}`);
-      assert.equal(url.search + url.hash + url.username + url.password, '');
-      site.checkoutPaths.add(url.pathname);
+    await t.test(`${plan} public checkout is retired: 410 pointing to /setup, nothing stored`, async () => {
       const before = await site.readStore();
-      assert.equal(before.billing.mock.sessions[checkout.id].plan, plan);
-      assertUncompleted(before);
-      // GET the page only: never submit its /complete form.
-      const page = await site.request(url.href);
-      assertResponse(page, 200, /^text\/html$/i, `${plan} mock checkout page`);
-      assert.match(page.body, /<h1>Review your demo plan<\/h1>/);
-      assert.ok(page.body.includes(`<h2>${plan === 'annual' ? 'Annual' : 'Monthly'} plan</h2>`));
-      assert.match(page.body, /No real money moves/);
-      assert.doesNotMatch(page.body, /4242 4242/);
-      assert.deepEqual(await site.readStore(), before, 'Viewing checkout must not complete it or charge');
+      const response = await site.request('/api/checkout', { plan });
+      assertResponse(response, 410, /^application\/json$/i, `${plan} checkout`);
+      assert.equal(JSON.parse(response.body).next, '/setup');
+      assert.deepEqual(await site.readStore(), before, 'A retired checkout must not create a session');
     });
   }
 });

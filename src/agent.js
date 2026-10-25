@@ -22,18 +22,18 @@ const plural = (w) => (/s$/.test(w) ? w : `${w}s`);
 // Text templates by flow, worded from the trade catalog (trades.js). Braiders, plumbing and HVAC read exactly as before.
 const APPOINTMENTS = {
   first: () => `Hi, this is ${biz()}! Sorry ${solo() ? 'I' : 'we'} missed your call - ${trade().busy}. ${solo() ? 'I' : 'We'} can get you booked by text. What's your name? ${COMPLIANCE}`,
-  need: (n) => `Nice to meet you, ${n}! ${trade().ask}\n${serviceMenu()}\nReply with the number.${trade().notes ? ` ${trade().notes}` : ''}`,
+  need: (n) => `${n ? `Nice to meet you, ${n}!` : 'Thanks!'} ${trade().ask}\n${serviceMenu()}\nReply with the number.${trade().notes ? ` ${trade().notes}` : ''}`,
   day: (svc) => `Got it - ${svc}. What day works best for ${trade().dayWho || 'you'}? (e.g. "Saturday", "10/24", or "soonest")`,
   window: () => `No problem. When's a good time for ${solo() ? 'me' : 'us'} to call you back (e.g. "tonight after 7", "tomorrow morning")?`,
-  done: (n, w) => `Thanks ${n}! ${solo() ? "I'll" : "We'll"} call you back ${w}.${linkLine()}`,
+  done: (n, w) => `Thanks${hey(n)}! ${solo() ? "I'll" : "We'll"} call you back ${w}.${linkLine()}`,
 };
 const JOBS = {
   first: () => `Hi, this is ${biz()}. Sorry we missed your call!${trade().busy ? ` ${trade().busy}.` : ''} What's your name? ${COMPLIANCE}`,
-  need: (n) => `Thanks ${n}! ${trade().need}`,
+  need: (n) => `Thanks${hey(n)}! ${trade().need}`,
   window: () => `Got it. ${trade().windowQ || 'When\'s a good time for a callback (e.g. "now", "after 3pm")?'}`,
   done: (n, w) => {
     const who = trade().doneWho && trade().doneWho !== 'we' ? `${trade().doneWho} will` : "we'll";
-    return `Thanks ${n}, ${who} call you back ${w}.${trade().doneTail ? ` ${trade().doneTail}` : ''}`;
+    return `Thanks${hey(n)}, ${who} call you back ${w}.${trade().doneTail ? ` ${trade().doneTail}` : ''}`;
   },
 };
 const templates = () => (isAppointments() ? APPOINTMENTS : JOBS);
@@ -140,12 +140,33 @@ async function polish(fallback, context) {
   } catch { return fallback; }
 }
 
+// First reply -> caller's name, or null when the text is a request rather than a name ("Hi I want knotless braids").
+// Explicit forms win anywhere in the text ("..., I'm Keisha"); otherwise a short, name-like reply is used as is.
+const NOT_NAME = /^(a|an|the|not|just|here|there|looking|wanting|interested|calling|trying|wondering|asking|good|fine|ok|okay|ready|available|free|busy|new|returning|booking|hoping|in|on|at|so|very|still|also|going|gonna|about|sorry|texting|from|with|your|you|yes|no|yeah|nope|hi|hey|hello|thanks|thank)$/i;
+const REQUEST_WORDS = /\b(want|wanna|need|needs|looking|book|booking|appointment|appt|schedule|price|prices|cost|how|what|when|where|why|can|could|would|do|does|is|are|available|availability|today|tomorrow|help|leak|clog|braids?|cut|nails?|lash(es)?|quote|service|services|please|pls|asap|fix|broken|repair|call|text|my|i|you|your)\b|[?\d@]/i;
+function extractName(text) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  const word = "[A-Za-z\u00C0-\u024F][A-Za-z\u00C0-\u024F'\u2019-]{0,30}";
+  const explicit = t.match(new RegExp(`\\b(?:my name is|my name'?s|name'?s|name is|this is|it'?s|i'?m|im|i am|call me|me llamo|soy)\\s+(${word})(?:\\s+(${word}))?`, 'i'));
+  if (explicit && !NOT_NAME.test(explicit[1])) {
+    const second = explicit[2] && /^[A-Z\u00C0-\u00DE]/.test(explicit[2]) && !NOT_NAME.test(explicit[2]) ? ` ${explicit[2]}` : '';
+    return (explicit[1] + second).slice(0, 60);
+  }
+  const rest = t.replace(/^((hi|hey|hello|hola|yes|yeah|yep|ok|okay|sure)\b[\s,!.:-]*)+/i, '').split(/[,.!;]/)[0].trim();
+  const words = rest.split(' ').filter(Boolean);
+  if (!rest || words.length > 3 || REQUEST_WORDS.test(rest) || words.some((w) => !new RegExp(`^${word}$`).test(w) || NOT_NAME.test(w))) return null;
+  return rest.slice(0, 60);
+}
+const hey = (n) => (n ? ` ${n}` : '');
+
 // Returns { reply, completed, booking? }
 async function handleReply(lead, text) {
   const t = templates();
   const clean = text.trim().slice(0, 300);
   if (lead.step === 'name') {
-    lead.name = clean.replace(/^((hi|hey|hello|yes|yeah|this is|it'?s|i'?m|im|my name is|name'?s)\b[\s,!.:-]*)+/i, '').split(/[,.!]/)[0].trim() || clean;
+    const name = extractName(clean);
+    lead.name = name;
+    if (!name) lead.intro = clean; // a request, not a name: keep it for the owner, never show it as the caller's name
     lead.step = 'need';
     return { reply: await polish(t.need(lead.name), clean) };
   }
@@ -205,21 +226,21 @@ const I = () => (solo() ? "I'm" : "We're"), Ill = () => (solo() ? "I'll" : "We'l
 const onTheWay = () => `${env.BUSINESS_NAME || 'We'} will text ${trade().onTheWay || 'when the tech is on the way'}.`;
 const texts = {
   held: (name, b, holdMin, url) => isAppointments()
-    ? `Thanks ${name}! ${I()} holding ${b.service ? b.service + ', ' : ''}${b.slotLabel} for you for ${holdMin} min. A $${b.amount} deposit (goes toward your service) locks it in: ${url}`
-    : `Thanks ${name}! We're holding ${b.slotLabel} for you for ${holdMin} min. A $${b.amount} deposit (applied to your bill) confirms it: ${url}`,
+    ? `Thanks${hey(name)}! ${I()} holding ${b.service ? b.service + ', ' : ''}${b.slotLabel} for you for ${holdMin} min. A $${b.amount} deposit (goes toward your service) locks it in: ${url}`
+    : `Thanks${hey(name)}! We're holding ${b.slotLabel} for you for ${holdMin} min. A $${b.amount} deposit (applied to your bill) confirms it: ${url}`,
   heldNoLink: (name, b) => isAppointments()
-    ? `Thanks ${name}! ${I()} holding ${b.slotLabel} for you. ${Ill()} text you a deposit link shortly to lock it in.`
-    : `Thanks ${name}! We're holding ${b.slotLabel} for you. We'll text you a deposit link shortly to confirm.`,
+    ? `Thanks${hey(name)}! ${I()} holding ${b.slotLabel} for you. ${Ill()} text you a deposit link shortly to lock it in.`
+    : `Thanks${hey(name)}! We're holding ${b.slotLabel} for you. We'll text you a deposit link shortly to confirm.`,
   bookedNoDeposit: (name, b) => isAppointments()
-    ? `You're booked, ${name}: ${b.service ? b.service + ', ' : ''}${b.slotLabel}. See you then!`
-    : `You're booked, ${name}: ${b.slotLabel}. ${onTheWay()}`,
+    ? `You're booked${name ? `, ${name}` : ''}: ${b.service ? b.service + ', ' : ''}${b.slotLabel}. See you then!`
+    : `You're booked${name ? `, ${name}` : ''}: ${b.slotLabel}. ${onTheWay()}`,
   paid: (b) => isAppointments()
-    ? `Deposit received - you're booked, ${b.name}! ${b.service ? b.service + ', ' : ''}${b.slotLabel}. Your $${b.amount} goes toward your service. See you then!`
-    : `Deposit received - you're confirmed for ${b.slotLabel}, ${b.name}! ${onTheWay()}`,
+    ? `Deposit received - you're booked${b.name ? `, ${b.name}` : ''}! ${b.service ? b.service + ', ' : ''}${b.slotLabel}. Your $${b.amount} goes toward your service. See you then!`
+    : `Deposit received - you're confirmed for ${b.slotLabel}${b.name ? `, ${b.name}` : ''}! ${onTheWay()}`,
   paidConflict: (b) => isAppointments()
-    ? `Thanks ${b.name}, ${solo() ? 'I' : 'we'} got your deposit, but your hold on ${b.slotLabel} had run out and that time was taken. ${Ill()} reach out to find you a new time.`
-    : `Thanks ${b.name}, we got your deposit but your hold on ${b.slotLabel} had expired and the slot was taken. We'll call you to reschedule.`,
+    ? `Thanks${hey(b.name)}, ${solo() ? 'I' : 'we'} got your deposit, but your hold on ${b.slotLabel} had run out and that time was taken. ${Ill()} reach out to find you a new time.`
+    : `Thanks${hey(b.name)}, we got your deposit but your hold on ${b.slotLabel} had expired and the slot was taken. We'll call you to reschedule.`,
 };
 
 const firstMessage = () => templates().first();
-module.exports = { safeAiText, polish, handleReply, firstMessage, texts, isBraiders, isAppointments, solo, trade, systemPrompt, isUrgent, parseDay, pickService };
+module.exports = { extractName, safeAiText, polish, handleReply, firstMessage, texts, isBraiders, isAppointments, solo, trade, systemPrompt, isUrgent, parseDay, pickService };
