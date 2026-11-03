@@ -4,7 +4,8 @@
 // -> start time or callback.
 // OpenAI phrasing if key set, else templates. Shop config reads go through config.env (override > env).
 const env = require('./config').env;
-const biz = () => env.BUSINESS_NAME || 'our team';
+// Never a generic fallback: with no real shop name, sms.js blocks every caller text and alerts the admin (src/consent.js).
+const biz = () => require('./consent').shopName();
 const city = () => (env.BUSINESS_CITY || '').trim();
 const inCity = () => (city() ? ` in ${city()}` : '');
 const booking = require('./booking');
@@ -223,7 +224,7 @@ async function handleReply(lead, text) {
 // Booking/deposit texts (sent by server.js). Appointment trades get "I'm holding" (solo) wording; jobs keep the original
 // home-services text, with the trade's "on the way" phrase (tech / crew / electrician ...).
 const I = () => (solo() ? "I'm" : "We're"), Ill = () => (solo() ? "I'll" : "We'll");
-const onTheWay = () => `${env.BUSINESS_NAME || 'We'} will text ${trade().onTheWay || 'when the tech is on the way'}.`;
+const onTheWay = () => `${biz() || 'We'} will text ${trade().onTheWay || 'when the tech is on the way'}.`;
 const texts = {
   held: (name, b, holdMin, url) => isAppointments()
     ? `Thanks${hey(name)}! ${I()} holding ${b.service ? b.service + ', ' : ''}${b.slotLabel} for you for ${holdMin} min. A $${b.amount} deposit (goes toward your service) locks it in: ${url}`

@@ -15,6 +15,7 @@ const store = require('./store');
 const { maskPhone, isProduction, PLACEHOLDER_PHONE, limiter, num, on } = require('./security');
 const shopContext = require('./shopContext');
 const env = require('./config').env;
+const { shopName } = require('./consent');
 const { TWILIO_ACCOUNT_SID: sid, TWILIO_AUTH_TOKEN: tok } = process.env;
 let client = sid && tok ? require('twilio')(sid, tok) : null;
 let injectedClient = false;
@@ -63,6 +64,11 @@ function capCheck(shop) {
   return null;
 }
 let onCap = async () => {};
+// No caller-facing text without a real shop name (A2P: every message identifies the business). Blocked sends alert the
+// platform administrator (server.js sets the hook), at most once per shop per hour.
+let onNoName = async () => {};
+const setNoNameAlert = (fn) => { onNoName = fn || (async () => {}); };
+const noNameAlerted = new Map();
 const setCapAlert = (fn) => { onCap = fn || (async () => {}); };
 let warnedPlaceholder = false;
 
@@ -93,6 +99,16 @@ async function sendSms(to, body, opts = {}) {
     if (to === PLACEHOLDER_PHONE && isProduction()) {
       if (!warnedPlaceholder) { console.error(`[security] OWNER_PHONE is not set (placeholder ${PLACEHOLDER_PHONE}): owner alerts are NOT being sent. Set OWNER_PHONE.`); warnedPlaceholder = true; }
       return { ok: false, skipped: 'placeholder_owner' };
+    }
+    if (kind === 'caller' && !shopName()) {
+      const id = context ? context.id : 'legacy';
+      console.error(`[sms] blocked caller text to ${maskPhone(to)}: the shop has no business name${context ? ` (vendor ${id.slice(0, 8)})` : ''}`);
+      if (Date.now() - (noNameAlerted.get(id) || 0) > 3600000) {
+        noNameAlerted.set(id, Date.now());
+        const info = { shopId: context ? context.id : null };
+        Promise.resolve().then(() => onNoName(info)).catch((e) => console.error('no-name alert failed:', e.message));
+      }
+      return { ok: false, skipped: 'no_shop_name' };
     }
     if (!opts.force && actualStore.isOptedOut(to)) { console.log(`[sms] skipped ${maskPhone(to)}: opted out`); return { ok: false, skipped: 'opted_out' }; }
     if (kind === 'caller' && !opts.force && actualStore.isPaused && actualStore.isPaused(to)) { console.log(`[sms] skipped ${maskPhone(to)}: automated texts paused (possible opt-out)`); return { ok: false, skipped: 'paused' }; }
@@ -127,5 +143,5 @@ async function sendSms(to, body, opts = {}) {
 }
 // Tests inject a fake Twilio client (never hits the network).
 const setClient = (c) => { client = c; injectedClient = !!c; };
-const resetCap = () => { for (const c of Object.values(CAPS)) { c.lim = null; c.key = null; c.alerted = 0; } shopLimits.clear(); };
-module.exports = { sendSms, live: !!client, setClient, setCapAlert, resetCap, shopMax, OPTED_OUT_CODES };
+const resetCap = () => { for (const c of Object.values(CAPS)) { c.lim = null; c.key = null; c.alerted = 0; } shopLimits.clear(); noNameAlerted.clear(); };
+module.exports = { sendSms, live: !!client, setClient, setCapAlert, setNoNameAlert, resetCap, shopMax, OPTED_OUT_CODES };

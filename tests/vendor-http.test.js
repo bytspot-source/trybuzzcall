@@ -517,10 +517,24 @@ test('vendor isolation and verified provider routing over local HTTP', { timeout
     const voices = await Promise.all(calls.map(body => f.signed('/twilio/voice', body)));
     for (const response of voices) { status(response, 200); check(response.body.includes('/twilio/voice/status'), 'Voice installs a signed callback destination'); }
     assert.equal(f.messages.length, 0, 'Forwarding does not text before a missed-call result');
-    f.barrier(2);
     const callbacks = await Promise.all(calls.map(body => f.signed('/twilio/voice/status', { ...body, DialCallStatus: 'no-answer' })));
-    for (const response of callbacks) status(response, 200);
+    for (const response of callbacks) {
+      status(response, 200);
+      check(/<Gather [^>]*numDigits="1"[^>]*action="[^"]*\/twilio\/voice\/consent"/.test(response.body), 'Missed call plays the one-digit consent prompt');
+      check(response.body.includes('Press 1 and we&apos;ll text you at this number'), 'Prompt carries the opt-in script');
+    }
+    assert.equal(f.messages.length, 0, 'No text before the caller presses 1');
+    f.barrier(2);
+    const consents = await Promise.all(calls.map(body => f.signed('/twilio/voice/consent', { ...body, Digits: '1' })));
+    for (const response of consents) status(response, 200);
     assert.equal(f.messages.length, 2, 'One initial caller text per shop');
+    for (const [i, shop] of [a, b].entries()) {
+      const log = await f.vendors.run(shop.id, () => f.store.db.voiceConsents || []);
+      check(log.length === 1 && log[0].callSid === calls[i].CallSid && log[0].from === CALLER && log[0].shopId === shop.id && log[0].digits === '1' && log[0].consented === true,
+        'Consent is logged in the receiving shop with time, CallSid, From, shop id and digits');
+      check(Number.isFinite(Date.parse(log[0].at)) && log[0].prompt.includes('Press 1'), 'Consent record keeps the time and the script played');
+    }
+    check(!(f.store.root.db.voiceConsents || []).length, 'Vendor consent is never logged in root');
     const leads = [];
     for (const shop of [a, b]) {
       const lead = await f.vendors.run(shop.id, () => f.store.findOpenLead(CALLER));
@@ -543,8 +557,10 @@ test('vendor isolation and verified provider routing over local HTTP', { timeout
     }
     status(await f.signed('/twilio/voice/status', { ...calls[0], CallSid: `CA${randomBytes(16).toString('hex')}`, DialCallStatus: 'no-answer' }), 200);
     status(await f.signed('/twilio/voice/status', { ...calls[0], From: '+14705550124', DialCallStatus: 'no-answer' }), 200);
+    status(await f.signed('/twilio/voice/consent', { ...calls[0], CallSid: `CA${randomBytes(16).toString('hex')}`, Digits: '1' }), 200);
+    status(await f.signed('/twilio/voice/consent', { ...calls[0], From: '+14705550124', Digits: '1' }), 200);
     for (const [target, body] of [['/twilio/voice', calls[0]], ['/twilio/sms', { From: CALLER, To: a.number, Body: 'STOP' }],
-      ['/twilio/voice/status', { ...calls[0], DialCallStatus: 'no-answer' }]]) status(await f.signed(target, body, true), 403);
+      ['/twilio/voice/status', { ...calls[0], DialCallStatus: 'no-answer' }], ['/twilio/voice/consent', { ...calls[0], Digits: '1' }]]) status(await f.signed(target, body, true), 403);
     f.unchanged(before);
     assert.equal(f.messages.length, sentBefore, 'Unassigned, unknown or forged callbacks cannot send messages');
     const bBefore = await f.shopSnapshot(b);
@@ -558,6 +574,7 @@ test('vendor isolation and verified provider routing over local HTTP', { timeout
       const next = {...body,CallSid:`CA${randomBytes(16).toString('hex')}`};
       status(await f.signed('/twilio/voice',next),200);
       status(await f.signed('/twilio/voice/status', { ...next, DialCallStatus: 'busy' }), 200);
+      status(await f.signed('/twilio/voice/consent', { ...next, Digits: '1' }), 200);
     }
     const newTexts = f.messages.filter(message => message.to === CALLER).slice(callerTexts);
     check(newTexts.length === 1 && newTexts[0].from === b.number, 'Only the shop without STOP may send another text');
@@ -732,6 +749,7 @@ test('vendor isolation and verified provider routing over local HTTP', { timeout
     const call = { From, To, CallSid: `CA${randomBytes(16).toString('hex')}` };
     status(await f.signed('/twilio/voice', call), 200);
     status(await f.signed('/twilio/voice/status', { ...call, DialCallStatus: 'no-answer' }), 200);
+    status(await f.signed('/twilio/voice/consent', { ...call, Digits: '1' }), 200); // caller presses 1
   };
   const forwardAll = async f => {
     await f.assignNumbers();

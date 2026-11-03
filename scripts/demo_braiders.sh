@@ -32,7 +32,7 @@ H=$(curl -s "$BASE/health"); echo "health: $H"
 echo "$H" | grep -q '"vertical":"braiders"' || { echo "Server at $BASE is not VERTICAL=braiders. Stop it or set PORT/BASE to a braider server."; exit 1; }
 
 echo; echo "== A. BOOKING PATH ($CALLER)"
-echo "-- 1. Missed call (no-answer)"; post $CALLER /twilio/voice/status --data-urlencode "DialCallStatus=no-answer"
+echo "-- 1. Missed call (no-answer)"; post $CALLER /twilio/voice/status --data-urlencode "DialCallStatus=no-answer"; post $CALLER /twilio/voice/consent --data-urlencode "Digits=1"
 sleep 0.3; echo "-- 2. Client: name";  post $CALLER /twilio/sms --data-urlencode "Body=Hey this is Tasha"
 sleep 0.3; echo "-- 3. Client: style + size/length"; post $CALLER /twilio/sms --data-urlencode "Body=1, medium, mid-back"
 sleep 0.3; echo "-- 4. Client: preferred day"; post $CALLER /twilio/sms --data-urlencode "Body=Saturday"
@@ -43,7 +43,7 @@ if [ -n "$URL" ]; then echo "-- 6. Client pays mock deposit: $URL"; curl -s "$UR
 else echo "-- 6. (no mock deposit link: deposit/booking disabled or Stripe live)"; fi
 
 echo; echo "== B. CALLBACK PATH ($CALLER2) - same Saturday; the 6-hr knotless booking above blocks overlapping starts"
-post $CALLER2 /twilio/voice/status --data-urlencode "DialCallStatus=no-answer"
+post $CALLER2 /twilio/voice/status --data-urlencode "DialCallStatus=no-answer"; post $CALLER2 /twilio/voice/consent --data-urlencode "Digits=1"
 sleep 0.3; post $CALLER2 /twilio/sms --data-urlencode "Body=Keisha"
 sleep 0.3; post $CALLER2 /twilio/sms --data-urlencode "Body=locs retwist"
 sleep 0.3; post $CALLER2 /twilio/sms --data-urlencode "Body=saturday"

@@ -37,7 +37,8 @@ test.after(() => { server.close(); fs.rmSync(dir, { recursive: true, force: true
 const auth = { authorization: 'Basic ' + Buffer.from(`admin:${ADMIN}`).toString('base64') };
 const req = (p, opts = {}) => fetch(BASE + p, { redirect: 'manual', ...opts, headers: { ...(opts.headers || {}) } });
 const form = (p, fields, headers = {}) => req(p, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers }, body: new URLSearchParams(fields).toString() });
-const call = (from) => form('/twilio/voice/status', { From: from, DialCallStatus: 'no-answer' });
+// A missed call texts only after the caller presses 1 at the voice consent prompt (src/consent.js).
+const call = async (from) => { await form('/twilio/voice/status', { From: from, DialCallStatus: 'no-answer' }); return form('/twilio/voice/consent', { From: from, Digits: '1' }); };
 const text = (from, Body) => form('/twilio/sms', { From: from, Body });
 const smsLog = () => { try { return fs.readFileSync(path.join(dir, 'sms.log'), 'utf8'); } catch { return ''; } };
 const sentTo = (p) => smsLog().split('\n').filter((l) => l.includes(`SMS -> ${p}:`));
@@ -289,13 +290,23 @@ test('N5: exact Twilio keywords -> optout (Twilio confirms); every other variant
   assert.equal(optout.classify('ｓｔａｒｔ'), 'optin');
   assert.equal(optout.classify('don’t text me'), 'revoke', 'smart apostrophe');
 });
-test('N5: exact STOP -> no app confirmation; each variant -> exactly one confirmation, then silence', async (t) => {
+test('N5: exact STOP -> one shop-named app confirmation, once (none with KEYWORD_REPLIES=twilio); each variant -> exactly one confirmation, then silence', async (t) => {
   quiet(t);
   const p = num(); await call(p);
   const base = sentTo(p).length;
   await text(p, 'STOP');
   assert.equal(store.isOptedOut(p), true);
-  assert.equal(sentTo(p).length, base, 'Twilio sends the STOP confirmation, not us');
+  assert.equal(sentTo(p).length, base + 1, 'the app confirms the exact STOP keyword, naming the shop');
+  assert.match(sentTo(p).at(-1), /Test Plumbing: You're unsubscribed/);
+  await text(p, 'STOP'); await call(p);
+  assert.equal(sentTo(p).length, base + 1, 'a repeated exact STOP is not confirmed again');
+  withEnv(t, { KEYWORD_REPLIES: 'twilio' });
+  const tw = num(); await call(tw);
+  const tb = sentTo(tw).length;
+  await text(tw, 'STOP');
+  assert.equal(store.isOptedOut(tw), true);
+  assert.equal(sentTo(tw).length, tb, 'KEYWORD_REPLIES=twilio: Twilio Advanced Opt-Out sends the STOP confirmation, not us');
+  delete process.env.KEYWORD_REPLIES;
   for (const v of ['S T O P', 'STOP 2', '❌STOP❌', 'ＳＴＯＰ', 'opt out', 'stop.', 'please stop texting me']) {
     const q = num(); await call(q);
     const b = sentTo(q).length;

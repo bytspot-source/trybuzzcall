@@ -32,7 +32,8 @@ test.after(() => { server.close(); fs.rmSync(dir, { recursive: true, force: true
 const auth = { authorization: 'Basic ' + Buffer.from(`admin:${ADMIN}`).toString('base64') };
 const req = (p, opts = {}) => fetch(BASE + p, { redirect: 'manual', ...opts, headers: { ...(opts.headers || {}) } });
 const form = (p, fields, headers = {}) => req(p, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers }, body: new URLSearchParams(fields).toString() });
-const call = (from) => form('/twilio/voice/status', { From: from, DialCallStatus: 'no-answer' });
+// A missed call texts only after the caller presses 1 at the voice consent prompt (src/consent.js).
+const call = async (from) => { await form('/twilio/voice/status', { From: from, DialCallStatus: 'no-answer' }); return form('/twilio/voice/consent', { From: from, Digits: '1' }); };
 const text = (from, Body) => form('/twilio/sms', { From: from, Body });
 const smsLog = () => { try { return fs.readFileSync(path.join(dir, 'sms.log'), 'utf8'); } catch { return ''; } };
 const sentTo = (p) => smsLog().split('\n').filter((l) => l.includes(`SMS -> ${p}:`));

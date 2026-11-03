@@ -36,7 +36,8 @@ const basic = (u, p) => ({ authorization: 'Basic ' + Buffer.from(`${u}:${p}`).to
 const auth = basic('admin', ADMIN);
 const req = (p, opts = {}) => fetch(BASE + p, { redirect: 'manual', ...opts, headers: { ...(opts.headers || {}) } });
 const form = (p, fields, headers = {}) => req(p, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers }, body: new URLSearchParams(fields).toString() });
-const call = (from) => form('/twilio/voice/status', { From: from, DialCallStatus: 'no-answer' });
+// A missed call texts only after the caller presses 1 at the voice consent prompt (src/consent.js).
+const call = async (from) => { await form('/twilio/voice/status', { From: from, DialCallStatus: 'no-answer' }); return form('/twilio/voice/consent', { From: from, Digits: '1' }); };
 const text = (from, Body) => form('/twilio/sms', { From: from, Body });
 const smsLog = () => { try { return fs.readFileSync(path.join(dir, 'sms.log'), 'utf8'); } catch { return ''; } };
 const sentTo = (p) => smsLog().split('\n').filter((l) => l.includes(`SMS -> ${p}:`));
@@ -63,15 +64,18 @@ Module._load = function (r, ...a) { return r === 'twilio' ? fake : orig.call(thi
   const port = await freePort();
   const child = spawn(process.execPath, ['-r', preload, path.resolve(__dirname, '../src/server.js')], { cwd: d, stdio: ['ignore', 'pipe', 'pipe'],
     env: { PATH: process.env.PATH, NODE_ENV: 'test', PORT: String(port), DATA_DIR: d, PUBLIC_BASE_URL: `http://127.0.0.1:${port}`, ADMIN_PASSWORD: 'x'.repeat(20),
-      TWILIO_ACCOUNT_SID: 'AC' + '0'.repeat(32), TWILIO_AUTH_TOKEN: 'f'.repeat(32), TWILIO_PHONE_NUMBER: '+15005550006', OWNER_PHONE: '+15550000000', DOTENV_CONFIG_PATH: '/nonexistent' } });
+      TWILIO_ACCOUNT_SID: 'AC' + '0'.repeat(32), TWILIO_AUTH_TOKEN: 'f'.repeat(32), TWILIO_PHONE_NUMBER: '+15005550006', OWNER_PHONE: '+15550000000', BUSINESS_NAME: 'Crash Test Plumbing', DOTENV_CONFIG_PATH: '/nonexistent' } });
   let out = ''; child.stdout.on('data', (c) => { out += c; }); child.stderr.on('data', (c) => { out += c; });
   t.after(() => { child.kill('SIGKILL'); fs.rmSync(d, { recursive: true, force: true }); });
   await new Promise((r, j) => { const tm = setTimeout(() => j(new Error('boot timeout: ' + out)), 4000); const i = setInterval(() => { if (out.includes(`on :${port}`)) { clearTimeout(tm); clearInterval(i); r(); } }, 20); });
   const B = `http://127.0.0.1:${port}`;
   const post = (p, f) => fetch(B + p, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(f).toString() });
-  const r1 = await post('/twilio/voice', { From: '+14045550123' });
+  const r0 = await post('/twilio/voice', { From: '+14045550123' });
+  assert.equal(r0.status, 200);
+  assert.match(await r0.text(), /<Gather /, 'missed call plays the consent prompt first');
+  const r1 = await post('/twilio/voice/consent', { From: '+14045550123', Digits: '1' });
   assert.equal(r1.status, 200);
-  assert.match(await r1.text(), /Please try again later/, 'caller is not told "we texted you" when the text failed');
+  assert.match(await r1.text(), /Please try calling again later/, 'caller is not told "we texted you" when the text failed');
   await new Promise((r) => setTimeout(r, 300));
   assert.equal(child.exitCode, null, 'process still alive:\n' + out);
   assert.equal((await fetch(B + '/health')).status, 200);
@@ -129,8 +133,11 @@ test('opt-out keywords (Twilio list, any case) stop all texts; START/UNSTOP resu
     const r = await text(p, kw);
     assert.match(await r.text(), /<Response><\/Response>/);
     assert.equal(store.isOptedOut(p), true, kw);
+    const after = sentTo(p);
+    assert.equal(after.length, before + 1, `${kw}: exactly one confirmation`);
+    assert.match(after.at(-1), /Test Plumbing: You're unsubscribed/, `${kw}: the confirmation names the shop`);
     await call(p); await text(p, 'Dana');
-    assert.equal(sentTo(p).length, before, `${kw}: nothing sent after opting out`);
+    assert.equal(sentTo(p).length, before + 1, `${kw}: nothing sent after opting out`);
   }
   const p = num();
   await text(p, 'STOP');
@@ -149,7 +156,7 @@ test('YES from a subscribed caller is a normal reply; HELP gets a help text, eve
   const h = num();
   await text(h, 'STOP'); await text(h, 'help');
   const lines = sentTo(h);
-  assert.equal(lines.length, 1); assert.match(lines[0], /Reply STOP to opt out/);
+  assert.equal(lines.length, 2); assert.match(lines[1], /Test Plumbing missed-call text-back via BuzzCall\. .*Reply STOP to opt out\./);
 });
 test('plain-language revocation: one confirmation, opted out, owner told; nothing after that', async (t) => {
   quiet(t);

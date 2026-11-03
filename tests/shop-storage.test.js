@@ -212,6 +212,8 @@ test('shared SPILL_DIR writes/replays only the matching namespace, even during P
 test('parallel SMS operations use assigned senders, scoped logs and scoped provider opt-outs', async (t) => {
   const a = makeShop(t, 'sms-a'), b = makeShop(t, 'sms-b'), unassigned = makeShop(t, 'sms-none');
   b.shop.phoneNumber = '+15550001002'; unassigned.shop.phoneNumber = null;
+  // Caller texts need a real shop name (src/consent.js).
+  for (const c of [a, b, unassigned]) c.store.setOverride({ values: { BUSINESS_NAME: `Shop ${c.id}` } });
   const calls = [], phone = '+15550004001';
   const rootLog = path.join(store.root.dataDir(), 'sms.log');
   const rootBefore = fs.existsSync(rootLog) ? fs.readFileSync(rootLog, 'utf8') : null;
@@ -242,7 +244,9 @@ test('parallel SMS operations use assigned senders, scoped logs and scoped provi
   await context.run(a, () => sms.sendSms('+15550004002', 'New assigned line'));
   assert.equal(calls.at(-1).from, '+15550001003');
   assert.equal(fs.existsSync(rootLog) ? fs.readFileSync(rootLog, 'utf8') : null, rootBefore);
-  // Preserve the existing setClient test seam even with no legacy sender env.
+  // Preserve the existing setClient test seam even with no legacy sender env (a named legacy shop).
+  assert.equal((await sms.sendSms('+15550004003', 'Root without a name')).skipped, 'no_shop_name', 'no caller text without a shop name');
+  envFor(t, { BUSINESS_NAME: 'Root fixture shop' });
   assert.equal((await sms.sendSms('+15550004003', 'Root fake-client message')).ok, true);
   assert.match(fs.readFileSync(rootLog, 'utf8'), /Root fake-client message/);
   assert.doesNotMatch(log(a), /Root fake-client message/);

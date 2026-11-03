@@ -19,6 +19,9 @@ Node 20 + Express. Leads are stored in a JSON file (`data/db.json`), with no nat
 Caller ──call──▶ Twilio number ──POST /twilio/voice──▶ <Dial FORWARD_TO_PHONE>
                                    │ no-answer/busy ──▶ POST /twilio/voice/status
                                    ▼
+                       <Gather numDigits=1> voice opt-in prompt (src/consent.js)
+                                   │ caller presses 1 ──▶ POST /twilio/voice/consent (logged in db.voiceConsents)
+                                   ▼
                        text-back SMS to caller (agent.firstMessage)
 Caller ──SMS──▶ POST /twilio/sms ──▶ agent.handleReply (name → need → window)
                                    └─ when complete ──▶ BUZZ SMS to OWNER_PHONE
@@ -179,7 +182,9 @@ So roughly **$13–27/month** (estimate). Note: per Render's docs a persistent d
 
 - Hosting: a paid Render instance and a paid database (see above), not Free.
 - Render env: `NODE_ENV=production`, `DATABASE_URL` (the app refuses to start without Postgres when it is set), a 20+ character `ADMIN_PASSWORD` (plus `ADMIN_USERNAME`, `ADMIN_PASSWORD_STRICT=1`), `OWNER_PHONE`, `PUBLIC_BASE_URL`. Remove `DEMO_MODE` once Stripe/Twilio are live.
-- Twilio console: Advanced Opt-Out on (it confirms exact STOP keywords; the app confirms every other opt-out once), Geo-Permissions US/Canada only, SMS Pumping Protection on.
+- Twilio console: Geo-Permissions US/Canada only, SMS Pumping Protection on. Keyword replies: by default the app sends shop-named HELP, STOP and START replies (`KEYWORD_REPLIES=app`). With Twilio Advanced Opt-Out's own auto-replies on, Twilio's STOP reply is the one delivered (it blocks the app's) and START gets both replies, so either turn Twilio's keyword auto-replies off or set `KEYWORD_REPLIES=twilio` to leave exact STOP/START confirmations to Twilio.
+- **Voice consent (A2P 10DLC):** a missed call never texts on its own. The caller hears "[Shop] can't take your call right now. Press 1 and we'll text you at this number to get you booked. Message frequency varies, message and data rates may apply. Reply STOP to opt out or HELP for help." and only a 1 starts the text-back. Every answer is logged per shop (`db.voiceConsents`: time, CallSid, From, shop id, digits, script). Per-shop wording: `VOICE_CONSENT_PROMPT` (keep `{shop}`, "Press 1", the frequency/rates disclosures, STOP and HELP, or the default is used); `VOICE_CONSENT_SPANISH=1` adds the Spanish script. No caller text is ever sent without a shop name (`BUSINESS_NAME`); blocked sends alert the platform admin.
+- **Public SMS page per shop:** `/s/<slug>/sms` (slug = shop name lowercased, words joined by `-`; a second shop with the same name gets `-<first 6 of its id>`). Use it as the A2P campaign's opt-in proof URL.
 - **Area codes:** text-backs go only to US/Canada area codes in `src/areaCodes.js` (NANPA list, refreshed yearly; a test fails when it is ~12 months old). If the shop serves callers from a code that is skipped (a brand-new overlay, or Puerto Rico 787/939, USVI 340, Guam 671), set `TEXT_EXTRA_AREA_CODES=787,939`. The owner gets a daily text counting callers skipped for their area code.
 - Check admin `/health` (with Basic auth) shows `storage: "postgres"`, `storageState: "ok"`, and the boot log shows `[store] postgres backend ready` and `fail-closed ON`.
 - Review caps and retention: `OUTBOUND_SHOP_MAX_PER_HOUR` (100), `OUTBOUND_SHOP_MAX_PER_DAY` (300), `OUTBOUND_MAX_PER_HOUR` (200), `OUTBOUND_MAX_PER_DAY` (500), `RETENTION_DAYS` (365), `BOT_PAUSE_HOURS` (72).
