@@ -103,6 +103,8 @@ test('connect webhook: unsigned mock events refused in production without DEMO_M
 
 // ---------- (3) Twilio signatures ----------
 const call = (from, headers) => form('/twilio/voice/status', { From: from, DialCallStatus: 'no-answer' }, headers);
+// Texts start only after the caller presses 1 at the consent prompt (src/consent.js).
+const textCall = async (from) => { await call(from); return form('/twilio/voice/consent', { From: from, Digits: '1' }); };
 test('twilio: no token -> allowed locally, 503 in production unless DEMO_MODE=1', async (t) => {
   quiet(t);
   assert.equal((await call('+14707770001')).status, 200);
@@ -125,18 +127,24 @@ test('twilio: with a token, unsigned posts are 403; SKIP_TWILIO_VALIDATION only 
   const params = { From: '+14707770013', DialCallStatus: 'no-answer' };
   const sig = twilio.getExpectedTwilioSignature(token, 'https://shop.example/twilio/voice/status', params);
   assert.equal((await form('/twilio/voice/status', params, { 'x-twilio-signature': sig })).status, 200);
+  // The consent (Gather action) route is signed like every other Twilio webhook.
+  const press = { From: '+14707770013', Digits: '1' };
+  assert.equal((await form('/twilio/voice/consent', press)).status, 403);
+  assert.equal((await form('/twilio/voice/consent', press, { 'x-twilio-signature': 'bad' })).status, 403);
+  const sig2 = twilio.getExpectedTwilioSignature(token, 'https://shop.example/twilio/voice/consent', press);
+  assert.equal((await form('/twilio/voice/consent', press, { 'x-twilio-signature': sig2 })).status, 200);
 });
 
 // ---------- (4) per-number text-back throttle ----------
 test('text-back: one first text per number per cooldown; other numbers unaffected; 0 disables', async (t) => {
   quiet(t);
   const count = (p) => smsLog().split('\n').filter((l) => l.includes(`SMS -> ${p}:`)).length;
-  await call('+14708880001'); await call('+14708880001'); await call('+14708880001');
+  await textCall('+14708880001'); await textCall('+14708880001'); await textCall('+14708880001');
   assert.equal(count('+14708880001'), 1);
-  await call('+14708880002');
+  await textCall('+14708880002');
   assert.equal(count('+14708880002'), 1);
   withEnv(t, { TEXTBACK_COOLDOWN_MINUTES: '0' });
-  await call('+14708880003'); await call('+14708880003');
+  await textCall('+14708880003'); await textCall('+14708880003');
   assert.equal(count('+14708880003'), 2);
 });
 

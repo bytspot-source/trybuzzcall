@@ -20,6 +20,8 @@ const sec = require('./security');
 const vendors = require('./vendors');
 const mail = require('./email');
 const shopContext = require('./shopContext');
+const consent = require('./consent');
+const smsPage = require('./smsPage');
 
 const app = express();
 app.disable('x-powered-by');
@@ -220,10 +222,11 @@ async function inactiveText(phone) {
   const last = store.db.inactiveTexts[phone];
   if (last && Date.now() - Date.parse(last) < 86400000) return;
   store.db.inactiveTexts[phone] = new Date().toISOString(); store.save();
-  const biz = env.BUSINESS_NAME || 'us';
-  const msg = env.INACTIVE_MESSAGE || (agent.isAppointments() && agent.solo()
-    ? `Hi, this is ${biz}. Sorry I missed your call! Please try calling again later. Reply STOP to opt out.`
-    : `Hi, this is ${biz}. Sorry we missed your call! Please try calling again later. Reply STOP to opt out.`);
+  const biz = consent.shopName();
+  if (!biz) return; // sms.js would block it anyway: never text without the shop's name
+  const msg = env.INACTIVE_MESSAGE ? consent.named(env.INACTIVE_MESSAGE, biz) : (agent.isAppointments() && agent.solo()
+    ? `Hi, this is ${biz}. Sorry I missed your call! Please try calling again later. Reply STOP to opt out, HELP for help. Msg & data rates may apply.`
+    : `Hi, this is ${biz}. Sorry we missed your call! Please try calling again later. Reply STOP to opt out, HELP for help. Msg & data rates may apply.`);
   await sendSms(phone, msg);
 }
 
@@ -269,7 +272,9 @@ async function reportAreaSkips(now = Date.now()) {
 app.locals.reportAreaSkips = reportAreaSkips;
 // Only valid US/Canada numbers get a text-back: anonymous/restricted/blank caller IDs and international or premium
 // numbers are skipped (SMS pumping / toll fraud). Returns true when a text was sent.
+// Called ONLY after the caller pressed 1 at the voice consent prompt (/twilio/voice/consent).
 async function startTextBack(phone) {
+  if (!consent.shopName()) { console.error('[textback] skipped: the shop has no business name (no texts without it)'); return false; }
   if (!sec.isNanp(phone)) {
     const why = sec.nanpReason(phone);
     console.log(`[textback] skipped caller id ${phone ? sec.maskPhone(String(phone).slice(0, 20)) : '(blank)'}: ${why}`);
@@ -286,6 +291,33 @@ async function startTextBack(phone) {
   lead.messages.push({ dir: 'out', body: msg }); store.save();
   return (await sendSms(phone, msg)).ok;
 }
+
+// Can this caller be offered texts at all? Non-US/Canada / anonymous caller IDs, opted-out and paused numbers, and a
+// shop without a name never hear the opt-in prompt (nothing would be sent).
+async function missedCallTwiml(phone) {
+  if (!consent.shopName()) { await noNameAlert(shopContext.current()?.id || null, 'missed call'); return `<Say>${missedSayNoText()}</Say><Hangup/>`; }
+  if (!sec.isNanp(phone)) {
+    const why = sec.nanpReason(phone);
+    console.log(`[textback] no opt-in prompt for caller id ${phone ? sec.maskPhone(String(phone).slice(0, 20)) : '(blank)'}: ${why}`);
+    if (why === 'non-US/Canada NANP area code' || why === 'not a US/Canada area code') recordAreaSkip(String(phone).slice(2, 5)); // never toll-free/premium/non-geographic
+    return `<Say>${missedSayNoText()}</Say><Hangup/>`;
+  }
+  if (store.isOptedOut(phone) || store.isPaused(phone)) return `<Say>${missedSayNoText()}</Say><Hangup/>`;
+  return consent.gatherTwiml(BASE);
+}
+const consentNoTextSay = () => 'Thanks. We were not able to send a text right now. Please try calling again later. Goodbye.';
+let noNameAlertedAt = new Map();
+async function noNameAlert(shopId, where) {
+  const key = shopId || 'legacy';
+  if (Date.now() - (noNameAlertedAt.get(key) || 0) < 3600000) return;
+  noNameAlertedAt.set(key, Date.now());
+  const who = shopId ? `vendor ${shopId.slice(0, 8)}` : 'the legacy line';
+  const msg = `BUZZ platform: ${who} has no business name, so BuzzCall is not texting its callers (${where}). Set the business name before this line sends any texts.`;
+  console.error(`[compliance] ${msg}`);
+  try { await platformAlert(msg, 'BuzzCall: texts blocked, business name missing'); } catch (e) { console.error('no-name alert failed:', e.message); }
+}
+sms.setNoNameAlert(({ shopId } = {}) => noNameAlert(shopId, 'outbound text'));
+app.locals.resetNoNameAlerts = () => { noNameAlertedAt = new Map(); };
 
 // 1) Incoming call: forward to owner if configured, else treat as missed
 const routeTwilio = (callback = false) => async (req, res, next) => {
@@ -311,19 +343,28 @@ app.post('/twilio/voice', verifyTwilio, routeTwilio(), async (req, res) => {
   if (env.FORWARD_TO_PHONE) {
     return twiml(res, `<Dial timeout="${env.RING_TIMEOUT_SECONDS || 20}" action="${BASE}/twilio/voice/status">${env.FORWARD_TO_PHONE}</Dial>`);
   }
-  const texted = await startTextBack(req.body.From);
-  twiml(res, `<Say>${texted ? missedSay() : missedSayNoText()}</Say><Hangup/>`);
+  twiml(res, await missedCallTwiml(req.body.From)); // opt-in prompt; nothing is texted until the caller presses 1
 });
 
 // 2) Dial result: no-answer/busy/failed => missed call
 app.post('/twilio/voice/status', verifyTwilio, routeTwilio(true), async (req, res) => {
   const s = req.body.DialCallStatus;
   if (recordVendorCall(req, ['no-answer','busy','failed','canceled'].includes(s) ? 'missed' : s === 'completed' ? 'answered' : 'ringing') === false) return twiml(res, '<Hangup/>');
-  if (['no-answer', 'busy', 'failed', 'canceled'].includes(s)) {
-    const texted = await startTextBack(req.body.From);
-    return twiml(res, `<Say>${texted ? missedSay() : missedSayNoText()}</Say><Hangup/>`);
-  }
+  if (['no-answer', 'busy', 'failed', 'canceled'].includes(s)) return twiml(res, await missedCallTwiml(req.body.From)); // same consent gate
   twiml(res, '<Hangup/>');
+});
+
+// 2b) Consent prompt result (<Gather action>). Signed like every Twilio webhook; vendor calls must match a call this
+// line routed (routeTwilio callback mode). Every outcome is logged; only Digits=1 starts the text-back.
+app.post('/twilio/voice/consent', verifyTwilio, routeTwilio(true), async (req, res) => {
+  const from = req.body.From, digits = String(req.body.Digits ?? '');
+  if (!consent.shopName()) { await noNameAlert(shopContext.current()?.id || null, 'consent'); return twiml(res, `<Say>${missedSayNoText()}</Say><Hangup/>`); }
+  const entry = await consent.record({ callSid: req.body.CallSid, from, digits });
+  const call = shopContext.current() && (store.db.calls || []).find((c) => c.id === req.body.CallSid);
+  if (call) { call.consent = entry.consented ? 'yes' : entry.digits ? 'declined' : 'no_input'; store.save(); }
+  if (!entry.consented) return twiml(res, consent.goodbyeTwiml(entry.digits));
+  const texted = sec.isNanp(from) ? await startTextBack(from) : false;
+  twiml(res, `<Say>${texted ? missedSay() : consentNoTextSay()}</Say><Hangup/>`);
 });
 
 // Record an opt-out durably before answering (Postgres write-through), but never hold the webhook past 5s.
@@ -334,28 +375,35 @@ app.post('/twilio/sms', verifyTwilio, routeTwilio(), async (req, res) => {
   const from = req.body.From, body = String(req.body.Body || '');
   if (!sec.isNanp(from)) return twiml(res, ''); // never text non-US/CA or anonymous senders
   const kw = optout.classify(body);
-  const biz = env.BUSINESS_NAME || 'us';
-  if (kw === 'optout') { // exact Twilio keyword: Twilio's opt-out handling sends the confirmation; we just record it
+  const biz = consent.shopName(); // '' blocks every caller text in sms.js (and alerts the admin)
+  // KEYWORD_REPLIES=twilio: Twilio Advanced Opt-Out sends the STOP/START confirmations, the app stays silent for exact
+  // keywords. Default (app): the app sends the shop-named confirmations. With Twilio's own STOP handling on, Twilio
+  // blocks the app's STOP confirmation (error 21610) and only Twilio's reply reaches the caller.
+  const appKeywordReplies = String(process.env.KEYWORD_REPLIES || 'app').toLowerCase() !== 'twilio';
+  if (kw === 'optout') { // exact Twilio keyword
+    const already = store.isOptedOut(from); // confirm once, then silence (like every other opt-out)
     await optOutNow(from, 'keyword'); await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: ${from} replied ${body.trim().slice(0, 20)} and is opted out of texts.`);
+    if (appKeywordReplies && biz && !already) await sendSms(from, consent.stopText(biz), { force: true });
     return twiml(res, '');
   }
   if (kw === 'revoke') { // any other opt-out (keyword variant or plain language): exactly one confirmation, then silence
     if (!store.isOptedOut(from)) {
       await optOutNow(from, 'message');
       // Spanish opt-outs (basta, no me escriban, ...) get a bilingual confirmation; Twilio doesn't handle those keywords.
-      const en = `${biz}: You're unsubscribed and won't get more texts from us. Reply START to resubscribe.`;
-      const es = `Se canceló su suscripción y no recibirá más mensajes. Responda START para volver a suscribirse.`;
+      const en = consent.stopText(biz);
+      const es = 'Se canceló su suscripción y no recibirá más mensajes. Responda START para volver a suscribirse.';
       await sendSms(from, optout.language(body) === 'es' ? `${en} / ${es}` : en, { force: true });
       await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: ${from} asked not to be texted ("${body.trim().slice(0, 60)}") and is opted out.`);
     }
     return twiml(res, '');
   }
   if (kw === 'optin' && (store.isOptedOut(from) || optout.letters(body) !== 'YES')) {
-    store.optIn(from); store.resumeBot(from); return twiml(res, ''); // Twilio sends the re-subscribe confirmation
+    await Promise.race([store.optIn(from), sec.sleep(5000)]); store.resumeBot(from);
+    if (appKeywordReplies && biz) await sendSms(from, consent.startText(biz));
+    return twiml(res, '');
   }
   if (kw === 'help') {
-    const contact = env.OWNER_PHONE && env.OWNER_PHONE !== sec.PLACEHOLDER_PHONE ? ` or call ${env.OWNER_PHONE}` : '';
-    await sendSms(from, env.HELP_MESSAGE || `${biz}: Missed-call text line for booking and callbacks. Reply STOP to opt out${contact}. Msg & data rates may apply.`, { force: true });
+    if (biz) await sendSms(from, env.HELP_MESSAGE ? consent.named(env.HELP_MESSAGE, biz) : consent.helpText(biz), { force: true });
     return twiml(res, '');
   }
   if (store.isOptedOut(from)) return twiml(res, ''); // opted out: no conversation until START
@@ -381,6 +429,19 @@ app.post('/twilio/sms', verifyTwilio, routeTwilio(), async (req, res) => {
   await sendSms(from, reply);
   if (completed) await buzzOwner(lead);
   twiml(res, '');
+});
+
+// Public per-shop SMS program page (A2P 10DLC): /s/<slug>/sms. Public fields only (shop name, its BuzzCall number,
+// the voice opt-in script, sample messages). Never the owner's phone or email.
+app.get('/s/:slug/sms', async (req, res) => {
+  const page = await smsPage.find(req.params.slug);
+  if (!page) return res.status(404).type('text').send('Not found');
+  const render = () => {
+    const html = smsPage.render({ number: page.number });
+    if (!html) return res.status(404).type('text').send('Not found');
+    res.set('Cache-Control', 'public, max-age=300').type('html').send(html);
+  };
+  return page.shop ? vendors.run(page.shop.id, render) : shopContext.run(null, render);
 });
 
 const tag = (lead) => `${lead.urgent ? '🚨 URGENT ' : ''}`;

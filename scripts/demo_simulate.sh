@@ -13,7 +13,7 @@ post(){ local from=$1 path=$2; shift 2; curl -s -X POST "$BASE$path" --data-urle
 START=$(wc -l < "$LOG" 2>/dev/null || echo 0)
 
 echo "== A. BOOKING PATH ($CALLER)"
-echo "-- 1. Missed call (no-answer)"; post $CALLER /twilio/voice/status --data-urlencode "DialCallStatus=no-answer"
+echo "-- 1. Missed call (no-answer)"; post $CALLER /twilio/voice/status --data-urlencode "DialCallStatus=no-answer"; post $CALLER /twilio/voice/consent --data-urlencode "Digits=1"
 sleep 0.3; echo "-- 2. Caller: name"; post $CALLER /twilio/sms --data-urlencode "Body=This is Dana"
 sleep 0.3; echo "-- 3. Caller: need"; post $CALLER /twilio/sms --data-urlencode "Body=Burst pipe under kitchen sink, water everywhere"
 sleep 0.3; echo "-- 4. Caller: picks slot 1"; post $CALLER /twilio/sms --data-urlencode "Body=1"
@@ -23,7 +23,7 @@ if [ -n "$URL" ]; then echo "-- 5. Caller pays mock deposit: $URL"; curl -s "$UR
 else echo "-- 5. (no mock deposit link: deposit/booking disabled or Stripe live)"; fi
 
 echo; echo "== B. CLASSIC CALLBACK PATH ($CALLER2) - slot 1 above is now taken, so offers start later"
-post $CALLER2 /twilio/voice/status --data-urlencode "DialCallStatus=no-answer"
+post $CALLER2 /twilio/voice/status --data-urlencode "DialCallStatus=no-answer"; post $CALLER2 /twilio/voice/consent --data-urlencode "Digits=1"
 sleep 0.3; post $CALLER2 /twilio/sms --data-urlencode "Body=Mike"
 sleep 0.3; post $CALLER2 /twilio/sms --data-urlencode "Body=Water heater making a banging noise"
 sleep 0.3; post $CALLER2 /twilio/sms --data-urlencode "Body=callback"

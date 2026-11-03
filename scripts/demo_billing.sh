@@ -35,7 +35,7 @@ state(){ status | J 'const s=j.subscription||{},d=v=>v?v.slice(0,10):"-";
   console.log(`   STATE [clock ${d(j.now)}] primary=${s.id} status=${s.status} plan=${s.plan} period_end=${d(s.current_period_end)} cancel_at_period_end=${!!s.cancel_at_period_end} service=${j.access.active?"ACTIVE":"INACTIVE"} (${j.access.reason}) credit=$${j.mockCreditBalance}`)'; }
 adv(){ curl -s -u $AUTH -H "Origin: $BASE" -X POST "$BASE/billing/mock/advance" -d "days=$1" >/dev/null; }
 api(){ curl -s -u $AUTH -H "Origin: $BASE" -X POST "$BASE$1" "${@:2}"; }
-missed(){ curl -s -X POST "$BASE/twilio/voice/status" --data-urlencode "From=$1" --data-urlencode "DialCallStatus=no-answer" >/dev/null; sleep 0.2; tail -n1 "$DATA/sms.log" | sed 's/^.*SMS -> /   SMS -> /'; }
+missed(){ curl -s -X POST "$BASE/twilio/voice/status" --data-urlencode "From=$1" --data-urlencode "DialCallStatus=no-answer" >/dev/null; curl -s -X POST "$BASE/twilio/voice/consent" --data-urlencode "From=$1" --data-urlencode "Digits=1" >/dev/null; sleep 0.2; tail -n1 "$DATA/sms.log" | sed 's/^.*SMS -> /   SMS -> /'; }
 
 echo "== A. SETUP FEE"
 echo "-- Shop #1 signs up (monthly): mock checkout page says:"

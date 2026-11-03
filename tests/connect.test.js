@@ -409,14 +409,14 @@ test('/health reports connect readiness without exposing anything secret', async
   assert.ok(!JSON.stringify(h).includes(TEST_KEY));
 });
 
-test('legal drafts: shop is merchant of record/payee, Stripe Connected Account Agreement linked, review notes kept', () => {
+test('legal pages: shop is merchant of record/payee, Stripe Connected Account Agreement linked; no draft banners on terms', () => {
   const terms = fs.readFileSync(path.join(__dirname, '../public/terms.html'), 'utf8');
   const refunds = fs.readFileSync(path.join(__dirname, '../public/refunds.html'), 'utf8');
   assert.match(terms, /merchant of record/);
   assert.match(terms, /payee/);
   assert.match(terms, /processed by Stripe|Payments are processed by Stripe/);
   assert.match(terms, /href="https:\/\/stripe\.com\/connect-account\/legal"/);
-  assert.match(terms, /TODO\(legal\)/); assert.match(terms, /pending review by legal counsel/);
+  assert.doesNotMatch(terms, /TODO\(legal\)/); assert.doesNotMatch(terms, /pending review by legal counsel/);
   assert.match(refunds, /TODO\(legal\)/); assert.match(refunds, /pending review by legal counsel/);
   assert.match(refunds, /own Stripe account/);
 });
