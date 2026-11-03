@@ -306,6 +306,10 @@ test('N5: exact STOP -> one shop-named app confirmation, once (none with KEYWORD
   await text(tw, 'STOP');
   assert.equal(store.isOptedOut(tw), true);
   assert.equal(sentTo(tw).length, tb, 'KEYWORD_REPLIES=twilio: Twilio Advanced Opt-Out sends the STOP confirmation, not us');
+  const hw = num(); await call(hw);
+  const hb = sentTo(hw).length;
+  await text(hw, 'HELP');
+  assert.equal(sentTo(hw).length, hb, 'KEYWORD_REPLIES=twilio: Twilio answers HELP, the app stays silent (no double reply)');
   delete process.env.KEYWORD_REPLIES;
   for (const v of ['S T O P', 'STOP 2', '❌STOP❌', 'ＳＴＯＰ', 'opt out', 'stop.', 'please stop texting me']) {
     const q = num(); await call(q);

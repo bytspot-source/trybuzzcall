@@ -377,7 +377,7 @@ app.post('/twilio/sms', verifyTwilio, routeTwilio(), async (req, res) => {
   const kw = optout.classify(body);
   const biz = consent.shopName(); // '' blocks every caller text in sms.js (and alerts the admin)
   // KEYWORD_REPLIES=twilio: Twilio Advanced Opt-Out sends the STOP/START confirmations, the app stays silent for exact
-  // keywords. Default (app): the app sends the shop-named confirmations. With Twilio's own STOP handling on, Twilio
+  // keywords (STOP, START, HELP). Default (app): the app sends the shop-named confirmations. With Twilio's own STOP handling on, Twilio
   // blocks the app's STOP confirmation (error 21610) and only Twilio's reply reaches the caller.
   const appKeywordReplies = String(process.env.KEYWORD_REPLIES || 'app').toLowerCase() !== 'twilio';
   if (kw === 'optout') { // exact Twilio keyword
@@ -402,8 +402,8 @@ app.post('/twilio/sms', verifyTwilio, routeTwilio(), async (req, res) => {
     if (appKeywordReplies && biz) await sendSms(from, consent.startText(biz));
     return twiml(res, '');
   }
-  if (kw === 'help') {
-    if (biz) await sendSms(from, env.HELP_MESSAGE ? consent.named(env.HELP_MESSAGE, biz) : consent.helpText(biz), { force: true });
+  if (kw === 'help') { // in twilio mode Twilio's HELP auto-reply answers; the app stays silent to avoid a double reply
+    if (appKeywordReplies && biz) await sendSms(from, env.HELP_MESSAGE ? consent.named(env.HELP_MESSAGE, biz) : consent.helpText(biz), { force: true });
     return twiml(res, '');
   }
   if (store.isOptedOut(from)) return twiml(res, ''); // opted out: no conversation until START
