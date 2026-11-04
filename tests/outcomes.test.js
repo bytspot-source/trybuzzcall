@@ -274,7 +274,7 @@ test('retention: records are capped and the oldest pruned', (t) => {
   assert.ok(!store.db.outcomes[sids[0]] && !store.db.outcomes[sids[1]]);
   assert.equal(outcomes.maxRecords(), 3);
   withEnv(t, { OUTCOMES_MAX_RECORDS: undefined });
-  assert.equal(outcomes.maxRecords(), 50000);
+  assert.equal(outcomes.maxRecords(), 10000);
 });
 
 test('a logging failure never breaks the voice or SMS routes', async (t) => {

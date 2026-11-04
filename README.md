@@ -103,8 +103,8 @@ failure-safe: a logging error is logged and ignored, never breaking the voice or
   an HMAC-SHA256 hash salted with `OUTCOMES_HASH_SALT`, else a random salt persisted in the platform store; phone numbers,
   emails and the caller's name are scrubbed from free text at capture; `training_excluded` rows are left out). All behind
   admin auth.
-- **Retention:** `OUTCOMES_MAX_RECORDS` (default 50000) per shop; past the cap the oldest records are pruned on insert.
-  Outcomes are not purged by `RETENTION_DAYS`. Note: the shop's whole store is one JSON document, so a very large cap makes
+- **Retention:** `OUTCOMES_MAX_RECORDS` (default 10000) per shop; past the cap the oldest records are pruned on insert.
+  Outcomes are not purged by `RETENTION_DAYS`. Note: the shop's whole store is one JSON document, so a large cap makes
   each save bigger; lower the cap if saves get slow.
 - **Optional email step:** `OUTCOMES_EMAIL_STEP=1` (default off: production behaviour unchanged). After booking, the caller
   is asked "Want a confirmation by email? Reply with your email or SKIP." A valid address is stored as `email_unverified`

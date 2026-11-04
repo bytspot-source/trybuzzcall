@@ -11,7 +11,7 @@
 // salt persisted in the platform store), scrubs phone numbers / emails / the caller's name out of free text at capture
 // time, and leaves out every training_excluded record (the caller opted out: see store.optOut).
 //
-// Retention: capped at OUTCOMES_MAX_RECORDS per shop (default 50000); the oldest records are pruned first.
+// Retention: capped at OUTCOMES_MAX_RECORDS per shop (default 10000); the oldest records are pruned first.
 //
 // Optional email step (OUTCOMES_EMAIL_STEP=1, default OFF): after a booking the caller is asked for an email; a valid
 // address is stored as email_unverified and a one-tap link /o/verify/:token marks email_verified=true. Without
@@ -24,7 +24,7 @@ const sec = require('./security');
 const STAGES = ['missed', 'no_consent', 'consented', 'conversed', 'slot_offered', 'booked', 'deposit_paid', 'opted_out'];
 // Forward-only progression. no_consent and consented are alternatives at the same rank; opted_out always wins.
 const RANK = { missed: 0, no_consent: 1, consented: 1, conversed: 2, slot_offered: 3, booked: 4, deposit_paid: 5, opted_out: 99 };
-const DEFAULT_MAX = 50000;
+const DEFAULT_MAX = 10000;
 const PHONE_LINK_DAYS = 7; // an SMS reply is tied to that caller's latest call record within this many days
 const EMAIL_ASK = 'Want a confirmation by email? Reply with your email or SKIP.';
 const EMAIL_TOKEN_DAYS = 7;
