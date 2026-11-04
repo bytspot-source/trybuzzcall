@@ -13,7 +13,7 @@ for (const k of ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'STRIPE_CONNECT_W
   'TWILIO_PHONE_NUMBER', 'OPENAI_API_KEY', 'DATABASE_URL', 'FORWARD_TO_PHONE', 'VERTICAL', 'BUSINESS_VERTICAL', 'BUSINESS_TYPE', 'SERVICES', 'BOOKING_LINK',
   'BILLING_REQUIRE_SUBSCRIPTION', 'BILLING_ENFORCE', 'DEMO_MODE', 'ADMIN_USERNAME', 'RENDER', 'CLIENT_IP_HEADER', 'TEXTBACK_COOLDOWN_MINUTES',
   'OUTBOUND_MAX_PER_HOUR', 'OUTBOUND_MAX_PER_DAY', 'RETENTION_DAYS', 'BOOKING_ENABLED', 'DEPOSIT_ENABLED', 'REQUIRE_POSTGRES', 'HELP_MESSAGE',
-  'INACTIVE_MESSAGE', 'INACTIVE_MODE', 'KEYWORD_REPLIES', 'VOICE_CONSENT_PROMPT', 'VOICE_CONSENT_SPANISH', 'TEXT_EXTRA_AREA_CODES']) delete process.env[k];
+  'INACTIVE_MESSAGE', 'INACTIVE_MODE', 'KEYWORD_REPLIES', 'VOICE_CONSENT_PROMPT', 'VOICE_CONSENT_SPANISH', 'TEXT_EXTRA_AREA_CODES', 'VOICE_NAME', 'VOICE_NAME_ES']) delete process.env[k];
 const OWNER = '+14045550100';
 const OWNER_EMAIL = 'owner-private@example.com';
 Object.assign(process.env, { DATA_DIR: dir, TZ: 'UTC', BUSINESS_TZ: 'UTC', NODE_ENV: 'test', ADMIN_PASSWORD: 'a2p-test-password-long-enough', BUSINESS_NAME: 'Peach State Plumbing',
@@ -52,7 +52,7 @@ test('missed call plays the press-1 opt-in prompt and texts nothing yet', async 
   assert.equal(r.status, 200);
   const xml = await r.text();
   assert.match(xml, /<Gather input="dtmf" numDigits="1" timeout="8" actionOnEmptyResult="true" action="https:\/\/shop\.example\/twilio\/voice\/consent" method="POST">/);
-  assert.ok(xml.includes(`<Say>${xmlText(PROMPT)}</Say></Gather>`), 'exact opt-in script inside the Gather');
+  assert.ok(xml.includes(`<Say voice="Polly.Joanna-Neural">${xmlText(PROMPT)}</Say></Gather>`), 'exact opt-in script inside the Gather');
   assert.doesNotMatch(xml, /just texted|just sent you a text/i, 'never claims a text was sent');
   assert.equal(sentTo(p).length, 0, 'no text before consent');
   assert.ok(!store.findOpenLead(p), 'no lead before consent');
@@ -120,7 +120,7 @@ test('per-shop prompt wording (VOICE_CONSENT_PROMPT) needs the required disclosu
   process.env.VOICE_CONSENT_PROMPT = '';
   process.env.VOICE_CONSENT_SPANISH = '1';
   const xml = await (await form('/twilio/voice', { From: num(), CallSid: callSid() })).text();
-  assert.match(xml, /<Say language="es-MX">Peach State Plumbing no puede atender su llamada en este momento\. Oprima 1 /);
+  assert.match(xml, /<Say language="es-MX" voice="Polly\.Mia-Neural">Peach State Plumbing no puede atender su llamada en este momento\. Oprima 1 /);
   assert.ok(xml.indexOf('es-MX') < xml.indexOf('</Gather>'), 'Spanish script is inside the same Gather');
 });
 

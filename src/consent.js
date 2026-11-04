@@ -12,6 +12,7 @@
 const env = require('./config').env;
 const store = require('./store');
 const shopContext = require('./shopContext');
+const { say } = require('./voice');
 
 const MAX_RECORDS = 10000;
 const SUPPORT_PHONE = '(470) 482-8377';
@@ -46,13 +47,13 @@ const xml = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 // no-input outcome too, so it is logged (and answered with a goodbye, never a text).
 function gatherTwiml(base) {
   const name = shopName();
-  const es = spanish() ? `<Pause length="1"/><Say language="es-MX">${xml(spanishPrompt(name))}</Say>` : '';
-  return `<Gather input="dtmf" numDigits="1" timeout="8" actionOnEmptyResult="true" action="${xml(base)}/twilio/voice/consent" method="POST"><Say>${xml(voicePrompt(name))}</Say>${es}</Gather>`
-    + `<Say>${xml(NO_INPUT)}</Say>${spanish() ? `<Say language="es-MX">${xml(NO_INPUT_ES)}</Say>` : ''}<Hangup/>`;
+  const es = spanish() ? `<Pause length="1"/>${say(spanishPrompt(name), 'es')}` : '';
+  return `<Gather input="dtmf" numDigits="1" timeout="8" actionOnEmptyResult="true" action="${xml(base)}/twilio/voice/consent" method="POST"><Pause length="1"/>${say(voicePrompt(name))}${es}</Gather>`
+    + `${say(NO_INPUT)}${spanish() ? say(NO_INPUT_ES, 'es') : ''}<Hangup/>`;
 }
 const goodbyeTwiml = (digits) => {
   const none = !digits;
-  return `<Say>${xml(none ? NO_INPUT : DECLINED)}</Say>${spanish() ? `<Say language="es-MX">${xml(none ? NO_INPUT_ES : DECLINED_ES)}</Say>` : ''}<Hangup/>`;
+  return `${say(none ? NO_INPUT : DECLINED)}${spanish() ? say(none ? NO_INPUT_ES : DECLINED_ES, 'es') : ''}<Hangup/>`;
 };
 
 // Consent log, in the current shop's store (legacy root or the vendor's namespaced store).

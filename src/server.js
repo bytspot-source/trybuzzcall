@@ -21,6 +21,7 @@ const vendors = require('./vendors');
 const mail = require('./email');
 const shopContext = require('./shopContext');
 const consent = require('./consent');
+const { say } = require('./voice');
 const smsPage = require('./smsPage');
 
 const app = express();
@@ -295,14 +296,14 @@ async function startTextBack(phone) {
 // Can this caller be offered texts at all? Non-US/Canada / anonymous caller IDs, opted-out and paused numbers, and a
 // shop without a name never hear the opt-in prompt (nothing would be sent).
 async function missedCallTwiml(phone) {
-  if (!consent.shopName()) { await noNameAlert(shopContext.current()?.id || null, 'missed call'); return `<Say>${missedSayNoText()}</Say><Hangup/>`; }
+  if (!consent.shopName()) { await noNameAlert(shopContext.current()?.id || null, 'missed call'); return `${say(missedSayNoText())}<Hangup/>`; }
   if (!sec.isNanp(phone)) {
     const why = sec.nanpReason(phone);
     console.log(`[textback] no opt-in prompt for caller id ${phone ? sec.maskPhone(String(phone).slice(0, 20)) : '(blank)'}: ${why}`);
     if (why === 'non-US/Canada NANP area code' || why === 'not a US/Canada area code') recordAreaSkip(String(phone).slice(2, 5)); // never toll-free/premium/non-geographic
-    return `<Say>${missedSayNoText()}</Say><Hangup/>`;
+    return `${say(missedSayNoText())}<Hangup/>`;
   }
-  if (store.isOptedOut(phone) || store.isPaused(phone)) return `<Say>${missedSayNoText()}</Say><Hangup/>`;
+  if (store.isOptedOut(phone) || store.isPaused(phone)) return `${say(missedSayNoText())}<Hangup/>`;
   return consent.gatherTwiml(BASE);
 }
 const consentNoTextSay = () => 'Thanks. We were not able to send a text right now. Please try calling again later. Goodbye.';
@@ -435,14 +436,14 @@ app.post('/twilio/voice/status', verifyTwilio, routeTwilio(true), async (req, re
 // line routed (routeTwilio callback mode). Every outcome is logged; only Digits=1 starts the text-back.
 app.post('/twilio/voice/consent', verifyTwilio, routeTwilio(true), async (req, res) => {
   const from = req.body.From, digits = String(req.body.Digits ?? '');
-  if (!consent.shopName()) { await noNameAlert(shopContext.current()?.id || null, 'consent'); return twiml(res, `<Say>${missedSayNoText()}</Say><Hangup/>`); }
+  if (!consent.shopName()) { await noNameAlert(shopContext.current()?.id || null, 'consent'); return twiml(res, `${say(missedSayNoText())}<Hangup/>`); }
   const entry = await consent.record({ callSid: req.body.CallSid, from, digits });
   const call = shopContext.current() && (store.db.calls || []).find((c) => c.id === req.body.CallSid);
   if (call) { call.consent = entry.consented ? 'yes' : entry.digits ? 'declined' : 'no_input'; store.save(); }
   if (!entry.consented) { buzzLater(missedBuzz(req.body.CallSid, from, 'no_optin')); return twiml(res, consent.goodbyeTwiml(entry.digits)); }
   const texted = sec.isNanp(from) ? await startTextBack(from) : false;
   buzzLater(missedBuzz(req.body.CallSid, from, texted ? 'texting' : 'not_sent'));
-  twiml(res, `<Say>${texted ? missedSay() : consentNoTextSay()}</Say><Hangup/>`);
+  twiml(res, `${say(texted ? missedSay() : consentNoTextSay())}<Hangup/>`);
 });
 
 // Record an opt-out durably before answering (Postgres write-through), but never hold the webhook past 5s.
