@@ -143,6 +143,18 @@ function adminAlert(subject, text) {
     return queue({ to: adminTo(), subject: oneLine(subject, 150), text: String(text || '').slice(0, 4000), kind: 'admin alert' });
   } catch { return null; }
 }
+// Outcomes log email step (src/outcomes.js, OUTCOMES_EMAIL_STEP=1): one confirmation link to a caller-supplied address.
+// Never throws; skipped (nothing sent) without RESEND_API_KEY; at most one per address per window.
+function outcomeVerify(to, link, shopName) {
+  try {
+    const address = String(to || '').trim().toLowerCase();
+    if (!validEmail(address) || !process.env.RESEND_API_KEY) return null;
+    if (!claim('outcome-verify', address)) { console.log(`[email] outcome verify to ${maskEmail(address)} skipped: already sent recently`); return null; }
+    const name = oneLine(shopName, 80) || 'the business you called';
+    return queue({ to: address, subject: `Confirm your email for ${name}`, kind: 'outcome verify',
+      text: `Hi,\n\nYou asked ${name} for booking confirmations by email. Tap this link to confirm this address:\n${link}\n\nIf this wasn't you, ignore this email.\n\nSent by BuzzCall for ${name}.` });
+  } catch { return null; }
+}
 const reset = () => { inFlight.clear(); adminHourly = null; if (store.root.db.emailThrottle) store.root.db.emailThrottle = {}; };
 
-module.exports = { signup, adminAlert, maskEmail, setFetch, settle, reset, RESEND_URL, SETUP_URL, DEFAULT_FROM, DEFAULT_ADMIN };
+module.exports = { signup, adminAlert, outcomeVerify, maskEmail, setFetch, settle, reset, RESEND_URL, SETUP_URL, DEFAULT_FROM, DEFAULT_ADMIN };

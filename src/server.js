@@ -23,6 +23,7 @@ const shopContext = require('./shopContext');
 const consent = require('./consent');
 const { say } = require('./voice');
 const smsPage = require('./smsPage');
+const outcomes = require('./outcomes'); // outcomes log: every entry point is failure-safe (never breaks call/SMS handling)
 
 const app = express();
 app.disable('x-powered-by');
@@ -367,6 +368,7 @@ async function missedBuzz(callSid, from, outcome) {
     if (!instantBuzzLimit.hit(shopContext.shopId() || 'legacy').ok) { console.error(`[buzz] instant missed-call buzz limit reached (${max}/hour) on this line: not buzzing for ${sec.maskPhone(from)}`); return false; }
   }
   await owner(null, missedBuzzText(from, outcome));
+  outcomes.ownerBuzzed(callSid, outcome);
   return true;
 }
 // Called when a call is determined missed. `offered` = the caller hears the press-1 prompt (consent callback buzzes).
@@ -416,6 +418,7 @@ app.post('/twilio/voice', verifyTwilio, routeTwilio(), async (req, res) => {
     return twiml(res, `<Dial timeout="${env.RING_TIMEOUT_SECONDS || 20}" action="${BASE}/twilio/voice/status">${env.FORWARD_TO_PHONE}</Dial>`);
   }
   const xml = await missedCallTwiml(req.body.From); // opt-in prompt; nothing is texted until the caller presses 1
+  outcomes.missed({ callSid: req.body.CallSid, from: req.body.From, offered: xml.includes('<Gather') });
   buzzLater(armMissedBuzz(req.body.CallSid, req.body.From, xml.includes('<Gather')));
   twiml(res, xml);
 });
@@ -426,6 +429,7 @@ app.post('/twilio/voice/status', verifyTwilio, routeTwilio(true), async (req, re
   if (recordVendorCall(req, ['no-answer','busy','failed','canceled'].includes(s) ? 'missed' : s === 'completed' ? 'answered' : 'ringing') === false) return twiml(res, '<Hangup/>');
   if (['no-answer', 'busy', 'failed', 'canceled'].includes(s)) {
     const xml = await missedCallTwiml(req.body.From); // same consent gate
+    outcomes.missed({ callSid: req.body.CallSid, from: req.body.From, offered: xml.includes('<Gather') });
     buzzLater(armMissedBuzz(req.body.CallSid, req.body.From, xml.includes('<Gather')));
     return twiml(res, xml);
   }
@@ -440,8 +444,12 @@ app.post('/twilio/voice/consent', verifyTwilio, routeTwilio(true), async (req, r
   const entry = await consent.record({ callSid: req.body.CallSid, from, digits });
   const call = shopContext.current() && (store.db.calls || []).find((c) => c.id === req.body.CallSid);
   if (call) { call.consent = entry.consented ? 'yes' : entry.digits ? 'declined' : 'no_input'; store.save(); }
-  if (!entry.consented) { buzzLater(missedBuzz(req.body.CallSid, from, 'no_optin')); return twiml(res, consent.goodbyeTwiml(entry.digits)); }
+  if (!entry.consented) {
+    outcomes.consent({ callSid: req.body.CallSid, from, digits: entry.digits, consented: false });
+    buzzLater(missedBuzz(req.body.CallSid, from, 'no_optin')); return twiml(res, consent.goodbyeTwiml(entry.digits));
+  }
   const texted = sec.isNanp(from) ? await startTextBack(from) : false;
+  outcomes.consent({ callSid: req.body.CallSid, from, digits: entry.digits, consented: true, texted });
   buzzLater(missedBuzz(req.body.CallSid, from, texted ? 'texting' : 'not_sent'));
   twiml(res, `${say(texted ? missedSay() : consentNoTextSay())}<Hangup/>`);
 });
@@ -500,9 +508,13 @@ app.post('/twilio/sms', verifyTwilio, routeTwilio(), async (req, res) => {
     return twiml(res, '');
   }
   if (!billing.access().active) { await inactiveText(from); return twiml(res, ''); }
+  // Optional email step (OUTCOMES_EMAIL_STEP=1, default off): a reply to "Want a confirmation by email?" after booking.
+  const emailStep = outcomes.emailReply(from, body, { base: BASE, sendVerify: (to, link) => mail.outcomeVerify(to, link, consent.shopName()) });
+  if (emailStep) { await sendSms(from, emailStep.reply); return twiml(res, ''); }
   let lead = store.findOpenLead(from) || store.createLead(from);
   lead.messages.push({ dir: 'in', body });
   const { reply, completed, booking: b } = await agent.handleReply(lead, body);
+  outcomes.conversation(from, lead);
   if (b) { await onBooked(lead, b); return twiml(res, ''); }
   lead.messages.push({ dir: 'out', body: reply }); store.save();
   await sendSms(from, reply);
@@ -559,6 +571,9 @@ async function onBooked(lead, b) {
   } else msg = agent.texts.bookedNoDeposit(lead.name, b);
   lead.messages.push({ dir: 'out', body: msg }); store.save();
   await sendSms(lead.phone, msg);
+  outcomes.booked(lead, b);
+  const ask = outcomes.askEmail(lead); // null unless OUTCOMES_EMAIL_STEP=1
+  if (ask) { lead.messages.push({ dir: 'out', body: ask }); store.save(); await sendSms(lead.phone, ask); }
   const status = b.status === 'held' ? `slot held, deposit pending ($${b.amount}, hold expires ${new Date(b.holdExpiresAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })})`
     : b.depositSkipped ? 'BOOKED (no deposit; deposit off: Stripe not connected)' : 'BOOKED (no deposit)';
   if (b.service) await owner(lead.id, `BUZZ ${env.BUSINESS_NAME || ''}: ${status.replace('slot held', 'time held')}: ${lead.name || 'Caller (name not given)'}, ${lead.need}, ${b.slotLabel}. tel:${lead.phone}`);
@@ -573,6 +588,7 @@ const refundNote = (b) => (b.connectAccount ? '. Deposit is in your Stripe accou
 async function onPaid(id) {
   const { booking: b, changed, conflict } = booking.markPaid(id);
   if (!b || !changed) return b;
+  if (!conflict) outcomes.paid(b);
   const lead = store.db.leads.find((l) => l.id === b.leadId) || { id: b.leadId, phone: b.phone, name: b.name, need: b.need };
   if (conflict) {
     await sendSms(b.phone, agent.texts.paidConflict(b));
@@ -629,7 +645,7 @@ async function buzzOwner(lead) {
 // Public form throttles (per client IP).
 const formLimit = (name, max) => sec.rateLimit({ windowMs: sec.num(process.env.FORM_RATE_WINDOW_MINUTES, 10) * 60000, max: sec.num(process.env[name], max) });
 const waitlistLimit = formLimit('WAITLIST_RATE_MAX', 30), setupLimit = formLimit('SETUP_RATE_MAX', 20), checkoutLimit = formLimit('CHECKOUT_RATE_MAX', 30);
-app.locals.resetFormLimits = () => { waitlistLimit.reset(); setupLimit.reset(); checkoutLimit.reset(); };
+app.locals.resetFormLimits = () => { waitlistLimit.reset(); setupLimit.reset(); checkoutLimit.reset(); verifyLimit.reset(); };
 // Waitlist
 app.post('/api/waitlist', waitlistLimit, (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
@@ -752,6 +768,40 @@ function sameOrigin(req, res, next) {
   return res.status(403).send(r === 'cross' ? 'cross-origin request refused' : 'cross-origin request refused (missing Origin)');
 }
 require('./vendorRoutes').register(app, { requireAdmin, BASE, sameOrigin });
+// ---------- Outcomes log (src/outcomes.js) ----------
+// Admin: /admin/outcomes (counts per stage + recent records), /admin/outcomes.csv (operations, includes phones/emails),
+// /admin/outcomes-training.csv (de-identified: no phone/email/name, salted caller hash, opted-out callers excluded).
+async function allOutcomes() {
+  const rows = outcomes.recordsOf(store.root), names = { legacy: env.BUSINESS_NAME || 'Legacy line' };
+  for (const shop of vendors.all().filter((s) => s.status !== 'provisioning')) {
+    names[shop.id] = shop.name;
+    try { rows.push(...outcomes.recordsOf(await vendors.scopedStore(shop))); } catch { console.error('[outcomes] a vendor store is unavailable; its outcomes are left out of this view'); }
+  }
+  rows.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+  return { rows, names };
+}
+const csvReply = (res, name, csv) => res.set('Content-Disposition', `attachment; filename="${name}"`).type('text/csv; charset=utf-8').send(csv);
+app.get('/admin/outcomes', requireAdmin, async (req, res) => {
+  const { rows, names } = await allOutcomes();
+  res.type('html').send(require('./workspacePages').outcomes({ counts: outcomes.counts(rows), rows, shopNames: names, maskPhone: sec.maskPhone,
+    emailStep: outcomes.emailStepOn(), maxRecords: outcomes.maxRecords() }));
+});
+app.get('/admin/outcomes.csv', requireAdmin, async (req, res) => csvReply(res, 'outcomes.csv', outcomes.fullCsv((await allOutcomes()).rows)));
+app.get('/admin/outcomes-training.csv', requireAdmin, async (req, res) => csvReply(res, 'outcomes-training.csv', outcomes.trainingCsv((await allOutcomes()).rows)));
+// Public one-tap email confirmation (OUTCOMES_EMAIL_STEP=1). The token (48 hex) is looked up by its SHA-256 in the
+// platform store; the record is updated in its own shop's store. Idempotent. Unknown/expired tokens get a plain 404.
+const verifyLimit = formLimit('OUTCOMES_VERIFY_RATE_MAX', 30);
+const verifyPage = (ok) => `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex, nofollow"><title>${ok ? 'Email confirmed' : 'Link not valid'} | BuzzCall</title><link rel="stylesheet" href="/styles.css"></head><body><main class="doc"><div class="wrap"><h1>${ok ? 'Thanks, your email is confirmed.' : 'This link is not valid or has expired.'}</h1><p>${ok ? 'You can close this page.' : 'Nothing was changed.'}</p></div></main></body></html>`;
+app.get('/o/verify/:token', verifyLimit, async (req, res) => {
+  res.set('Cache-Control', 'private, no-store').set('Referrer-Policy', 'no-referrer');
+  let r = null;
+  try {
+    const e = outcomes.lookupToken(req.params.token);
+    const run = () => outcomes.verify(req.params.token);
+    if (e) r = e.shopId ? await vendors.run(e.shopId, run, { suspended: true }) : shopContext.run(null, run);
+  } catch { r = null; }
+  res.status(r ? 200 : 404).type('html').send(verifyPage(!!r));
+});
 app.post('/admin/setups/:id/apply', requireAdmin, (req, res) => {
   const s = store.findSetup(req.params.id);
   if (!s) return res.status(404).json({ error: 'setup not found' });

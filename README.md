@@ -87,6 +87,30 @@ See `.env.example`. Key ones: `BUSINESS_NAME`, `VERTICAL` (home_services|braider
 - Logs never contain the API key, full addresses or message bodies.
 - **Domain verification is required.** Resend only sends from `trybuzzcall.com` after the domain is verified: add the domain in the Resend dashboard (Domains > Add domain), then add the DNS records it shows at Namecheap (Domain List > trybuzzcall.com > Advanced DNS). Typically: an MX record and an SPF TXT record (`v=spf1 include:amazonses.com ~all`) on the `send` subdomain, and a DKIM TXT record at `resend._domainkey` with the key Resend generates; a DMARC TXT record at `_dmarc` (for example `v=DMARC1; p=none;`) is recommended. Copy the exact values from Resend, then click Verify. Until it is verified, sends fail with an HTTP error in the logs (signups are still saved).
 
+## Outcomes log (`src/outcomes.js`)
+One record per missed call, keyed by Twilio `CallSid` and stored in the shop's own store (`db.outcomes`), updated as the
+call progresses: `missed` -> `consented` / `no_consent` -> `conversed` -> `slot_offered` -> `booked` -> `deposit_paid`, or
+`opted_out` (stages only move forward; opted_out wins). Each record has the shop id/slug, time, hour-of-day and weekday
+(shop time zone), `phone_verified` (the caller pressed 1 from that caller ID; method `voice_press_1` and time), the caller
+phone (operations only), service requested, urgency (keyword rule: emergency, leak, flood, no heat, no hot water, ASAP, ...
+plus the trade's own urgent words), callback time, booking/deposit, and when the owner was buzzed
+(`owner_buzz_latency_ms`). The owner's own reply is not observable today, so `owner_response_ms` stays empty. Every hook is
+failure-safe: a logging error is logged and ignored, never breaking the voice or SMS webhook.
+- **Opt-outs:** any opt-out (STOP, plain-language, Twilio 21610) sets `training_excluded=true` on all of that caller's
+  records (kept after a later START) and marks the latest one `opted_out`.
+- **Admin:** `/admin/outcomes` (counts per stage, recent records with masked phones), `/admin/outcomes.csv` (operations,
+  includes phone and email), `/admin/outcomes-training.csv` (de-identified: no phone, email, name or CallSid; the caller is
+  an HMAC-SHA256 hash salted with `OUTCOMES_HASH_SALT`, else a random salt persisted in the platform store; phone numbers,
+  emails and the caller's name are scrubbed from free text at capture; `training_excluded` rows are left out). All behind
+  admin auth.
+- **Retention:** `OUTCOMES_MAX_RECORDS` (default 10000) per shop; past the cap the oldest records are pruned on insert.
+  Outcomes are not purged by `RETENTION_DAYS`. Note: the shop's whole store is one JSON document, so a large cap makes
+  each save bigger; lower the cap if saves get slow.
+- **Optional email step:** `OUTCOMES_EMAIL_STEP=1` (default off: production behaviour unchanged). After booking, the caller
+  is asked "Want a confirmation by email? Reply with your email or SKIP." A valid address is stored as `email_unverified`
+  and a one-tap link `/o/verify/:token` (valid 7 days) sets `email_verified=true`. Without `RESEND_API_KEY` nothing is
+  emailed; the address is still stored.
+
 ## Vendor sign-in limits
 
 Failed vendor logins/activations are limited per account+IP (`VENDOR_LOGIN_MAX_FAILS`, 10 / 15 min), per account (`VENDOR_ACCOUNT_MAX_FAILS`, 100 / 15 min) and per IP (`VENDOR_IP_MAX_FAILS`, 30 / 10 min). `VENDOR_GLOBAL_MAX_ATTEMPTS` (5000 / 10 min) is only a backstop, so a few IPs cannot lock every vendor out.

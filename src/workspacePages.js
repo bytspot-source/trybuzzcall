@@ -6,7 +6,7 @@ const trades = require('./trades');
 const adminShell = {
   basePath: '/admin', caption: 'PLATFORM ADMIN', breadcrumb: 'Platform admin',
   businessName: 'BuzzCall platform', identityCaption: 'Platform administrator',
-  nav: [['vendors', 'Vendors', 'overview', '/admin'], ['legacy', 'Legacy workspace', 'database', '/admin/legacy']],
+  nav: [['vendors', 'Vendors', 'overview', '/admin'], ['outcomes', 'Outcomes', 'checklist', '/admin/outcomes'], ['legacy', 'Legacy workspace', 'database', '/admin/legacy']],
   active: 'vendors', headerAction: { href: '/vendor/login', label: 'Vendor sign in', icon: 'external' },
 };
 const vendorShell = {
@@ -139,4 +139,19 @@ function settings({ shop = {}, values = {}, error, message } = {}) {
 function message({ title = 'Workspace notice', message: text = 'Please try again or contact support.', status } = {}) {
   return page({ title, area: 'payment', script: false, body: `<section class="result-card">${heading('BuzzCall workspace', title, text)}${status != null ? `<p class="muted">Status: ${esc(status)}</p>` : ''}<div class="action-row"><a class="button button-primary" href="/vendor/login">Vendor sign in</a><a class="button button-outline" href="/admin">Platform admin · separate access</a></div></section>` });
 }
-module.exports = { platform, vendorDetail, auth, invitation, settings, message };
+// Outcomes log (src/outcomes.js): counts per stage and the most recent records. Phones are masked on screen; the full
+// CSV (/admin/outcomes.csv) has them for operations, the training CSV has none.
+const STAGE_LABELS = { missed: 'Missed', no_consent: 'No consent', consented: 'Consented', conversed: 'Conversed', slot_offered: 'Slot offered',
+  booked: 'Booked', deposit_paid: 'Deposit paid', opted_out: 'Opted out' };
+function outcomes({ counts = {}, rows = [], shopNames = {}, maskPhone = (p) => p, limit = 200, emailStep = false, maxRecords = 0 } = {}) {
+  const by = counts.byStage || {};
+  const cards = `<div class="metric-grid">${metric('Outcomes', counts.total ?? 0, 'Missed calls recorded (all shops)')}${metric('Phone verified', counts.phoneVerified ?? 0, 'Caller pressed 1 from that caller ID')}${metric('Training excluded', counts.trainingExcluded ?? 0, 'Opted out: never in the training export')}${metric('Booked + paid', (by.booked || 0) + (by.deposit_paid || 0), 'Current stage booked or deposit paid')}</div>`;
+  const stageRows = Object.keys(STAGE_LABELS).map(k => `<tr><td>${esc(STAGE_LABELS[k])}</td><td>${esc(by[k] || 0)}</td></tr>`).join('');
+  const recent = rows.slice(0, limit).map(r => `<tr><td class="nowrap">${esc(date(r.created_at, { hour: 'numeric', minute: '2-digit' }))}</td><td>${esc(shopNames[r.shop_id] || r.shop_slug || r.shop_id || '')}</td><td class="nowrap">${esc(maskPhone(r.caller_phone || ''))}</td><td>${badge(STAGE_LABELS[r.result_stage] || r.result_stage || 'Not recorded', r.result_stage === 'deposit_paid' || r.result_stage === 'booked' ? 'good' : r.result_stage === 'opted_out' || r.result_stage === 'no_consent' ? 'warning' : 'neutral')}</td><td>${esc(r.phone_verified ? 'Yes' : 'No')}</td><td>${esc(r.service || '')}</td><td>${esc(r.urgency || '')}</td><td>${esc(r.callback_time || '')}</td><td>${esc(r.training_excluded ? 'Excluded' : 'Included')}</td></tr>`).join('');
+  const exports = `<div class="action-row"><a class="button button-primary" href="/admin/outcomes.csv">Download CSV (operations, includes phones)</a><a class="button button-outline" href="/admin/outcomes-training.csv">Download de-identified training CSV</a></div><p class="muted">The training CSV drops phone, email and name, replaces the caller with a salted hash and leaves out every caller who opted out. Records are capped at ${esc(maxRecords)} per shop (oldest pruned first). Email step: ${esc(emailStep ? 'on' : 'off')}.</p>`;
+  const body = heading('Platform administration', 'Outcomes', 'One record per missed call, updated as the call progresses.') + cards +
+    `<div class="grid-two">${panel('Count per stage', table(['Stage', 'Records'], stageRows, 'Outcomes per stage'))}${panel('Exports', exports)}</div>` +
+    `<section class="panel"><div class="panel-header"><h2>Recent outcomes</h2><span class="count-label">${esc(Math.min(rows.length, limit))} shown</span></div>${recent ? table(['When', 'Shop', 'Caller', 'Stage', 'Verified', 'Service', 'Urgency', 'Callback', 'Training'], recent, 'Recent outcomes') : empty('No outcomes yet', 'Missed calls will appear here.')}</section>`;
+  return page({ ...adminShell, active: 'outcomes', title: 'Outcomes', body, script: false });
+}
+module.exports = { platform, vendorDetail, auth, invitation, settings, message, outcomes };
