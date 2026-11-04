@@ -527,7 +527,15 @@ test('vendor isolation and verified provider routing over local HTTP', { timeout
     f.barrier(2);
     const consents = await Promise.all(calls.map(body => f.signed('/twilio/voice/consent', { ...body, Digits: '1' })));
     for (const response of consents) status(response, 200);
-    assert.equal(f.messages.length, 2, 'One initial caller text per shop');
+    assert.equal(f.messages.filter(message => message.to === CALLER).length, 2, 'One initial caller text per shop');
+    // Instant missed-call buzz (sent after the TwiML reply): exactly one per shop, from that shop's line to that shop's owner.
+    for (let i = 0; i < 50 && f.messages.length < 4; i++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(f.messages.length, 4, 'Two caller texts plus one owner buzz per shop');
+    for (const [i, shop] of [a, b].entries()) {
+      const buzz = f.messages.filter(message => message.to === `+1470555019${i + 1}`);
+      check(buzz.length === 1 && buzz[0].from === shop.number && buzz[0].after === shop.id && /Missed call from \+14705550123 just now\. Pressed 1 - texting them now\.$/.test(buzz[0].body),
+        'Instant buzz routes to the receiving shop owner from that shop line');
+    }
     for (const [i, shop] of [a, b].entries()) {
       const log = await f.vendors.run(shop.id, () => f.store.db.voiceConsents || []);
       check(log.length === 1 && log[0].callSid === calls[i].CallSid && log[0].from === CALLER && log[0].shopId === shop.id && log[0].digits === '1' && log[0].consented === true,
