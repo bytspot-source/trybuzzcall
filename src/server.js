@@ -319,6 +319,77 @@ async function noNameAlert(shopId, where) {
 sms.setNoNameAlert(({ shopId } = {}) => noNameAlert(shopId, 'outbound text'));
 app.locals.resetNoNameAlerts = () => { noNameAlertedAt = new Map(); };
 
+// Instant owner buzz: ONE short SMS to the shop owner per missed call (on top of the end-of-conversation buzz).
+// INSTANT_MISSED_BUZZ=0 turns it off (default on). The wording needs the press-1 outcome, so:
+//  - caller hears the opt-in prompt -> buzz from /twilio/voice/consent as soon as they answer (1, other key or no
+//    input); if they hang up during the prompt Twilio never posts the consent result, so a fallback timer
+//    (INSTANT_MISSED_BUZZ_FALLBACK_SECONDS, default 60) sends the "didn't opt in" buzz instead;
+//  - caller isn't offered texts (opted out / paused / no shop name) -> buzz right away.
+// Deduped by CallSid in the shop's own store (db.missedBuzzes, 24h), so repeated status callbacks, the consent
+// callback and the fallback timer can never buzz twice. Anonymous/blank/non-US-Canada caller IDs (sec.isNanp) get
+// no buzz: there is no number to call back, and it keeps robocall/toll-fraud floods from turning into owner SMS.
+// Lapsed shops (billing.access) get none. Owner alerts don't count toward caller text caps, so a separate per-line
+// ceiling (INSTANT_MISSED_BUZZ_MAX_PER_HOUR, default 30) bounds a call flood.
+const instantBuzzOn = () => String(env.INSTANT_MISSED_BUZZ ?? '').trim() !== '0';
+const instantBuzzFallbackMs = () => sec.num(process.env.INSTANT_MISSED_BUZZ_FALLBACK_SECONDS, 60) * 1000;
+const instantBuzzTimers = new Map();
+let instantBuzzLimit = null, instantBuzzLimitMax = null;
+const instantBuzzKey = (callSid) => `${shopContext.shopId() || 'legacy'}:${callSid}`;
+const validCallSid = (s) => typeof s === 'string' && /^[A-Za-z0-9]{1,80}$/.test(s);
+const MISSED_BUZZ_OUTCOMES = {
+  texting: 'Pressed 1 - texting them now.',
+  not_sent: 'Pressed 1 but no text went out - call them back.',
+  no_optin: "Didn't opt in to texts - call them back.",
+  opted_out: 'Opted out of texts - call them back.',
+};
+const missedBuzzText = (from, outcome) => `BUZZ ${env.BUSINESS_NAME || ''}: Missed call from ${from} just now. ${MISSED_BUZZ_OUTCOMES[outcome] || MISSED_BUZZ_OUTCOMES.no_optin}`;
+function missedBuzzSeen(callSid) {
+  const t = (store.db.missedBuzzes ||= {}), now = Date.now();
+  for (const [k, v] of Object.entries(t)) if (now - Date.parse(v) >= 86400000) delete t[k];
+  return !!t[callSid];
+}
+// Sends the buzz once per CallSid. Returns true when this call sent it.
+async function missedBuzz(callSid, from, outcome) {
+  if (!instantBuzzOn() || !validCallSid(callSid)) return false;
+  const key = instantBuzzKey(callSid);
+  const timer = instantBuzzTimers.get(key);
+  if (timer) { clearTimeout(timer); instantBuzzTimers.delete(key); }
+  if (!sec.isNanp(from) || missedBuzzSeen(callSid)) return false;
+  store.db.missedBuzzes[callSid] = new Date().toISOString();
+  const keys = Object.keys(store.db.missedBuzzes);
+  if (keys.length > 2000) for (const k of keys.slice(0, keys.length - 2000)) delete store.db.missedBuzzes[k];
+  store.save();
+  if (!billing.access().active) { console.log(`[buzz] no instant buzz for ${sec.maskPhone(from)}: shop subscription inactive`); return false; }
+  const max = sec.num(process.env.INSTANT_MISSED_BUZZ_MAX_PER_HOUR, 30);
+  if (max > 0) {
+    if (!instantBuzzLimit || instantBuzzLimitMax !== max) { instantBuzzLimit = sec.limiter({ windowMs: 3600000, max }); instantBuzzLimitMax = max; }
+    if (!instantBuzzLimit.hit(shopContext.shopId() || 'legacy').ok) { console.error(`[buzz] instant missed-call buzz limit reached (${max}/hour) on this line: not buzzing for ${sec.maskPhone(from)}`); return false; }
+  }
+  await owner(null, missedBuzzText(from, outcome));
+  return true;
+}
+// Called when a call is determined missed. `offered` = the caller hears the press-1 prompt (consent callback buzzes).
+async function armMissedBuzz(callSid, from, offered) {
+  if (!instantBuzzOn() || !validCallSid(callSid)) return;
+  if (!sec.isNanp(from)) { console.log(`[buzz] no instant buzz: caller id ${from ? sec.maskPhone(String(from).slice(0, 20)) : '(blank)'} is ${sec.nanpReason(from)}`); return; }
+  if (missedBuzzSeen(callSid)) return;
+  if (!offered) return void await missedBuzz(callSid, from, store.isOptedOut(from) || store.isPaused(from) ? 'opted_out' : 'no_optin');
+  const key = instantBuzzKey(callSid);
+  if (instantBuzzTimers.has(key)) return;
+  // Timers keep the request's shop context (AsyncLocalStorage), so the fallback reaches the right owner and store.
+  const timer = setTimeout(() => {
+    instantBuzzTimers.delete(key);
+    missedBuzz(callSid, from, 'no_optin').catch((e) => console.error('instant buzz failed:', e.message));
+  }, instantBuzzFallbackMs());
+  timer.unref?.();
+  instantBuzzTimers.set(key, timer);
+}
+// Webhook handlers don't wait on the owner SMS (the caller's TwiML goes back right away); the dedupe mark is set
+// synchronously before the send, so a repeat callback arriving meanwhile still can't buzz twice.
+const buzzLater = (p) => { p.catch((e) => console.error('instant buzz failed:', e.message)); };
+app.locals.instantBuzzPending = () => instantBuzzTimers.size;
+app.locals.resetInstantBuzz = () => { for (const t of instantBuzzTimers.values()) clearTimeout(t); instantBuzzTimers.clear(); instantBuzzLimit = null; };
+
 // 1) Incoming call: forward to owner if configured, else treat as missed
 const routeTwilio = (callback = false) => async (req, res, next) => {
   const destination = await vendors.twilioShop(req.body, callback);
@@ -343,14 +414,20 @@ app.post('/twilio/voice', verifyTwilio, routeTwilio(), async (req, res) => {
   if (env.FORWARD_TO_PHONE) {
     return twiml(res, `<Dial timeout="${env.RING_TIMEOUT_SECONDS || 20}" action="${BASE}/twilio/voice/status">${env.FORWARD_TO_PHONE}</Dial>`);
   }
-  twiml(res, await missedCallTwiml(req.body.From)); // opt-in prompt; nothing is texted until the caller presses 1
+  const xml = await missedCallTwiml(req.body.From); // opt-in prompt; nothing is texted until the caller presses 1
+  buzzLater(armMissedBuzz(req.body.CallSid, req.body.From, xml.includes('<Gather')));
+  twiml(res, xml);
 });
 
 // 2) Dial result: no-answer/busy/failed => missed call
 app.post('/twilio/voice/status', verifyTwilio, routeTwilio(true), async (req, res) => {
   const s = req.body.DialCallStatus;
   if (recordVendorCall(req, ['no-answer','busy','failed','canceled'].includes(s) ? 'missed' : s === 'completed' ? 'answered' : 'ringing') === false) return twiml(res, '<Hangup/>');
-  if (['no-answer', 'busy', 'failed', 'canceled'].includes(s)) return twiml(res, await missedCallTwiml(req.body.From)); // same consent gate
+  if (['no-answer', 'busy', 'failed', 'canceled'].includes(s)) {
+    const xml = await missedCallTwiml(req.body.From); // same consent gate
+    buzzLater(armMissedBuzz(req.body.CallSid, req.body.From, xml.includes('<Gather')));
+    return twiml(res, xml);
+  }
   twiml(res, '<Hangup/>');
 });
 
@@ -362,8 +439,9 @@ app.post('/twilio/voice/consent', verifyTwilio, routeTwilio(true), async (req, r
   const entry = await consent.record({ callSid: req.body.CallSid, from, digits });
   const call = shopContext.current() && (store.db.calls || []).find((c) => c.id === req.body.CallSid);
   if (call) { call.consent = entry.consented ? 'yes' : entry.digits ? 'declined' : 'no_input'; store.save(); }
-  if (!entry.consented) return twiml(res, consent.goodbyeTwiml(entry.digits));
+  if (!entry.consented) { buzzLater(missedBuzz(req.body.CallSid, from, 'no_optin')); return twiml(res, consent.goodbyeTwiml(entry.digits)); }
   const texted = sec.isNanp(from) ? await startTextBack(from) : false;
+  buzzLater(missedBuzz(req.body.CallSid, from, texted ? 'texting' : 'not_sent'));
   twiml(res, `<Say>${texted ? missedSay() : consentNoTextSay()}</Say><Hangup/>`);
 });
 

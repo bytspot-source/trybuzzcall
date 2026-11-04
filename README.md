@@ -97,6 +97,7 @@ Failed vendor logins/activations are limited per account+IP (`VENDOR_LOGIN_MAX_F
 3. Number → Voice "A call comes in": `POST {PUBLIC_BASE_URL}/twilio/voice`
 4. Number → Messaging "A message comes in": `POST {PUBLIC_BASE_URL}/twilio/sms`
 5. Set `FORWARD_TO_PHONE` to the owner's cell. Calls ring there for `RING_TIMEOUT_SECONDS`, and if unanswered the text-back starts. Alternative: keep the shop's existing number and set *conditional call forwarding (no-answer)* on the carrier to the Twilio number, leaving `FORWARD_TO_PHONE` empty.
+   Either way the owner gets an instant buzz per missed call ("BUZZ <shop>: Missed call from <number> just now. Pressed 1 - texting them now." / "... Didn't opt in to texts - call them back."); `INSTANT_MISSED_BUZZ=0` turns it off.
 6. When Twilio keys are set, webhook signatures are validated against `PUBLIC_BASE_URL`, so it must match the public URL exactly.
 
 ## Public tunnel
