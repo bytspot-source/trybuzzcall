@@ -88,6 +88,7 @@ ${bubble('out', consent.startText(name))}
 <li><b>Reply STOP to opt out, HELP for help.</b> Reply START to resubscribe. Carriers are not liable for delayed or undelivered messages.</li>
 <li>Consent to receive texts is not a condition of purchase.</li>
 <li>Mobile numbers and SMS opt-in data are not shared with or sold to third parties or affiliates for marketing purposes.</li>
+<li>Call and text details may be used, with personal details removed, to improve BuzzCall's service, including AI features. They are never sold or shared for marketing.</li>
 <li>Help: ${esc(consent.SUPPORT_PHONE)} · <a href="mailto:${esc(consent.SUPPORT_EMAIL)}">${esc(consent.SUPPORT_EMAIL)}</a></li>
 </ul>
 <p>See the <a href="/privacy">Privacy Policy</a> and <a href="/terms">Terms</a> (including the <a href="/terms#sms">SMS Terms</a>).</p>

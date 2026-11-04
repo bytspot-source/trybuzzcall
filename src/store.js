@@ -80,6 +80,22 @@ function ensureDir(dir, name, warnings) {
 }
 const FILE_MODE = { mode: 0o600 };
 
+// Outcomes log (src/outcomes.js): any opt-out (STOP, a plain-language revocation, Twilio 21610) excludes every outcome
+// record of that caller from the de-identified training export, and marks their latest record's stage opted_out.
+// Kept even after a later START (we don't re-include data the caller asked us to stop using). Never throws.
+function excludeOutcomes(db, phone) {
+  try {
+    const list = Object.values(db.outcomes && typeof db.outcomes === 'object' ? db.outcomes : {}).filter((o) => o && o.caller_phone === phone);
+    if (!list.length) return false;
+    const at = new Date().toISOString();
+    let changed = false;
+    for (const o of list) if (!o.training_excluded) { o.training_excluded = true; o.training_excluded_reason = 'opt_out'; o.training_excluded_at = at; changed = true; }
+    const latest = list.reduce((a, b) => (String(b.created_at || '') > String(a.created_at || '') ? b : a));
+    if (latest.result_stage !== 'opted_out') { latest.result_stage = 'opted_out'; (latest.stage_at ||= {}).opted_out = at; latest.updated_at = at; changed = true; }
+    return changed;
+  } catch (e) { console.error('[store] outcomes opt-out marking failed (ignored):', e && e.message); return false; }
+}
+
 function createStore(opts = {}) {
   // Only trusted, stable shop IDs belong here, never paths or raw request input.
   const namespace = opts.namespace;
@@ -318,6 +334,7 @@ function createStore(opts = {}) {
       let changed = false;
       if (!db.optOuts[phone]) { db.optOuts[phone] = { at: new Date().toISOString(), source: String(source || 'unknown').slice(0, 40) }; changed = true; }
       for (const l of db.leads) if (l.phone === phone && l.status !== 'done' && l.status !== 'opted_out') { l.status = 'opted_out'; changed = true; }
+      if (excludeOutcomes(db, phone)) changed = true;
       if (!changed) return Promise.resolve();
       save();
       const entry = { op: 'out', phone, at: db.optOuts[phone].at, source: db.optOuts[phone].source };
