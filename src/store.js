@@ -16,7 +16,7 @@ const FLUSH_DELAY_MS = 200;
 const RETRY_DELAY_MS = 5000;
 const TABLE = 'buzz_kv';
 
-const defaultDb = () => ({ leads: [], alerts: [], waitlist: [], bookings: [], billing: {}, setups: [], optOuts: {} });
+const defaultDb = () => ({ leads: [], alerts: [], waitlist: [], bookings: [], billing: {}, setups: [], optOuts: {}, deposits: [], vendorDebt: {}, depositsMeta: { offsetMs: 0, events: [] } });
 
 function pgConfig(url) {
   const cfg = { connectionString: url, max: 3, connectionTimeoutMillis: 10000, idleTimeoutMillis: 30000 };

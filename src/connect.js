@@ -1,14 +1,14 @@
-// Stripe Connect for deposits: each shop owner has their own Stripe account (v1 Accounts, default controller
-// properties = Standard-equivalent: Stripe collects requirements, owner pays Stripe fees, Stripe covers losses, full
-// Dashboard). Deposit Checkout Sessions are DIRECT charges created on that account (Stripe-Account header), so the
-// shop is merchant of record and the money never touches BuzzCall's balance. See docs/stripe-connect-plan.md.
+// Stripe Connect for deposit payouts: Express accounts for vendors. Customer deposits are charged on BuzzCall's
+// platform account (separate charges + transfers — see src/deposits.js). Funds are NOT sent to the vendor at booking;
+// a Transfer runs after the appointment. Destination charges transfer immediately, so they cannot delay payout until
+// after the job. Express + separate charges/transfers cleanly support held funds, delayed release, refunds before
+// transfer, and transfer reversals after release.
 //
 // State lives in the config override (store.getOverride().stripeConnect, persisted to Postgres/config.json):
 //   { accountId, mode: 'live'|'test'|'mock', source: 'onboarding'|'env', chargesEnabled, detailsSubmitted,
 //     payoutsEnabled, requirementsDue[], disabledReason, deauthorized, checkedAt, updatedAt }
-// STRIPE_CONNECT_ACCOUNT_ID (env) is only a backward-compatible fallback for the account id; readiness is always
-// read from Stripe (charges_enabled) before deposits are taken.
-// Mock mode (no STRIPE_SECRET_KEY): no Stripe calls; onboarding is simulated (/admin/connect/mock).
+// STRIPE_CONNECT_ACCOUNT_ID (env) is only a backward-compatible fallback for the account id.
+// Mock mode (no STRIPE_SECRET_KEY): no Stripe calls; onboarding is simulated (/admin/connect/mock or /vendor/connect/mock).
 const crypto = require('crypto');
 const store = require('./store');
 const shopContext = require('./shopContext');
@@ -41,14 +41,14 @@ function state() {
   return null;
 }
 const accountId = () => state()?.accountId || null;
-// 'not_connected' | 'pending' | 'charges_enabled'
+// 'not_connected' | 'pending' | 'charges_enabled' (payouts ready when charges_enabled for Express)
 function status() { const s = state(); return !s ? 'not_connected' : s.chargesEnabled ? 'charges_enabled' : 'pending'; }
 const statusLabel = (st = status()) => ({ not_connected: 'Not connected', pending: 'Pending (onboarding not finished or Stripe review)', charges_enabled: 'Charges enabled' }[st]);
 
 function fromAccount(a, source) {
   return { accountId: a.id, mode: mode(), source, chargesEnabled: !!a.charges_enabled, detailsSubmitted: !!a.details_submitted,
     payoutsEnabled: !!a.payouts_enabled, requirementsDue: [...(a.requirements?.currently_due || [])].slice(0, 20),
-    disabledReason: a.requirements?.disabled_reason || null, checkedAt: new Date().toISOString() };
+    disabledReason: a.requirements?.disabled_reason || null, checkedAt: new Date().toISOString(), accountType: 'express' };
 }
 // Account object (from retrieve or an account.updated event) -> state. Ignores other accounts.
 function applyAccount(a) {
@@ -62,25 +62,25 @@ async function refresh() {
   applyAccount(await stripe().accounts.retrieve(id));
   return state();
 }
-// Before a deposit: re-check Stripe if the account isn't known to be ready (e.g. env-only id), at most every 5 min.
+// Before reading payout readiness: re-check Stripe if the account isn't known to be ready, at most every 5 min.
 async function ensureFresh(maxAgeMs = 5 * 60000) {
   const s = state();
   if (!s || mode() === 'mock' || s.chargesEnabled) return s;
   if (s.checkedAt && Date.now() - Date.parse(s.checkedAt) < maxAgeMs) return s;
   try { return await refresh(); } catch (e) { console.error('[connect] account refresh failed:', e.message); return state(); }
 }
-// Account to create deposit Checkout Sessions on, or null (fail closed). Mock mode has no real money: deposits keep
-// using /pay/mock and are tagged with the mock account if one was "onboarded".
+// Connected Express account ready for payouts (transfers), or null.
 function chargeAccount() {
   const s = state();
   return s && s.chargesEnabled ? s.accountId : null;
 }
-const depositsReady = () => mode() === 'mock' || !!chargeAccount();
+// Deposits are always taken on the platform when Stripe (or mock) is available; Connect only gates payouts.
+const depositsReady = () => mode() === 'mock' || !!key();
+const payoutsReady = () => mode() === 'mock' ? !!chargeAccount() : !!chargeAccount();
 
-// Admin onboarding: create the account if none, then a single-use Account Link. Returns { url, accountId, created }.
+// Admin/vendor onboarding: create Express account if none, then a single-use Account Link.
 const onboarding = new Map();
 async function persistAccount() {
-  // Retry the write too: file-backend failures can leave the account in memory only.
   save(stored());
   await store.flush();
   const s = store.status();
@@ -100,7 +100,7 @@ async function onboardAccount(BASE, prefill = {}) {
     let s = stored();
     if (!s || s.mode !== 'mock' || s.deauthorized) {
       s = { accountId: `acct_mock_${crypto.randomBytes(6).toString('hex')}`, mode: 'mock', source: 'onboarding', chargesEnabled: false,
-        detailsSubmitted: false, payoutsEnabled: false, requirementsDue: ['mock onboarding'] };
+        detailsSubmitted: false, payoutsEnabled: false, requirementsDue: ['mock onboarding'], accountType: 'express' };
       save(s);
     }
     if (shopContext.current()) await persistAccount();
@@ -109,9 +109,8 @@ async function onboardAccount(BASE, prefill = {}) {
   let id = accountId(), created = false;
   if (!id) {
     const params = {
-      // Default controller properties, spelled out (= Standard): owner pays Stripe fees, Stripe owns losses and
-      // requirement collection, full Stripe Dashboard. No `type`.
-      controller: { fees: { payer: 'account' }, losses: { payments: 'stripe' }, requirement_collection: 'stripe', stripe_dashboard: { type: 'full' } },
+      type: 'express',
+      capabilities: { transfers: { requested: true }, card_payments: { requested: true } },
       metadata: { platform: 'buzzcall', ...(shopContext.current() ? { shopId: shopContext.shopId() } : {}) },
     };
     const bp = {};
@@ -140,8 +139,7 @@ function deauthorize() { const s = state(); if (s) save({ ...s, chargesEnabled: 
 // Livemode guard for Connect webhook events: test keys only accept test events, live keys only live events.
 const livemodeOk = (event) => mode() === 'mock' || event.livemode === undefined || !!event.livemode === (mode() === 'live');
 
-// Lead fee as a direct-charge application fee (cents). 0 when waived. When enabled it is capped at
-// amount - 1 cent (Stripe requires fee < charge) and at no more than 1/3 of the deposit.
+// Legacy lead-fee helper (still used when recording application-style fees against deposit amount).
 function applicationFeeCents(amountCents, leadFee, waived) {
   if (waived) return 0;
   const fee = Math.min(Math.round(Number(leadFee || 0) * 100), amountCents - 1, Math.floor(amountCents / 3));
@@ -152,8 +150,9 @@ function summary() {
   const s = state();
   return { mode: mode(), status: status(), label: statusLabel(), accountId: s?.accountId || null, source: s?.source || null,
     chargesEnabled: !!s?.chargesEnabled, detailsSubmitted: !!s?.detailsSubmitted, payoutsEnabled: !!s?.payoutsEnabled,
-    requirementsDue: s?.requirementsDue || [], disabledReason: s?.disabledReason || null, checkedAt: s?.checkedAt || null, depositsReady: depositsReady() };
+    requirementsDue: s?.requirementsDue || [], disabledReason: s?.disabledReason || null, checkedAt: s?.checkedAt || null,
+    depositsReady: depositsReady(), payoutsReady: payoutsReady(), accountType: s?.accountType || 'express' };
 }
 
-module.exports = { mode, state, accountId, status, statusLabel, summary, refresh, ensureFresh, chargeAccount, depositsReady, onboard,
-  mockComplete, deauthorize, applyAccount, livemodeOk, applicationFeeCents, stripe, setStripe };
+module.exports = { mode, state, accountId, status, statusLabel, summary, refresh, ensureFresh, chargeAccount, depositsReady,
+  payoutsReady, onboard, mockComplete, deauthorize, applyAccount, livemodeOk, applicationFeeCents, stripe, setStripe };

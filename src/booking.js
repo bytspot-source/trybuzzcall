@@ -118,35 +118,37 @@ function hold(lead, slot) {
   store.db.bookings.unshift(b); store.save(); return b;
 }
 
-// Stripe Connect DIRECT charge params (the Checkout Session itself is created on the shop's account via the
-// stripeAccount option, see depositLink). The lead fee, when not waived, is the application fee, capped at
-// deposit - 1 cent and at 1/3 of the deposit. Never transfer_data: funds never sit in BuzzCall's balance.
+// Platform Checkout Session payment_intent metadata. Deposit funds sit on the platform; vendor payout is a later
+// Transfer (src/deposits.js). Optional DEPOSIT_PLATFORM_FEE_PCT is applied at transfer time, not as application_fee.
+// Lead fee is recorded on the booking (due/waived/review) for invoicing — it is not an application fee on the charge.
 function connectParams(b, acct) {
   const c = cfg();
   const feeCents = connect.applicationFeeCents(Math.round(b.amount * 100), c.leadFee, c.leadFeeWaived);
-  b.connectAccount = acct; b.applicationFeeCents = feeCents;
+  // Tag the booking with the vendor's Connect account when known (payout target); charge still runs on the platform.
+  if (acct) b.connectAccount = acct;
+  b.applicationFeeCents = feeCents; // recorded for lead-fee bookkeeping only
   const shopId = require('./shopContext').shopId();
-  return { payment_intent_data: { ...(feeCents > 0 ? { application_fee_amount: feeCents } : {}),
-    metadata: { bookingId: b.id, ...(shopId ? { shopId } : {}) } } };
+  return { payment_intent_data: {
+    transfer_group: b.id,
+    metadata: { bookingId: b.id, ...(shopId ? { shopId } : {}), ...(acct ? { connectAccount: acct } : {}) } } };
 }
 
-// Fail closed: no ready connected account (live/test Stripe) => no deposit. The held booking becomes a plain booking
-// (no deposit) and the owner is told why. Returns the booking.
+// Kept for callers that previously skipped deposits when Connect was missing. Platform charges no longer need Connect;
+// prefer leaving the hold + pay link. Still available for explicit skip paths.
 function skipDeposit(b, reason = 'stripe_not_connected') {
   b.status = 'confirmed'; b.amount = 0; b.depositSkipped = reason; b.holdExpiresAt = null; store.save();
   return b;
 }
 
 // Records the lead fee on a paid booking (once). Status:
-//   'collected' = taken as Stripe Connect application fee; 'due' = to be invoiced monthly;
+//   'collected' = legacy direct-charge application fee; 'due' = to be invoiced / netted from payout;
 //   'waived' = LEAD_FEE_WAIVED (pilot); 'review' = paid but slot lost (refund deposit and fee).
 function recordLeadFee(b, conflict) {
   if (b.lead_fee_status) return b;
   const c = cfg();
-  const viaConnect = !!b.connectAccount;
-  const fee = viaConnect && b.applicationFeeCents != null ? b.applicationFeeCents / 100 : c.leadFee;
+  const fee = b.applicationFeeCents != null ? b.applicationFeeCents / 100 : c.leadFee;
   b.lead_fee = c.leadFeeWaived ? 0 : fee;
-  b.lead_fee_status = c.leadFeeWaived ? 'waived' : conflict ? 'review' : viaConnect ? 'collected' : 'due';
+  b.lead_fee_status = c.leadFeeWaived ? 'waived' : conflict ? 'review' : 'due';
   b.lead_fee_at = new Date().toISOString();
   return b;
 }
@@ -162,26 +164,26 @@ function leadFeeTotals() {
   return t;
 }
 
-// Returns the pay URL, or null when deposits can't be taken (fail closed: never a platform-account charge).
+// Returns the pay URL. Charges always run on the platform account (separate charges + delayed transfers).
+// A missing Connect account does NOT block the deposit: funds are held and payout stays pending until Connect is ready.
 async function depositLink(b, BASE) {
+  await connect.ensureFresh();
+  const acct = connect.chargeAccount(); // optional payout destination; may be null
   if (env.STRIPE_SECRET_KEY) {
-    await connect.ensureFresh();
-    const acct = connect.chargeAccount();
-    if (!acct) return null;
     const s = await connect.stripe().checkout.sessions.create({
       mode: 'payment',
       line_items: [{ quantity: 1, price_data: { currency: 'usd', unit_amount: Math.round(b.amount * 100),
         product_data: { name: b.service ? `Deposit: ${b.service} with ${env.BUSINESS_NAME || `your ${trade().pro || 'pro'}`}, ${b.slotLabel}` : `Deposit: ${env.BUSINESS_NAME || 'service'} visit ${b.slotLabel}` } } }],
-      metadata: { bookingId: b.id, ...(require('./shopContext').current() ? { shopId: require('./shopContext').shopId() } : {}) }, client_reference_id: b.id,
+      metadata: { bookingId: b.id, ...(require('./shopContext').current() ? { shopId: require('./shopContext').shopId() } : {}), ...(acct ? { connectAccount: acct } : {}) },
+      client_reference_id: b.id,
       expires_at: Math.floor(Date.now() / 1000) + Math.max(cfg().holdMin, 30) * 60, // Stripe min 30 min
       success_url: `${BASE}/payment/return?status=success`, cancel_url: `${BASE}/payment/return?status=cancel`,
       ...connectParams(b, acct),
-    }, { stripeAccount: acct });
+    }); // platform charge — no stripeAccount
     b.stripeSessionId = s.id; b.payUrl = s.url;
   } else {
     b.payUrl = `${BASE}/pay/mock/${b.id}`;
-    const mockAcct = connect.chargeAccount(); // mock: tag with the simulated connected account, if onboarded
-    if (mockAcct) connectParams(b, mockAcct);
+    connectParams(b, acct);
   }
   store.save();
   if (require('./shopContext').current()) {

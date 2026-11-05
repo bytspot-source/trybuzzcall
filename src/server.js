@@ -11,6 +11,7 @@ const agent = require('./agent');
 const booking = require('./booking');
 const billing = require('./billing');
 const connect = require('./connect');
+const deposits = require('./deposits');
 const setupRules = require('./setupRules');
 const setupPages = require('./setupPages');
 const adminPages = require('./adminPages');
@@ -66,20 +67,27 @@ app.post('/stripe/webhook', express.raw({ type: '*/*' }), async (req, res) => {
     }
   }
   catch (e) { console.error('billing webhook error:', e.message); return res.status(500).send('billing handler error'); }
-  // Vendor deposits are direct Connect charges; platform-account events cannot mark them paid.
-  if (!shopContext.current() && ['checkout.session.completed', 'checkout.session.async_payment_succeeded'].includes(event.type)) {
+  // Platform deposit checkouts (separate charges + transfers): mark paid on the platform webhook.
+  if (['checkout.session.completed', 'checkout.session.async_payment_succeeded'].includes(event.type)) {
     const s = event.data.object;
-    const id = s.metadata?.bookingId || s.client_reference_id;
-    if (id && s.payment_status !== 'unpaid') await onPaid(id);
+    if (!s.mode || s.mode === 'payment') {
+      const id = s.metadata?.bookingId || s.client_reference_id;
+      if (id && s.payment_status !== 'unpaid') {
+        await onPaid(id, {
+          sessionId: s.id,
+          paymentIntentId: typeof s.payment_intent === 'string' ? s.payment_intent : s.payment_intent?.id,
+        });
+      }
+    }
   }
+  try { await deposits.handleWebhookEvent(event); } catch (e) { console.error('deposits webhook error:', e.message); }
   res.json({ received: true });
   };
   return destination.shop ? vendors.run(destination.shop.id, handle, { suspended: true }) : handle();
 });
 // Stripe Connect webhook (endpoint scope "Connected accounts", its own signing secret STRIPE_CONNECT_WEBHOOK_SECRET).
-// Deposits are direct charges on the shop's account, so their checkout events arrive here with a top-level `account`.
-// Only events for THIS shop's connected account are acted on (every Connect endpoint of a platform receives every
-// connected account's events); others are acknowledged and ignored so Stripe doesn't retry them.
+// Deposit Checkout Sessions are now platform charges; this endpoint handles account.updated / deauthorized and any
+// legacy connected-account checkout events. Only events for THIS shop's connected account are acted on.
 app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   let event;
   try {
@@ -112,10 +120,13 @@ app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, re
         if (b && !b.paid) { b.paymentFailed = true; store.save(); }
         break;
       }
-      case 'account.updated': connect.applyAccount(o); break;
+      case 'account.updated':
+        connect.applyAccount(o);
+        try { await deposits.handleWebhookEvent(event); } catch (e) { console.error('deposits account.updated:', e.message); }
+        break;
       case 'account.application.deauthorized':
         connect.deauthorize();
-        await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: Stripe was disconnected from BuzzCall. Deposits are off until you reconnect Stripe.`);
+        await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: Stripe was disconnected from BuzzCall. Vendor payouts are paused until you reconnect Stripe. Customer deposits still work on the platform.`);
         break;
       default: return ignore('unhandled type');
     }
@@ -511,6 +522,14 @@ app.post('/twilio/sms', verifyTwilio, routeTwilio(), async (req, res) => {
   // Optional email step (OUTCOMES_EMAIL_STEP=1, default off): a reply to "Want a confirmation by email?" after booking.
   const emailStep = outcomes.emailReply(from, body, { base: BASE, sendVerify: (to, link) => mail.outcomeVerify(to, link, consent.shopName()) });
   if (emailStep) { await sendSms(from, emailStep.reply); return twiml(res, ''); }
+  // No-show check YES/NO: only when a check is pending for this number (does not collide with booking conversation).
+  const noshow = deposits.handleNoshowReply(from, body);
+  if (noshow) {
+    if (noshow.reply) await sendSms(from, noshow.reply);
+    if (noshow.ownerAlert) await owner(null, noshow.ownerAlert);
+    if (noshow.shopAlert && env.OWNER_PHONE) await sendSms(env.OWNER_PHONE, noshow.shopAlert, { kind: 'owner' });
+    return twiml(res, '');
+  }
   let lead = store.findOpenLead(from) || store.createLead(from);
   lead.messages.push({ dir: 'in', body });
   const { reply, completed, booking: b } = await agent.handleReply(lead, body);
@@ -562,8 +581,8 @@ async function onBooked(lead, b) {
   if (b.status === 'held') {
     let url;
     try { url = await booking.depositLink(b, BASE); } catch (e) { console.error('deposit link failed:', e.message); }
-    // Fail closed: null = Stripe live/test but the shop's connected account isn't ready. No deposit, plain booking.
-    if (url === null) booking.skipDeposit(b, 'stripe_not_connected');
+    // Platform charges: Connect is optional (payout pending). Only skip if depositLink hard-failed with no URL.
+    if (url === null) booking.skipDeposit(b, 'deposit_unavailable');
   }
   if (b.status === 'held') {
     const c = booking.cfg();
@@ -575,7 +594,7 @@ async function onBooked(lead, b) {
   const ask = outcomes.askEmail(lead); // null unless OUTCOMES_EMAIL_STEP=1
   if (ask) { lead.messages.push({ dir: 'out', body: ask }); store.save(); await sendSms(lead.phone, ask); }
   const status = b.status === 'held' ? `slot held, deposit pending ($${b.amount}, hold expires ${new Date(b.holdExpiresAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })})`
-    : b.depositSkipped ? 'BOOKED (no deposit; deposit off: Stripe not connected)' : 'BOOKED (no deposit)';
+    : b.depositSkipped ? `BOOKED (no deposit; deposit off: ${b.depositSkipped})` : 'BOOKED (no deposit)';
   if (b.service) await owner(lead.id, `BUZZ ${env.BUSINESS_NAME || ''}: ${status.replace('slot held', 'time held')}: ${lead.name || 'Caller (name not given)'}, ${lead.need}, ${b.slotLabel}. tel:${lead.phone}`);
   else await owner(lead.id, `${tag(lead)}BUZZ ${env.BUSINESS_NAME || ''}: ${status}: ${lead.name || 'Caller (name not given)'}, ${lead.need}, ${b.slotLabel}. Tap to call: tel:${lead.phone}`);
 }
@@ -583,12 +602,15 @@ async function onBooked(lead, b) {
 const money = (n) => (Number.isInteger(n) ? String(n) : Number(n).toFixed(2));
 const feeNote = (b) => b.lead_fee_status === 'waived' ? 'lead fee waived (pilot)' : `lead fee $${money(b.lead_fee || 0)}${b.lead_fee_status === 'collected' ? ' (auto-deducted)' : ''}`;
 
-// Deposits are paid into the shop's own Stripe account: refunds are issued by the owner there (no in-app refund tool).
-const refundNote = (b) => (b.connectAccount ? '. Deposit is in your Stripe account; refunds from your Stripe Dashboard.' : '');
-async function onPaid(id) {
+// Deposits are held on BuzzCall's platform and paid out after the appointment (src/deposits.js).
+const refundNote = (b) => '. Deposit held by BuzzCall; payout after the appointment (or refund from admin Deposits).';
+async function onPaid(id, payment = {}) {
   const { booking: b, changed, conflict } = booking.markPaid(id);
   if (!b || !changed) return b;
-  if (!conflict) outcomes.paid(b);
+  if (!conflict) {
+    outcomes.paid(b);
+    try { deposits.onBookingPaid(b, payment); } catch (e) { console.error('deposits.onBookingPaid failed:', e.message); }
+  }
   const lead = store.db.leads.find((l) => l.id === b.leadId) || { id: b.leadId, phone: b.phone, name: b.name, need: b.need };
   if (conflict) {
     await sendSms(b.phone, agent.texts.paidConflict(b));
@@ -867,12 +889,52 @@ app.post('/admin/connect/mock/complete', connectMockOnly, requireAdmin, (req, re
   if (wantsJson(req)) return res.json(connect.summary());
   res.redirect(303, '/admin#connect');
 });
+// ---------- Deposit protection admin (held / scheduled / paused / released / refunded) ----------
+app.get('/admin/deposits', requireAdmin, (req, res) => {
+  if (wantsJson(req)) return res.json(deposits.summary());
+  res.type('html').send(adminPages.depositsPage({
+    businessName: env.BUSINESS_NAME || 'Your business',
+    deposits: deposits.summary(),
+    connect: connect.summary(),
+    demoAllowed: sec.demoAllowed(),
+    mode: connect.mode(),
+  }));
+});
+app.post('/admin/deposits/:id/refund', requireAdmin, async (req, res) => {
+  const d = deposits.find(req.params.id);
+  if (!d) return res.status(404).json({ error: 'deposit not found' });
+  try {
+    const r = await deposits.refundDeposit(d, { reason: 'admin' });
+    if (wantsJson(req)) return res.json(r);
+    res.redirect(303, '/admin/deposits');
+  } catch (e) { console.error('deposit refund failed:', e.message); return res.status(500).json({ error: 'refund failed' }); }
+});
+app.post('/admin/deposits/:id/release', requireAdmin, async (req, res) => {
+  const d = deposits.find(req.params.id);
+  if (!d) return res.status(404).json({ error: 'deposit not found' });
+  try {
+    const r = await deposits.releaseDeposit(d, { force: true });
+    if (wantsJson(req)) return res.json(r);
+    res.redirect(303, '/admin/deposits');
+  } catch (e) { console.error('deposit release failed:', e.message); return res.status(500).json({ error: 'release failed' }); }
+});
+// Demo/mock only: fast-forward deposit timers (gated to mock + DEMO_MODE / non-production).
+app.post('/admin/deposits/demo/advance', requireAdmin, async (req, res) => {
+  if (connect.mode() !== 'mock' || !sec.demoAllowed()) return res.status(404).json({ error: 'demo advance unavailable' });
+  const hours = Number(req.body?.hours ?? req.query?.hours ?? 24);
+  try {
+    const r = await deposits.mockAdvance(hours, { sendSms: (to, body) => sendSms(to, body) });
+    if (wantsJson(req)) return res.json(r);
+    res.redirect(303, '/admin/deposits');
+  } catch (e) { return res.status(e.status || 500).json({ error: e.message || 'advance failed' }); }
+});
+
 // Authenticated, server-rendered workspace. Only explicitly selected non-secret values reach templates.
 app.get('/admin/legacy', requireAdmin, (req, res) => {
   res.type('html').send(adminPages.render({
     businessName: env.BUSINESS_NAME || 'Your business',
     leads: store.db.leads, bookings: store.db.bookings || [], alerts: store.db.alerts, waitlist: store.db.waitlist, optedOut: (phone) => store.isOptedOut(phone),
-    billing: billing.summary(), connect: connect.summary(), cfg: booking.cfg(), fees: booking.leadFeeTotals(),
+    billing: billing.summary(), connect: connect.summary(), deposits: deposits.summary(), cfg: booking.cfg(), fees: booking.leadFeeTotals(),
     storage: store.status(), policy: storagePolicy(), production: sec.isProduction(), demoAllowed: sec.demoAllowed(),
     paused: Object.keys(store.db.botPaused || {}).filter(phone => store.isPaused(phone)), twilioLive: live,
     pendingSetups: (store.db.setups || []).filter(s => s.status === 'pending').length,
@@ -887,7 +949,21 @@ async function maintainShops() {
   }
 }
 setInterval(() => { booking.expireHolds(); maintainShops().catch(() => {}); }, 60000).unref();
+async function depositsTickAll() {
+  const run = async () => {
+    try {
+      await deposits.tick({ sendSms: (to, body) => sendSms(to, body) });
+    } catch (e) { console.error('[deposits] tick failed:', e.message); }
+  };
+  await run();
+  for (const shop of vendors.all().filter((s) => s.status !== 'provisioning')) {
+    try { await vendors.run(shop.id, run, { suspended: true }); }
+    catch (e) { console.error('[deposits] shop tick failed:', e.message); }
+  }
+}
+setInterval(() => { depositsTickAll().catch(() => {}); }, 60000).unref();
 app.locals.maintainShops = maintainShops;
+app.locals.depositsTickAll = depositsTickAll;
 billing.init({ notify: (msg) => owner(null, msg), BASE });
 // Public health: status fields only (ops checks use ok/storageState/billing/serviceActive/...). Pricing config, the
 // OpenAI flag and the storage backend (`storage`, `storageDetail`) are admin-only (send Basic auth to get them too).
@@ -1020,7 +1096,7 @@ app.locals.storageAlert = storageAlert;
 app.locals.storagePolicy = storagePolicy;
 app.locals.initStorage = initStorage;
 
-module.exports = { app, onPaid, onBooked, bootChecks, runRetention, initStorage };
+module.exports = { app, onPaid, onBooked, bootChecks, runRetention, initStorage, depositsTickAll };
 if (require.main !== module) return; // required by tests: no listener, no signal handlers
 // Never let one stray rejection kill the line: log it and keep serving. An uncaught exception leaves the process in an
 // unknown state, so it is logged and the process exits (Render restarts it).

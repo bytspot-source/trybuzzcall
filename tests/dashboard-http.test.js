@@ -103,6 +103,7 @@ async function fixture(t) {
   t.mock.method(globalThis, 'fetch', denyProvider);
   store = require('../src/store');
   const billing = require('../src/billing');
+const deposits = require('../src/deposits');
   const connect = require('../src/connect');
   const sms = require('../src/sms');
   connect.setStripe(denyProvider);
@@ -164,8 +165,10 @@ async function fixture(t) {
     replaceEnv({ ...baseline, ...overrides });
     store.setOverride({});
     for (const key of Object.keys(store.db)) delete store.db[key];
-    Object.assign(store.db, { leads: [], bookings: [], alerts: [], waitlist: [], billing: {}, setups: [], optOuts: {} });
+    Object.assign(store.db, { leads: [], bookings: [], alerts: [], waitlist: [], billing: {}, setups: [], optOuts: {},
+      deposits: [], vendorDebt: {}, depositsMeta: { offsetMs: 0, events: [] } });
     billing.summary(); // Initialise billing defaults before read-only snapshots.
+    deposits.summary(); // Initialise deposit defaults before read-only snapshots.
     store.save();
     app.locals.resetAdminLockout();
     app.locals.resetFormLimits();
@@ -308,22 +311,23 @@ test('dashboard and payment safety over isolated local HTTP', { timeout: 60000 }
       if (mode === 'mock') {
         assert.match(body, /Demo payments/);
         assert.match(body, /Simulated amounts · no real money/);
-        assert.match(body, /No live deposits/);
+        assert.match(body, /Simulated payouts|No live deposits|Demo payments/);
         assert.doesNotMatch(body, />Deposits enabled</);
       } else if (mode === 'test') {
         assert.match(body, /Stripe test mode/);
         assert.match(body, /Stripe test amounts · no real money/);
-        assert.match(body, /Test deposits only/);
+        assert.match(body, /Test payouts only|Test deposits only/);
         assert.doesNotMatch(body, />Deposits enabled</);
+        assert.doesNotMatch(body, /badge[^>]*>Payouts enabled|Simulated payouts/);
         assert.doesNotMatch(body, /Demo payments/);
       } else {
         assert.match(body, /Live Stripe/);
-        assert.match(body, />Deposits enabled</);
+        assert.match(body, />Payouts enabled</);
         assert.doesNotMatch(body, /Demo payments|Stripe test mode|Simulated amounts/);
         process.env.DEPOSIT_ENABLED = '0';
         const disabled = html(await f.request('/admin/legacy', { admin: true }));
-        assert.match(disabled, />Deposits off</);
-        assert.doesNotMatch(disabled, />Deposits enabled</);
+        assert.match(disabled, />Payouts off</);
+        assert.doesNotMatch(disabled, />Payouts enabled</);
       }
       assert.deepEqual(f.snapshot(), before, 'Mode labels are derived locally, without syncing providers or changing state');
     }

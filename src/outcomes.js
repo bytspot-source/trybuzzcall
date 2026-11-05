@@ -21,9 +21,9 @@ const store = require('./store');
 const shopContext = require('./shopContext');
 const sec = require('./security');
 
-const STAGES = ['missed', 'no_consent', 'consented', 'conversed', 'slot_offered', 'booked', 'deposit_paid', 'opted_out'];
+const STAGES = ['missed', 'no_consent', 'consented', 'conversed', 'slot_offered', 'booked', 'deposit_paid', 'no_show_reported', 'refunded', 'opted_out'];
 // Forward-only progression. no_consent and consented are alternatives at the same rank; opted_out always wins.
-const RANK = { missed: 0, no_consent: 1, consented: 1, conversed: 2, slot_offered: 3, booked: 4, deposit_paid: 5, opted_out: 99 };
+const RANK = { missed: 0, no_consent: 1, consented: 1, conversed: 2, slot_offered: 3, booked: 4, deposit_paid: 5, no_show_reported: 6, refunded: 7, opted_out: 99 };
 const DEFAULT_MAX = 10000;
 const PHONE_LINK_DAYS = 7; // an SMS reply is tied to that caller's latest call record within this many days
 const EMAIL_ASK = 'Want a confirmation by email? Reply with your email or SKIP.';
@@ -189,6 +189,28 @@ const paid = safe('paid', (b) => {
   store.save();
   return r;
 });
+// 6) Customer replied NO to the no-show check (deposit payout paused).
+const noShowReported = safe('noShowReported', (depositOrBooking) => {
+  const bookingId = depositOrBooking && (depositOrBooking.bookingId || depositOrBooking.id);
+  const phone = depositOrBooking && depositOrBooking.phone;
+  const r = (bookingId && Object.values(table()).find((x) => x && x.booking_id === bookingId)) || latestForPhone(phone);
+  if (!r) return null;
+  setStage(r, 'no_show_reported');
+  r.no_show_reported_at = new Date().toISOString();
+  store.save();
+  return r;
+});
+// 7) Deposit refunded to the customer.
+const refunded = safe('refunded', (depositOrBooking) => {
+  const bookingId = depositOrBooking && (depositOrBooking.bookingId || depositOrBooking.id);
+  const phone = depositOrBooking && depositOrBooking.phone;
+  const r = (bookingId && Object.values(table()).find((x) => x && x.booking_id === bookingId)) || latestForPhone(phone);
+  if (!r) return null;
+  setStage(r, 'refunded');
+  r.refunded_at = new Date().toISOString();
+  store.save();
+  return r;
+});
 // Instant owner buzz sent for this call (missedBuzz). The owner's own reply is not observable by BuzzCall today, so
 // owner_response_ms stays null; owner_buzz_latency_ms = missed call -> owner buzzed.
 const ownerBuzzed = safe('ownerBuzzed', (callSid, outcome) => {
@@ -309,5 +331,5 @@ function counts(rows) {
 const reset = () => { hooks.beforeWrite = null; };
 
 module.exports = { STAGES, RANK, EMAIL_ASK, DEFAULT_MAX, hooks, safe, maxRecords, emailStepOn, urgencyOf, scrub, setStage, prune, get, latestForPhone,
-  missed, consent, conversation, booked, paid, ownerBuzzed, askEmail, emailReply, lookupToken, verify, validEmail,
+  missed, consent, conversation, booked, paid, noShowReported, refunded, ownerBuzzed, askEmail, emailReply, lookupToken, verify, validEmail,
   COLUMNS, TRAINING_COLUMNS, toCsv, cell, hashSalt, saltedHash, trainingRow, recordsOf, fullCsv, trainingCsv, counts, reset };

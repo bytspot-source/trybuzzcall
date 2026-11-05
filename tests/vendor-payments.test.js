@@ -491,8 +491,12 @@ test('Connect ignores legacy account fallback in tenant contexts, including conf
   await run(a, async () => {
     assert.equal(connect.accountId(), null);
     const b = deposit(a);
-    assert.equal(await booking.depositLink(b, BASE), null);
-    assert.equal(b.paid, false); assert.equal(b.payUrl, undefined);
+    // Platform charges still work without a tenant Connect account; payout stays pending.
+    const url = await booking.depositLink(b, BASE);
+    assert.ok(url);
+    assert.equal(b.paid, false);
+    assert.ok(b.payUrl);
+    assert.equal(b.connectAccount, undefined);
   });
 });
 
@@ -545,27 +549,31 @@ test('Connect mock vendor paths and legacy admin paths stay separate', async () 
   assert.equal((await connect.onboard(BASE)).url, `${BASE}/admin/connect/mock`);
 });
 
-test('deposits charge only the scoped account and tag session and payment intent without changing timezone code', async () => {
+test('deposits charge on the platform, tag Connect account when ready, without changing timezone code', async () => {
   live(); const { calls } = fakeStripe(); const a = tenant({ LEAD_FEE_WAIVED: '0', LEAD_FEE: '12' }), b = tenant();
   await Promise.all([run(a, () => connect.onboard(BASE)), run(b, () => connect.onboard(BASE))]);
   for (const shop of [a, b]) {
     const held = deposit(shop);
     await run(shop, () => booking.depositLink(held, BASE));
     const call = calls.sessions.at(-1);
-    assert.equal(call.options.stripeAccount, `acct_${shop.id}`);
-    assert.deepEqual(call.params.metadata, { bookingId: held.id, shopId: shop.id });
-    assert.deepEqual(call.params.payment_intent_data.metadata, call.params.metadata);
-    assert.equal(call.params.payment_intent_data.application_fee_amount, shop === a ? 1200 : undefined);
+    assert.equal(call.options, undefined); // platform charge — no stripeAccount
+    assert.equal(call.params.metadata.bookingId, held.id);
+    assert.equal(call.params.metadata.shopId, shop.id);
+    assert.equal(call.params.metadata.connectAccount, `acct_${shop.id}`);
+    assert.equal(call.params.payment_intent_data.transfer_group, held.id);
+    assert.equal(call.params.payment_intent_data.application_fee_amount, undefined);
     assert.equal(call.params.payment_intent_data.transfer_data, undefined);
+    assert.equal(held.applicationFeeCents, shop === a ? 1200 : 0); // a: fee on; b: pilot waiver default
     assert.equal(held.paid, false); assert.equal(held.status, 'held');
+    assert.equal(held.connectAccount, `acct_${shop.id}`);
     const disk = JSON.parse(fs.readFileSync(path.join(shop.store.dataDir(), 'db.json'), 'utf8'));
     assert.equal(disk.bookings[0].stripeSessionId, held.stripeSessionId);
   }
   const legacy = { id: 'booking_root', amount: 49, slotLabel: 'Tomorrow' };
   await booking.depositLink(legacy, BASE);
-  assert.equal(calls.sessions.at(-1).options.stripeAccount, 'acct_legacy');
-  assert.deepEqual(calls.sessions.at(-1).params.metadata, { bookingId: 'booking_root' });
-  assert.deepEqual(calls.sessions.at(-1).params.payment_intent_data.metadata, { bookingId: 'booking_root' });
+  assert.equal(calls.sessions.at(-1).options, undefined);
+  assert.equal(calls.sessions.at(-1).params.metadata.bookingId, 'booking_root');
+  assert.equal(calls.sessions.at(-1).params.metadata.connectAccount, 'acct_legacy');
 });
 
 test('Connect and deposit persistence failures reject without marking a payment successful', async () => {

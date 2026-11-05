@@ -6,6 +6,7 @@ const context = require('./shopContext');
 const billing = require('./billing');
 const booking = require('./booking');
 const connect = require('./connect');
+const deposits = require('./deposits');
 const pages = require('./workspacePages');
 const adminPages = require('./adminPages');
 const paymentPages = require('./paymentPages');
@@ -151,7 +152,7 @@ function register(app, { requireAdmin, BASE, sameOrigin }) {
   app.get('/vendor', requireVendor, safe(async (req,res) => {
     show(res, adminPages.renderVendor({ businessName: config.env.BUSINESS_NAME || req.vendor.name, ownerEmail: req.vendor.email,
       shop:req.vendor, leads:store.db.leads, calls:store.db.calls || [], bookings:store.db.bookings, alerts:store.db.alerts,
-      billing:billing.summary(),connect:connect.summary(),cfg:booking.cfg(),fees:booking.leadFeeTotals(), demoAllowed:sec.demoAllowed(), optedOut:phone=>store.isOptedOut(phone) }));
+      billing:billing.summary(),connect:connect.summary(),deposits:deposits.summary(),cfg:booking.cfg(),fees:booking.leadFeeTotals(), demoAllowed:sec.demoAllowed(), optedOut:phone=>store.isOptedOut(phone) }));
   }));
   app.get('/vendor/settings', requireVendor, safe(async (req,res) => show(res,pages.settings({shop:req.vendor,values:settingsValues()}))));
   app.post('/vendor/settings', requireVendor, safe(async (req,res) => {

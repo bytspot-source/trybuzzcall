@@ -1,5 +1,5 @@
 'use strict';
-// Stripe Connect (direct charges, fail closed, per-shop account in the config override). No network: a fake Stripe
+// Stripe Connect (Express + platform separate charges/transfers, per-shop account in the config override). No network: a fake Stripe
 // client is injected with connect.setStripe(); webhook signatures are generated and checked offline.
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -97,27 +97,29 @@ test('LEAD_FEE_WAIVED defaults ON (pilot); only an explicit 0/false turns it off
   process.env.LEAD_FEE_WAIVED = '1'; assert.equal(booking.cfg().leadFeeWaived, true);
 });
 
-// ---------- depositLink: direct charges, fail closed ----------
-test('fail closed: Stripe key but no connected account -> no Checkout Session, null link', async (t) => {
+// ---------- depositLink: platform charges (Connect optional for payout) ----------
+test('without connected account: platform Checkout still created (payout pending)', async (t) => {
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY });
   const f = fakeStripe(); connect.setStripe(f);
   const b = fakeBooking();
-  assert.equal(await booking.depositLink(b, 'https://shop.example'), null);
-  assert.equal(f.calls.sessions.length, 0);
-  assert.equal(b.payUrl, undefined);
+  const url = await booking.depositLink(b, 'https://shop.example');
+  assert.equal(url, 'https://checkout.stripe.com/c/pay/cs_test_1');
+  assert.equal(f.calls.sessions.length, 1);
+  assert.equal(f.calls.sessions[0].o, undefined);
+  assert.equal(b.connectAccount, undefined);
 });
 
-test('fail closed: env account id that is not charges_enabled -> status checked with Stripe, still no session', async (t) => {
+test('env account pending: still charges on platform; status refreshed for payout readiness', async (t) => {
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY, STRIPE_CONNECT_ACCOUNT_ID: 'acct_env_1' });
   const f = fakeStripe(); connect.setStripe(f);
-  assert.equal(await booking.depositLink(fakeBooking(), 'https://shop.example'), null);
+  assert.ok(await booking.depositLink(fakeBooking(), 'https://shop.example'));
   assert.deepEqual(f.calls.retrieve, ['acct_env_1']);
-  assert.equal(f.calls.sessions.length, 0);
+  assert.equal(f.calls.sessions.length, 1);
   assert.equal(connect.status(), 'pending');
-  assert.equal(store.getOverride().stripeConnect.accountId, 'acct_env_1'); // status cached in the override
+  assert.equal(store.getOverride().stripeConnect.accountId, 'acct_env_1');
 });
 
-test('direct charge: session created ON the connected account, no transfer_data, fee waived by default', async (t) => {
+test('platform charge: no stripeAccount, transfer_group set, fee waived by default (no application_fee)', async (t) => {
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY, STRIPE_CONNECT_ACCOUNT_ID: 'acct_env_2' });
   const f = fakeStripe({ charges_enabled: true, details_submitted: true }); connect.setStripe(f);
   const b = fakeBooking(49);
@@ -125,24 +127,27 @@ test('direct charge: session created ON the connected account, no transfer_data,
   assert.equal(url, 'https://checkout.stripe.com/c/pay/cs_test_1');
   assert.equal(f.calls.sessions.length, 1);
   const { p, o } = f.calls.sessions[0];
-  assert.deepEqual(o, { stripeAccount: 'acct_env_2' });
+  assert.equal(o, undefined);
   assert.equal(p.mode, 'payment');
   assert.equal(p.metadata.bookingId, b.id); assert.equal(p.client_reference_id, b.id);
   assert.equal(p.payment_intent_data.transfer_data, undefined);
   assert.equal(p.payment_intent_data.application_fee_amount, undefined);
+  assert.equal(p.payment_intent_data.transfer_group, b.id);
   assert.equal(p.payment_intent_data.metadata.bookingId, b.id);
   assert.equal(p.line_items[0].price_data.unit_amount, 4900);
   assert.equal(b.connectAccount, 'acct_env_2'); assert.equal(b.stripeSessionId, 'cs_test_1');
-  assert.ok(!JSON.stringify(p).includes('transfer_data'));
 });
 
-test('direct charge with lead fee enabled: application_fee_amount capped at 1/3 of the deposit', async (t) => {
+test('lead fee enabled: recorded on booking bookkeeping, not as Checkout application_fee', async (t) => {
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY, STRIPE_CONNECT_ACCOUNT_ID: 'acct_env_3', LEAD_FEE_WAIVED: '0', LEAD_FEE: '12' });
   const f = fakeStripe({ charges_enabled: true }); connect.setStripe(f);
-  await booking.depositLink(fakeBooking(20), 'https://shop.example');
-  assert.equal(f.calls.sessions[0].p.payment_intent_data.application_fee_amount, 666);
-  await booking.depositLink(fakeBooking(49), 'https://shop.example');
-  assert.equal(f.calls.sessions[1].p.payment_intent_data.application_fee_amount, 1200);
+  const b20 = fakeBooking(20);
+  await booking.depositLink(b20, 'https://shop.example');
+  assert.equal(f.calls.sessions[0].p.payment_intent_data.application_fee_amount, undefined);
+  assert.equal(b20.applicationFeeCents, 666);
+  const b49 = fakeBooking(49);
+  await booking.depositLink(b49, 'https://shop.example');
+  assert.equal(b49.applicationFeeCents, 1200);
 });
 
 test('mock mode (no key): /pay/mock link unchanged, no Stripe client used', async (t) => {
@@ -205,7 +210,7 @@ test('onboarding routes require admin auth and same origin', async (t) => {
   assert.equal((await post('/admin/connect/onboard', {}, { origin: 'https://evil.example' })).status, 403);
 });
 
-test('live/test onboarding: creates a default-controller (Standard-equivalent) account once, then an Account Link', async (t) => {
+test('live/test onboarding: creates an Express account once, then an Account Link', async (t) => {
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY });
   const f = fakeStripe(); connect.setStripe(f);
   const r1 = await req('/admin/connect/onboard', { method: 'POST', headers: { ...auth, origin: BASE } });
@@ -213,19 +218,17 @@ test('live/test onboarding: creates a default-controller (Standard-equivalent) a
   assert.equal(r1.headers.get('location'), 'https://connect.stripe.com/setup/s/test_link');
   assert.equal(f.calls.create.length, 1);
   const p = f.calls.create[0];
-  assert.equal(p.type, undefined);
-  assert.deepEqual(p.controller, { fees: { payer: 'account' }, losses: { payments: 'stripe' }, requirement_collection: 'stripe', stripe_dashboard: { type: 'full' } });
+  assert.equal(p.type, 'express');
+  assert.ok(p.capabilities.transfers.requested);
   assert.equal(p.business_profile.name, 'Test Plumbing');
   assert.equal(p.business_profile.url, 'https://shop.example');
   assert.deepEqual(f.calls.links[0], { account: 'acct_test_shop1', type: 'account_onboarding',
     refresh_url: 'https://shop.example/admin/connect/refresh', return_url: 'https://shop.example/admin/connect/return' });
   assert.equal(store.getOverride().stripeConnect.accountId, 'acct_test_shop1');
   assert.equal(store.getOverride().stripeConnect.mode, 'test');
-  // refresh re-issues a link for the SAME account
   const r2 = await req('/admin/connect/refresh', { headers: auth });
   assert.equal(r2.status, 303);
   assert.equal(f.calls.create.length, 1); assert.equal(f.calls.links.length, 2);
-  // return re-reads the account; status follows charges_enabled
   let s = await (await req('/admin/connect/return', { headers: { ...auth, accept: 'application/json' } })).json();
   assert.equal(s.status, 'pending');
   f.account.charges_enabled = true; f.account.details_submitted = true; f.account.requirements = { currently_due: [] };
@@ -234,17 +237,17 @@ test('live/test onboarding: creates a default-controller (Standard-equivalent) a
   assert.equal(connect.status(), 'charges_enabled');
   const html = await (await req('/admin/legacy', { headers: auth })).text();
   assert.match(html, /Deposit payouts \(Stripe Connect\)/);
-  assert.match(html, /Charges enabled/);
-  // mock onboarding page is off when Stripe is configured
+  assert.match(html, /Charges enabled|Payouts enabled/);
   assert.equal((await req('/admin/connect/mock', { headers: auth })).status, 404);
 });
 
-test('admin shows Not connected + Connect Stripe button; mock onboarding enables charges without Stripe', async (t) => {
+test('admin shows Not connected + Connect payouts button; mock onboarding enables payouts without Stripe', async (t) => {
   reset(t);
   connect.setStripe(() => { throw new Error('no Stripe calls in mock mode'); });
   let html = await (await req('/admin/legacy', { headers: auth })).text();
   assert.match(html, /Status: <b>Not connected<\/b>/);
   assert.match(html, /action="\/admin\/connect\/onboard"/);
+  assert.match(html, /Connect payouts|Preview payout setup/);
   const r = await req('/admin/connect/onboard', { method: 'POST', headers: { ...auth, origin: BASE } });
   assert.equal(r.status, 303); assert.equal(r.headers.get('location'), 'https://shop.example/admin/connect/mock');
   assert.match(connect.accountId(), /^acct_mock_/);
@@ -253,34 +256,34 @@ test('admin shows Not connected + Connect Stripe button; mock onboarding enables
   const done = await post('/admin/connect/mock/complete');
   assert.equal((await done.json()).status, 'charges_enabled');
   html = await (await req('/admin/legacy', { headers: auth })).text();
-  assert.match(html, /Charges enabled/);
+  assert.match(html, /Charges enabled|Payouts enabled/);
   const h = await (await req('/health')).json();
   assert.equal(h.connectStatus, 'charges_enabled'); assert.equal(h.connect, false); // mock never counts as live connect
 });
 
 // ---------- text flow ----------
-test('text flow, Stripe on but not connected: booked without deposit, owner told "deposit off: Stripe not connected"', async (t) => {
+test('text flow, Stripe on but not connected: deposit still held on platform (Checkout created)', async (t) => {
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY });
   quiet(t);
   const f = fakeStripe(); connect.setStripe(f);
   const b = await textToBooking('+14703330001');
   assert.ok(b);
-  assert.equal(b.status, 'confirmed'); assert.equal(b.amount, 0); assert.equal(b.depositSkipped, 'stripe_not_connected');
-  assert.equal(f.calls.sessions.length, 0);
+  assert.equal(b.status, 'held'); assert.equal(b.amount, 49);
+  assert.equal(f.calls.sessions.length, 1);
+  assert.equal(f.calls.sessions[0].o, undefined);
   const lead = store.db.leads.find((l) => l.phone === '+14703330001');
-  assert.match(lead.messages.at(-1).body, /You're booked/);
-  assert.doesNotMatch(lead.messages.at(-1).body, /deposit/i);
-  assert.ok(store.db.alerts.some((a) => /deposit off: Stripe not connected/.test(a.body)));
+  assert.match(lead.messages.at(-1).body, /checkout\.stripe\.com|deposit/i);
 });
 
-test('text flow, connected + charges enabled: deposit link is a direct-charge Checkout on the shop account', async (t) => {
+test('text flow, connected + charges enabled: deposit link is a platform Checkout tagged with Connect account', async (t) => {
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY });
   quiet(t);
   const f = fakeStripe({ charges_enabled: true }); connect.setStripe(f);
   store.setOverride({ stripeConnect: { accountId: 'acct_ready', mode: 'test', chargesEnabled: true } });
   const b = await textToBooking('+14703330002');
   assert.equal(b.status, 'held');
-  assert.deepEqual(f.calls.sessions[0].o, { stripeAccount: 'acct_ready' });
+  assert.equal(f.calls.sessions[0].o, undefined);
+  assert.equal(b.connectAccount, 'acct_ready');
   const lead = store.db.leads.find((l) => l.phone === '+14703330002');
   assert.match(lead.messages.at(-1).body, /checkout\.stripe\.com/);
 });
@@ -358,7 +361,7 @@ test('connect webhook: checkout.session.completed marks the deposit paid once (i
   assert.equal(x.paid, true); assert.equal(x.status, 'confirmed'); assert.equal(x.lead_fee_status, 'waived');
   const paidAlerts = store.db.alerts.filter((a) => /BOOKED \+ PAID/.test(a.body));
   assert.equal(paidAlerts.length, 1);
-  assert.match(paidAlerts[0].body, /refunds from your Stripe Dashboard/);
+  assert.match(paidAlerts[0].body, /held by BuzzCall|payout after the appointment|admin Deposits/i);
 });
 
 test('connect webhook: unpaid (async) session does not mark paid; booking tied to another account is ignored', async (t) => {
@@ -409,14 +412,14 @@ test('/health reports connect readiness without exposing anything secret', async
   assert.ok(!JSON.stringify(h).includes(TEST_KEY));
 });
 
-test('legal pages: shop is merchant of record/payee, Stripe Connected Account Agreement linked; no draft banners on terms', () => {
+test('legal pages: deposits collected by BuzzCall, Stripe Connected Account Agreement linked; no draft banners', () => {
   const terms = fs.readFileSync(path.join(__dirname, '../public/terms.html'), 'utf8');
   const refunds = fs.readFileSync(path.join(__dirname, '../public/refunds.html'), 'utf8');
-  assert.match(terms, /merchant of record/);
-  assert.match(terms, /payee/);
+  assert.match(terms, /Deposits are collected by BuzzCall|collected by BuzzCall/);
+  assert.match(terms, /paid out after the appointment|Payout after the appointment/);
   assert.match(terms, /processed by Stripe|Payments are processed by Stripe/);
   assert.match(terms, /href="https:\/\/stripe\.com\/connect-account\/legal"/);
   assert.doesNotMatch(terms, /TODO\(legal\)/); assert.doesNotMatch(terms, /pending review by legal counsel/);
-  assert.match(refunds, /TODO\(legal\)/); assert.match(refunds, /pending review by legal counsel/);
-  assert.match(refunds, /own Stripe account/);
+  assert.doesNotMatch(refunds, /TODO\(legal\)/); assert.doesNotMatch(refunds, /pending review by legal counsel/);
+  assert.match(refunds, /BuzzCall collects|reply <b>NO<\/b>|\(470\) 482-8377/);
 });
