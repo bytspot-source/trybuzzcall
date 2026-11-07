@@ -18,6 +18,16 @@ function shell(title, body) {
 
 const issueList = (items) => `<ul class="issue-list">${items.map((i) => `<li class="issue issue-${esc(i.level)}">${esc(i.message)}</li>`).join('')}</ul>`;
 
+function verifyHtml(setupId, values, message) {
+  return shell('Enter your code', `<section class="payment-card"><p class="eyebrow">Shop setup</p>
+<h1>Enter the code we texted you</h1>
+<p>${esc(message || 'We texted a 6-digit code to your alert cell. It expires in 10 minutes.')}</p>
+<form method="post" action="/onboarding/verify"><input type="hidden" name="setupId" value="${esc(setupId)}">
+<label class="field">6-digit code<input name="code" inputmode="numeric" autocomplete="one-time-code" required minlength="6" maxlength="6" pattern="[0-9]{6}"></label>
+<button class="button button-primary" type="submit">Verify my cell</button></form>
+<form method="post" action="/onboarding/resend"><input type="hidden" name="setupId" value="${esc(setupId)}"><button class="button button-outline" type="submit">Text me a new code</button></form>
+<p class="muted">${values && values.businessName ? esc(values.businessName) : ''}</p></section>`);
+}
 function thanksHtml(values) {
   return shell('Thanks', `<section class="payment-card"><span class="result-icon">${ui.icon('check')}</span><p class="eyebrow">Setup received</p>
 <h1>Thanks${values.businessName ? `, ${esc(values.businessName)}` : ''}!</h1>
@@ -76,4 +86,4 @@ ${rows || `<section class="panel">${ui.empty('No setups submitted yet.', 'New sh
 <details><summary>View raw non-secret configuration</summary><div class="table-wrap"><table class="data-table"><thead><tr><th scope="col">Key</th><th scope="col">Value</th><th scope="col">Source (override &gt; env &gt; default)</th></tr></thead><tbody>${conf}</tbody></table></div></details></div></section>`;
 }
 
-module.exports = { thanksHtml, errorsHtml, confirmHtml, adminSetupsHtml, esc };
+module.exports = { thanksHtml, verifyHtml, errorsHtml, confirmHtml, adminSetupsHtml, esc };

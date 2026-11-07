@@ -162,6 +162,7 @@
       .then(function (x) {
         if (x.status === 200 && x.j.ok) {
           form.hidden = true; summary.hidden = true;
+          if (x.j.next === 'verify') { showVerify(x.j.id, x.j.message); return; }
           var t = $('#setup-thanks'); t.hidden = false; t.focus(); window.scrollTo(0, 0); return;
         }
         if (x.status === 422) { attempted = true; render(order(x.j.issues || x.j.errors || [])); showSummary(order(x.j.errors || [])); summary.focus(); goTo(fieldEl((order(x.j.errors || [])[0] || {}).field || 'businessName')); setStatus(''); return; }
@@ -171,6 +172,28 @@
       .catch(function () { setStatus('We couldn\'t reach BuzzCall. Check your connection and try again.', 'error'); })
       .then(function () { busy = false; submitBtn.disabled = false; });
   }
+
+  function showVerify(id, message) {
+    var box = $('#setup-verify');
+    if (!box) return;
+    var msg = $('#verify-message'); if (msg && message) msg.textContent = message;
+    var hidden = $('#verify-setup-id'); if (hidden) hidden.value = id || '';
+    box.hidden = false; box.focus(); window.scrollTo(0, 0);
+    var code = $('#verify-code'); if (code) code.focus();
+  }
+  var verifyForm = $('#verify-form');
+  if (verifyForm) verifyForm.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var status = $('#verify-status');
+    var code = ($('#verify-code') || {}).value || '';
+    fetch('/onboarding/verify', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ setupId: ($('#verify-setup-id') || {}).value, code: code }) })
+      .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { status: r.status, j: j }; }); })
+      .then(function (x) {
+        if (x.status === 200 && x.j.ok && x.j.next) { window.location = x.j.next; return; }
+        if (status) status.textContent = (x.j && x.j.error) || 'That code did not work. Try again.';
+      })
+      .catch(function () { if (status) status.textContent = 'We could not reach BuzzCall. Try again.'; });
+  });
 
   form.addEventListener('submit', function (e) {
     e.preventDefault();

@@ -20,6 +20,7 @@ const crypto = require('crypto');
 const sec = require('./security');
 const vendors = require('./vendors');
 const mail = require('./email');
+const onboarding = require('./onboarding');
 const shopContext = require('./shopContext');
 const consent = require('./consent');
 const { say } = require('./voice');
@@ -783,7 +784,7 @@ app.get('/trades.js', (req, res) => res.type('application/javascript').sendFile(
 const wantsJson = (req) => req.is('application/json') || /application\/json/.test(req.get('accept') || '');
 const wantsHtml = (req) => !wantsJson(req) && /text\/html/.test(req.get('accept') || '');
 const billingReply = (req, res, result) => wantsHtml(req) ? res.redirect(303, '/admin#payments') : res.json(result);
-app.post('/setup', setupLimit, (req, res) => {
+app.post('/setup', setupLimit, async (req, res) => {
   const body = req.body && typeof req.body === 'object' ? req.body : {};
   const json = wantsJson(req);
   const { values, issues, errors, warnings } = setupRules.validate(body);
@@ -793,11 +794,21 @@ app.post('/setup', setupLimit, (req, res) => {
   if (errors.length) return json ? res.status(422).json({ ok: false, errors, warnings, issues }) : res.status(422).type('html').send(setupPages.errorsHtml(errors));
   if (warnings.length && !values.confirm) return json ? res.status(409).json({ ok: false, needsConfirm: true, warnings, issues }) : res.status(409).type('html').send(setupPages.confirmHtml(warnings, body));
   const { confirm, ...saved } = values;
+  if (onboarding.enabled() && !sec.isNanp(saved.ownerPhone)) {
+    const nanp = [{ field: 'ownerPhone', level: 'error', message: 'Use a US or Canada mobile number, like (404) 555-0100.' }];
+    return json ? res.status(422).json({ ok: false, errors: nanp, issues: nanp }) : res.status(422).type('html').send(setupPages.errorsHtml(nanp));
+  }
   const s = store.addSetup({ id: crypto.randomBytes(6).toString('hex'), createdAt: new Date().toISOString(), status: 'pending',
     values: saved, warningsConfirmed: warnings, consentAt: new Date().toISOString() });
-  mail.signup('setup', { email: saved.email, businessType: saved.businessType, businessName: saved.businessName }); // async
-  const message = "We'll review your setup and text you within 1 business day.";
-  return json ? res.json({ ok: true, id: s.id, message }) : res.type('html').send(setupPages.thanksHtml(saved));
+  if (!onboarding.enabled()) {
+    mail.signup('setup', { email: saved.email, businessType: saved.businessType, businessName: saved.businessName }); // async
+    const message = "We'll review your setup and text you within 1 business day.";
+    return json ? res.json({ ok: true, id: s.id, message }) : res.type('html').send(setupPages.thanksHtml(saved));
+  }
+  const sent = await onboarding.sendCode({ setupId: s.id, phone: saved.ownerPhone, ip: sec.clientIp(req), businessName: saved.businessName });
+  mail.adminAlert('BuzzCall: self-serve setup started', [`A shop submitted setup and is verifying their alert cell.`, `Business: ${saved.businessName || ''}`, `Email: ${saved.email || ''}`, `Time: ${new Date().toISOString()}`, 'Review it under Platform admin / Onboarding if it needs help.'].join('\n'));
+  const message = sent.ok ? 'We texted a 6-digit code to your alert cell. It expires in 10 minutes.' : (sent.error || 'We saved your setup. Request another code in a minute.');
+  return json ? res.json({ ok: true, id: s.id, next: 'verify', message }) : res.type('html').send(setupPages.verifyHtml(s.id, saved, message));
 });
 // Admin/billing POSTs (central guard above): refuse cross-site form posts (basic-auth credentials ride along automatically). Browsers send Origin on
 // every POST; a missing or "null" Origin falls back to Referer, and with neither the request is refused.
@@ -816,6 +827,7 @@ function sameOrigin(req, res, next) {
   return res.status(403).send(r === 'cross' ? 'cross-origin request refused' : 'cross-origin request refused (missing Origin)');
 }
 require('./vendorRoutes').register(app, { requireAdmin, BASE, sameOrigin });
+require('./onboardingRoutes').register(app, { requireAdmin, sameOrigin });
 // ---------- Outcomes log (src/outcomes.js) ----------
 // Admin: /admin/outcomes (counts per stage + recent records), /admin/outcomes.csv (operations, includes phones/emails),
 // /admin/outcomes-training.csv (de-identified: no phone/email/name, salted caller hash, opted-out callers excluded).
@@ -1255,6 +1267,7 @@ const port = env.PORT || 3000;
 initStorage().then((st) => {
 if (st.fatal) process.exit(1);
 config.applyTZ(); // the stored override may have just been loaded from Postgres
+onboarding.startPoller();
 const daily = () => { runRetention(); reportAreaSkips().catch((e) => console.error('area-code report failed:', e.message)); };
 daily(); setInterval(runRetention, 86400000).unref();
 setInterval(() => reportAreaSkips().catch(() => {}), 3600000).unref(); // reports each finished UTC day within the hour

@@ -208,6 +208,21 @@
       <p class="form-status" id="setup-status" role="status" aria-live="polite"></p>
     </form>
 
+    <section id="setup-verify" class="setup-card thanks-card" tabindex="-1" hidden>
+      <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> Confirm your cell</p>
+      <h2>Enter the code we texted you</h2>
+      <p id="verify-message">We texted a 6-digit code to your alert cell. It expires in 10 minutes.</p>
+      <form id="verify-form" method="post" action="/onboarding/verify">
+        <input type="hidden" name="setupId" id="verify-setup-id" value="">
+        <div class="field">
+          <label for="verify-code">6-digit code</label>
+          <input id="verify-code" name="code" inputmode="numeric" autocomplete="one-time-code" minlength="6" maxlength="6" pattern="[0-9]{6}" required>
+        </div>
+        <button class="button button-yellow" type="submit">Verify my cell <span aria-hidden="true">→</span></button>
+      </form>
+      <p class="form-status" id="verify-status" role="status" aria-live="polite"></p>
+    </section>
+
     <section id="setup-thanks" class="setup-card thanks-card" tabindex="-1" hidden>
       <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> Setup received</p>
       <h2>Thanks! You're all set for now.</h2>
