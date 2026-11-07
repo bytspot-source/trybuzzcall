@@ -137,6 +137,19 @@ function signup(kind, { email, businessType, businessName } = {}) {
   } catch (e) { console.error('[email] signup notification error'); }
 }
 
+// Sent only after a self-serve shop sets a password, and only when Resend is configured.
+function onboardingWelcome({ email, businessName } = {}) {
+  try {
+    const address = String(email || '').trim().toLowerCase();
+    if (!validEmail(address)) return null;
+    if (!process.env.RESEND_API_KEY) { console.log(`[email] onboarding welcome skipped (RESEND_API_KEY not set): ${maskEmail(address)}`); return null; }
+    if (!claim('welcome-onboarding', address)) { console.log(`[email] onboarding welcome to ${maskEmail(address)} skipped: already sent recently`); return null; }
+    const name = oneLine(businessName, 80) || 'Your shop';
+    return queue({ to: address, subject: 'Your BuzzCall shop is ready', kind: 'onboarding welcome',
+      text: `Hi,\n\n${name} is on BuzzCall. Sign in at https://trybuzzcall.com/vendor/login to start the free trial and finish your checklist.\n\nThe BuzzCall team\nhello@trybuzzcall.com` });
+  } catch { return null; }
+}
+
 function adminAlert(subject, text) {
   try {
     if (!adminLimiter().hit('admin').ok) { console.log('[email] admin alert skipped: hourly limit reached'); return null; }
@@ -157,4 +170,4 @@ function outcomeVerify(to, link, shopName) {
 }
 const reset = () => { inFlight.clear(); adminHourly = null; if (store.root.db.emailThrottle) store.root.db.emailThrottle = {}; };
 
-module.exports = { signup, adminAlert, outcomeVerify, maskEmail, setFetch, settle, reset, RESEND_URL, SETUP_URL, DEFAULT_FROM, DEFAULT_ADMIN };
+module.exports = { signup, adminAlert, onboardingWelcome, outcomeVerify, maskEmail, setFetch, settle, reset, RESEND_URL, SETUP_URL, DEFAULT_FROM, DEFAULT_ADMIN };

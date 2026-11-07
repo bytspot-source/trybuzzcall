@@ -115,6 +115,24 @@ failure-safe: a logging error is logged and ignored, never breaking the voice or
 
 Failed vendor logins/activations are limited per account+IP (`VENDOR_LOGIN_MAX_FAILS`, 10 / 15 min), per account (`VENDOR_ACCOUNT_MAX_FAILS`, 100 / 15 min) and per IP (`VENDOR_IP_MAX_FAILS`, 30 / 10 min). `VENDOR_GLOBAL_MAX_ATTEMPTS` (5000 / 10 min) is only a backstop, so a few IPs cannot lock every vendor out.
 
+## Self-serve onboarding
+
+With the flags below left unset, `/setup` still only saves a pending request and an admin still creates the vendor. Turn them on in the order in [docs/GO_LIVE_ONBOARDING.md](docs/GO_LIVE_ONBOARDING.md). Nothing that spends money runs unless its flag is on.
+
+| Flag | Default | What it does |
+| --- | --- | --- |
+| `AUTO_ONBOARDING` | off | After a valid `/setup`, text a 6-digit code to the alert cell (hashed, 10 minutes, 5 tries, rate-limited per phone and IP, US/Canada only). A correct code creates the vendor with the same `vendors.create` path an admin uses, then the owner sets a password and lands on a checklist. |
+| `AUTO_PROVISION_NUMBERS` | off | After the 14-day trial starts, buy one US local number: same area code, then the same state, then any US local. Voice and SMS webhooks point at `/twilio/voice` and `/twilio/sms`. Off, or over the daily cap, or under the Twilio balance floor: the step stays queued or "pending admin" and nothing is bought. |
+| `AUTO_A2P` | off | Collect legal name, optional EIN, address, website, and a contact, then submit a Low-Volume Standard brand (EIN) or Sole Proprietor brand (no EIN) plus one campaign. A poller stores pending, in review, approved, or rejected. |
+
+`AUTO_PROVISION_MAX_PER_DAY` defaults to 25 (rolling 24 hours). `AUTO_PROVISION_MIN_BALANCE` defaults to $20. The EIN is stored only until the brand submission returns, then only the last four digits remain, and it is never written to logs or HTML. A welcome email goes out only when `RESEND_API_KEY` is set. One verified cell can open one shop unless an admin allows another. The honeypot, consent checkbox, and `/setup` rate limit stay in place.
+
+Self-serve shops do not send customer text-backs until carrier registration is approved. Missed-call buzzes to the owner still go out. STOP and HELP still get a reply. Admin-created vendors are unchanged.
+
+`/admin/onboarding` lists each new shop (verified, trial, number, registration) and flags duplicates, name mismatches, provisioning failures, rejections, a low balance, and a cap hit. Retry, assign a number yourself, record a manual registration result, allow a second shop on a cell, or suspend.
+
+Rough carrier cost once `AUTO_A2P` and number purchase are on: about $4 to register the brand, $15 to vet the campaign, and $1.50 per month for a low-volume campaign (about $21 the first month), plus about $1.15 per month for the local number. Those are Twilio's published list prices and can change. See the go-live note for the doc links.
+
 ## Twilio setup
 1. Buy a local GA number (404/470/678/770/706/912/229/478/762).
 2. **A2P 10DLC**: register a brand and campaign (required for US SMS deliverability).

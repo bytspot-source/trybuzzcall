@@ -152,9 +152,15 @@ function register(app, { requireAdmin, BASE, sameOrigin }) {
   app.post('/vendor/logout', safe(async (req,res) => { await vendors.logout(req); vendors.setCookie(res); reply(req,res,{ok:true},'/vendor/login'); }));
   app.get('/vendor', requireVendor, safe(async (req,res) => {
     res.set('Permissions-Policy','camera=(), microphone=(), geolocation=(self), payment=()'); // optional check-in location
+    let checklist = '';
+    try {
+      const flow = require('./onboarding');
+      await flow.advance(req.vendor.id, process.env.PUBLIC_BASE_URL || '');
+      checklist = require('./onboardingPages').checklist(flow.checklistModel(req.vendor.id));
+    } catch (e) { console.error('[onboarding]', require('./onboardingStore').redact(e && e.message)); }
     show(res, adminPages.renderVendor({ businessName: config.env.BUSINESS_NAME || req.vendor.name, ownerEmail: req.vendor.email,
       shop:req.vendor, leads:store.db.leads, calls:store.db.calls || [], bookings:store.db.bookings, alerts:store.db.alerts,
-      billing:billing.summary(),connect:connect.summary(),deposits:deposits.summary(),cfg:booking.cfg(),fees:booking.leadFeeTotals(), demoAllowed:sec.demoAllowed(), optedOut:phone=>store.isOptedOut(phone) }));
+      billing:billing.summary(),connect:connect.summary(),deposits:deposits.summary(),cfg:booking.cfg(),fees:booking.leadFeeTotals(), demoAllowed:sec.demoAllowed(), optedOut:phone=>store.isOptedOut(phone), checklist }));
   }));
   // Vendor "I'm here" check-in for one of this vendor's own bookings (the store is the signed-in vendor's).
   app.post('/vendor/bookings/:id/checkin', requireVendor, safe(async (req,res) => {

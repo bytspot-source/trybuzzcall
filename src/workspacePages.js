@@ -6,7 +6,7 @@ const trades = require('./trades');
 const adminShell = {
   basePath: '/admin', caption: 'PLATFORM ADMIN', breadcrumb: 'Platform admin',
   businessName: 'BuzzCall platform', identityCaption: 'Platform administrator',
-  nav: [['vendors', 'Vendors', 'overview', '/admin'], ['outcomes', 'Outcomes', 'checklist', '/admin/outcomes'], ['deposits', 'Deposits', 'card', '/admin/deposits'], ['legacy', 'Legacy workspace', 'database', '/admin/legacy']],
+  nav: [['vendors', 'Vendors', 'overview', '/admin'], ['onboarding', 'Onboarding', 'checklist', '/admin/onboarding'], ['outcomes', 'Outcomes', 'checklist', '/admin/outcomes'], ['deposits', 'Deposits', 'card', '/admin/deposits'], ['legacy', 'Legacy workspace', 'database', '/admin/legacy']],
   active: 'vendors', headerAction: { href: '/vendor/login', label: 'Vendor sign in', icon: 'external' },
 };
 const vendorShell = {

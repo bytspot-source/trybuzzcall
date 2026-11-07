@@ -112,6 +112,14 @@ async function sendSms(to, body, opts = {}) {
     }
     if (!opts.force && actualStore.isOptedOut(to)) { console.log(`[sms] skipped ${maskPhone(to)}: opted out`); return { ok: false, skipped: 'opted_out' }; }
     if (kind === 'caller' && !opts.force && actualStore.isPaused && actualStore.isPaused(to)) { console.log(`[sms] skipped ${maskPhone(to)}: automated texts paused (possible opt-out)`); return { ok: false, skipped: 'paused' }; }
+    if (kind === 'caller' && !opts.force && !opts.allowHeld) {
+      const gate = require('./onboardingStore');
+      if (gate.callerTextsHeld()) {
+        gate.queueHeld(to, body);
+        console.log(`[sms] held ${maskPhone(to)}: carrier registration is not approved yet`);
+        return { ok: false, skipped: 'a2p_held', held: true };
+      }
+    }
     if (kind === 'caller') {
       const blocked = capCheck(context ? context.shop : null);
       if (blocked) {
