@@ -174,11 +174,13 @@ async function advance(shopId, base) {
 }
 
 const CA_REGIONS = new Set('AB BC MB NB NL NS NT NU ON PE QC SK YT'.split(' '));
-function registrationFrom(body) {
+function registrationFrom(body, existing) {
   const str = (k, max) => String(body?.[k] ?? '').replace(/[\u0000-\u001F\u007F]/g, '').trim().slice(0, max);
   const legalName = str('legalName', 120);
   const einRaw = str('ein', 20);
   const ein = storeApi.digits(einRaw);
+  const entity = str('entity', 40);
+  const spec = require('./a2p').entitySpec(entity);
   const street = str('street', 120), city = str('city', 80), region = str('region', 2).toUpperCase();
   const postalCode = str('postalCode', 10).toUpperCase();
   const website = str('website', 300);
@@ -187,8 +189,13 @@ function registrationFrom(body) {
   const contactPhone = str('contactPhone', 20);
   const e164 = require('./setupRules').phoneE164(contactPhone);
   const errors = [];
+  if (!spec) errors.push('Choose a business type: LLC, corporation, partnership, sole proprietor, or nonprofit.');
   if (legalName.length < 2) errors.push('Enter the legal name of the business.');
-  if (einRaw && ein.length !== 9) errors.push('EIN should be 9 digits, or leave it blank if you do not have one.');
+  const keptEin = !einRaw && existing?.ein ? storeApi.digits(existing.ein) : ein;
+  if (spec && spec.flow !== 'sole_proprietor') {
+    if (einRaw && ein.length !== 9) errors.push('EIN should be 9 digits.');
+    else if (keptEin.length !== 9) errors.push('This business type needs a 9-digit EIN.');
+  } else if (einRaw && ein.length !== 9) errors.push('EIN should be 9 digits, or leave it blank for a sole proprietor.');
   if (street.length < 3) errors.push('Enter the street address.');
   if (city.length < 2) errors.push('Enter the city.');
   if (!/^[A-Z]{2}$/.test(region)) errors.push('Enter the 2-letter state or province.');
@@ -202,11 +209,12 @@ function registrationFrom(body) {
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(contactEmail)) errors.push('Enter the contact email.');
   if (!e164 || !sec.isNanp(e164)) errors.push('Enter a US or Canada contact cell.');
   if (errors.length) return { ok: false, error: errors[0] };
+  const standard = spec.flow !== 'sole_proprietor';
   return {
     ok: true,
     registration: {
-      legalName, street, city, region, postalCode, country, website, contactName, contactEmail, contactPhone: e164,
-      ...(ein ? { ein } : {}), ready: true,
+      legalName, entity: spec.key, street, city, region, postalCode, country, website, contactName, contactEmail, contactPhone: e164,
+      ...(standard && keptEin.length === 9 ? { ein: keptEin } : {}), ready: true,
     },
   };
 }
@@ -214,14 +222,36 @@ async function saveRegistration(shopId, body, base) {
   const rec = shopRecord(shopId);
   if (!rec) return fail('Onboarding has not started for this shop.', 404);
   if (rec.a2p?.brandSid) return fail('Registration was already submitted. It updates when the carrier finishes review.', 409);
-  const parsed = registrationFrom(body);
+  const parsed = registrationFrom(body, rec.registration);
   if (!parsed.ok) return parsed;
   rec.registration = parsed.registration;
-  rec.a2p.flow = parsed.registration.ein ? 'low_volume_standard' : 'sole_proprietor';
+  rec.a2p.flow = require('./a2p').entitySpec(parsed.registration.entity).flow;
+  rec.flags = (rec.flags || []).filter((flag) => flag !== 'needs_business_type');
   const shop = vendors.get(shopId);
   if (shop && namesMismatch(parsed.registration.legalName, shop.name)) {
     rec.flags = [...new Set([...(rec.flags || []), 'name_mismatch'])];
   } else rec.flags = (rec.flags || []).filter((f) => f !== 'name_mismatch');
+  save();
+  if (trialOpen(rec.trial)) await advance(shopId, base);
+  return { ok: true, registration: publicRegistration(rec.registration) };
+}
+async function setEntity(shopId, body, base) {
+  const rec = shopRecord(shopId);
+  if (!rec) return fail('Shop not found', 404);
+  if (!rec.registration) return fail('This shop has not saved a registration yet.', 400);
+  if (rec.a2p?.brandSid) return fail('Registration was already submitted. It updates when the carrier finishes review.', 409);
+  const src = rec.registration;
+  const parsed = registrationFrom({
+    legalName: src.legalName, street: src.street, city: src.city, region: src.region, postalCode: src.postalCode,
+    website: src.website, contactName: src.contactName, contactEmail: src.contactEmail, contactPhone: src.contactPhone,
+    entity: body?.entity, ein: body?.ein || '',
+  }, src);
+  if (!parsed.ok) return parsed;
+  rec.registration = parsed.registration;
+  rec.a2p ||= { status: 'not_started' };
+  rec.a2p.flow = require('./a2p').entitySpec(parsed.registration.entity).flow;
+  rec.flags = (rec.flags || []).filter((flag) => flag !== 'needs_business_type');
+  if (rec.a2p.reason && /business type|EIN/.test(rec.a2p.reason)) rec.a2p.reason = '';
   save();
   if (trialOpen(rec.trial)) await advance(shopId, base);
   return { ok: true, registration: publicRegistration(rec.registration) };
@@ -236,6 +266,7 @@ function attention(shop, rec) {
   }
   if (shop && vendors.all().filter((s) => s.email === shop.email && s.status !== 'provisioning').length > 1) flags.add('duplicate_email');
   if (shop && rec.registration && namesMismatch(rec.registration.legalName, shop.name)) flags.add('name_mismatch');
+  if (rec.registration && !require('./a2p').entitySpec(rec.registration.entity)) flags.add('needs_business_type');
   if (rec.number && (rec.number.status === 'failed' || (rec.number.lastError && rec.number.status !== 'purchased' && rec.number.status !== 'manual'))) flags.add('provisioning_failure');
   if (rec.a2p?.status === 'rejected') flags.add('rejected_registration');
   if ((rec.flags || []).includes('low_balance')) flags.add('low_balance');
@@ -348,7 +379,7 @@ function checklistModel(shopId) {
 }
 
 module.exports = {
-  enabled, sendCode, verify, grantFor, setPassword, advance, saveRegistration, queue, viewShop,
+  enabled, sendCode, verify, grantFor, setPassword, advance, saveRegistration, setEntity, queue, viewShop,
   allowPhone, markRegistration, startPoller, checklistModel, flushHeld, redact, publicRegistration,
   resetLimits: storeApi.resetLimits,
 };

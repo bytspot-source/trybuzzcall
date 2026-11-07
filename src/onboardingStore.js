@@ -55,6 +55,7 @@ function publicRegistration(reg) {
     contactEmail: reg.contactEmail || '', contactPhone: reg.contactPhone || '',
     einOnFile: !!(reg.ein || reg.einLast4),
     einMasked: last4 ? `••-•••${last4}` : '',
+    entity: reg.entity || '',
   };
 }
 function forgetEin(reg) {

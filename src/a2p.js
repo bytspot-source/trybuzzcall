@@ -17,6 +17,21 @@ const POLICY = {
 };
 const PRIMARY = () => (/^BU[0-9a-fA-F]{32}$/.test(process.env.TWILIO_PRIMARY_PROFILE_SID || '') ? process.env.TWILIO_PRIMARY_PROFILE_SID : '');
 
+// Portal answers → Trust Hub fields. business_type and company_type are the allowed strings from
+// https://www.twilio.com/docs/messaging/compliance/a2p-10dlc/collect-business-info
+// Nonprofit also sets industry NOT_FOR_PROFIT and company_type non-profit:
+// https://www.twilio.com/docs/messaging/compliance/a2p-10dlc/onboarding-for-government-and-non-profit-agencies
+// Sole proprietor is not one of those business_type values. It uses the separate Sole Proprietor API:
+// https://www.twilio.com/docs/messaging/compliance/a2p-10dlc/onboarding-isv-api-sole-prop-new
+const ENTITIES = {
+  llc: { key: 'llc', label: 'LLC', flow: 'low_volume_standard', businessType: 'Limited Liability Corporation', companyType: 'private' },
+  corporation: { key: 'corporation', label: 'Corporation', flow: 'low_volume_standard', businessType: 'Corporation', companyType: 'private' },
+  partnership: { key: 'partnership', label: 'Partnership', flow: 'low_volume_standard', businessType: 'Partnership', companyType: 'private' },
+  nonprofit: { key: 'nonprofit', label: 'Nonprofit', flow: 'low_volume_standard', businessType: 'Non-profit Corporation', companyType: 'non-profit', industry: 'NOT_FOR_PROFIT' },
+  sole_proprietor: { key: 'sole_proprietor', label: 'Sole proprietor', flow: 'sole_proprietor' },
+};
+function entitySpec(value) { return ENTITIES[value] || null; }
+
 function industry(trade) {
   if (['plumbing', 'hvac', 'electrical', 'handyman', 'landscaping', 'cleaning'].includes(trade)) return 'CONSTRUCTION';
   if (trade === 'massage') return 'HEALTHCARE';
@@ -116,8 +131,8 @@ async function createProfile(client, rec, sole, email) {
       attributes: {
         business_name: reg.legalName,
         business_identity: 'direct_customer',
-        business_type: 'Corporation',
-        business_industry: industry(rec.businessType),
+        business_type: entitySpec(reg.entity).businessType,
+        business_industry: entitySpec(reg.entity).industry || industry(rec.businessType),
         business_regions_of_operation: 'USA_AND_CANADA',
         business_registration_identifier: 'EIN',
         business_registration_number: digits(reg.ein),
@@ -194,7 +209,7 @@ async function createTrust(client, rec, sole, email, profileSid) {
     const end = await client.trusthub.v1.endUsers.create({
       friendlyName: `${reg.legalName} messaging profile`.slice(0, 64),
       type: 'us_a2p_messaging_profile_information',
-      attributes: { company_type: 'private' },
+      attributes: { company_type: entitySpec(reg.entity).companyType },
     });
     bag.messagingEndUserSid = end.sid;
     save();
@@ -261,6 +276,25 @@ async function sync(shopId, base) {
   if (rec.a2p.manual) return rec.a2p;
   const reg = rec.registration;
   if (!reg?.ready && !rec.a2p.brandSid) return rec.a2p;
+  const spec = entitySpec(reg?.entity);
+  // Older saved registrations have no business type. Do not guess, and do not submit.
+  if (!rec.a2p.brandSid && !spec) {
+    const flags = new Set(rec.flags || []);
+    flags.add('needs_business_type');
+    rec.flags = [...flags];
+    rec.a2p.reason = 'Choose a business type before this registration is submitted.';
+    save();
+    return rec.a2p;
+  }
+  if (!rec.a2p.brandSid && spec.flow !== 'sole_proprietor' && digits(reg.ein).length !== 9) {
+    rec.a2p.reason = 'This business type needs a 9-digit EIN before it can be submitted.';
+    save();
+    return rec.a2p;
+  }
+  if (spec) {
+    rec.a2p.flow = spec.flow;
+    rec.flags = (rec.flags || []).filter((flag) => flag !== 'needs_business_type');
+  }
   const primary = PRIMARY();
   if (!primary && !rec.a2p.brandSid) {
     rec.a2p.reason = 'BuzzCall primary Trust Hub profile is not set (TWILIO_PRIMARY_PROFILE_SID). Nothing was submitted.';
@@ -275,8 +309,7 @@ async function sync(shopId, base) {
     save();
     return rec.a2p;
   }
-  const sole = rec.a2p.flow === 'sole_proprietor' || (!rec.a2p.brandSid && !digits(reg?.ein));
-  rec.a2p.flow = sole ? 'sole_proprietor' : 'low_volume_standard';
+  const sole = rec.a2p.flow === 'sole_proprietor';
   try {
     if (!rec.a2p.brandSid) {
       const email = reg.contactEmail;
@@ -350,4 +383,4 @@ async function resendOtp(shopId) {
   return { ok: true };
 }
 
-module.exports = { sync, resendOtp, reduceStatus, POLICY };
+module.exports = { sync, resendOtp, reduceStatus, POLICY, entitySpec, ENTITIES };

@@ -93,6 +93,12 @@ function register(app, { requireAdmin, sameOrigin }) {
     if (!result.ok) return res.status(result.status || 400).type('text').send(result.error);
     res.redirect(303, '/admin/onboarding');
   });
+  app.post('/admin/onboarding/:id/entity', requireAdmin, async (req, res) => {
+    if (!/^(1|true|yes|on)$/i.test(String(req.body?.confirm || ''))) return res.status(409).type('text').send('Confirm the business type.');
+    const result = await onboarding.setEntity(req.params.id, req.body, process.env.PUBLIC_BASE_URL || '');
+    if (!result.ok) return res.status(result.status || 400).type('text').send(result.error);
+    return json(req) ? res.json(result) : res.redirect(303, '/admin/onboarding');
+  });
   app.post('/admin/onboarding/:id/registration', requireAdmin, async (req, res) => {
     const result = await onboarding.markRegistration(req.params.id, String(req.body?.status || ''), req.body?.reason);
     if (!result.ok) return res.status(result.status || 400).type('text').send(result.error);

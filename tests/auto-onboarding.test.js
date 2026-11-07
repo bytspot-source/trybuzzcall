@@ -44,12 +44,21 @@ const state = {
   searches: [], buys: [], brands: [], campaigns: [], owned: [],
   brandStatus: 'PENDING', campaignStatus: 'PENDING', failureReason: '',
   brandSid: 'BN' + 'b'.repeat(32), campaignSid: 'QE' + 'c'.repeat(32),
-  einExact: false, einLength: 0, otps: 0, seq: 10,
+  einExact: false, einLength: 0, otps: 0, seq: 10, profiles: [],
 };
 function sid(prefix) { state.seq += 1; return prefix + String(state.seq).padStart(32, '0'); }
 function handle(path, args) {
   const key = path.filter(Boolean).join('.');
   const attrs = args && args.attributes;
+  if (args && args.type && attrs) {
+    state.profiles.push({
+      type: args.type,
+      business_type: attrs.business_type || '',
+      company_type: attrs.company_type || '',
+      business_industry: attrs.business_industry || '',
+      hasEin: !!attrs.business_registration_number,
+    });
+  }
   if (attrs && attrs.business_registration_number) {
     state.einExact = attrs.business_registration_number === EIN_DIGITS;
     state.einLength = String(attrs.business_registration_number).length;
@@ -356,7 +365,7 @@ test('A2P state machine holds customer texts until approval and never prints the
   const mark = logs.length;
   const shop = await signup({ email: 'a2p@peach.example', ownerPhone: phone(), businessName: 'Peach Plumbing' });
   const saved = await req('POST', '/vendor/onboarding/registration', { cookie: shop.cookie, body: {
-    legalName: 'Other Legal Name LLC', ein: EIN, street: '100 Peachtree St', city: 'Atlanta', region: 'GA',
+    legalName: 'Other Legal Name LLC', entity: 'llc', ein: EIN, street: '100 Peachtree St', city: 'Atlanta', region: 'GA',
     postalCode: '30303', website: 'https://peach.example', contactName: 'Ada Owner', contactEmail: 'ada@peach.example',
     contactPhone: '(404) 555-0177',
   } });
@@ -425,7 +434,7 @@ test('A2P state machine holds customer texts until approval and never prints the
   state.failureReason = '';
   const sole = await signup({ email: 'sole@peach.example', ownerPhone: phone(), businessName: 'Sole Shop Plumbing' });
   const soleSaved = await req('POST', '/vendor/onboarding/registration', { cookie: sole.cookie, body: {
-    legalName: 'Sam Sole', street: '200 Edgewood Ave', city: 'Atlanta', region: 'GA', postalCode: '30303',
+    legalName: 'Sam Sole', entity: 'sole_proprietor', street: '200 Edgewood Ave', city: 'Atlanta', region: 'GA', postalCode: '30303',
     website: 'https://sole.example', contactName: 'Sam Sole', contactEmail: 'sam@sole.example', contactPhone: sole.phone,
   } });
   assert.equal(soleSaved.status, 200);
@@ -444,4 +453,111 @@ test('A2P state machine holds customer texts until approval and never prints the
   assert.equal(state.campaigns.at(-1).usAppToPersonUsecase, 'SOLE_PROPRIETOR');
   assert.equal(network, 0);
   assert.equal(logs.some(containsEin), false);
+  const llcProfile = state.profiles.find((row) => row.business_type === 'Limited Liability Corporation');
+  assert.equal(llcProfile.company_type, '');
+  assert.equal(llcProfile.hasEin, true);
+  assert.equal(state.profiles.some((row) => row.company_type === 'private' && row.type === 'us_a2p_messaging_profile_information'), true);
+});
+
+test('business type maps to Twilio fields, rejects a missing EIN, and holds legacy records', async () => {
+  process.env.AUTO_ONBOARDING = '1';
+  process.env.AUTO_A2P = '1';
+  process.env.TWILIO_PRIMARY_PROFILE_SID = PRIMARY;
+  const a2p = require('../src/a2p');
+  const expected = [
+    ['llc', 'Limited Liability Corporation', 'private', ''],
+    ['corporation', 'Corporation', 'private', ''],
+    ['partnership', 'Partnership', 'private', ''],
+    ['nonprofit', 'Non-profit Corporation', 'non-profit', 'NOT_FOR_PROFIT'],
+  ];
+  for (const [key, businessType, companyType, industry] of expected) {
+    const spec = a2p.entitySpec(key);
+    assert.equal(spec.flow, 'low_volume_standard');
+    assert.equal(spec.businessType, businessType);
+    assert.equal(spec.companyType, companyType);
+    assert.equal(spec.industry || '', industry);
+  }
+  assert.equal(a2p.entitySpec('sole_proprietor').flow, 'sole_proprietor');
+  assert.equal(a2p.entitySpec('nope'), null);
+
+  const shop = await signup({ email: 'entity@peach.example', ownerPhone: phone(), businessName: 'Entity Shop Plumbing' });
+  const fields = {
+    legalName: 'Entity Shop LLC', street: '10 Mitchell St', city: 'Atlanta', region: 'GA', postalCode: '30303',
+    website: 'https://entity.example', contactName: 'Eve Owner', contactEmail: 'eve@entity.example', contactPhone: shop.phone,
+  };
+  const missing = await req('POST', '/vendor/onboarding/registration', { cookie: shop.cookie, body: fields });
+  assert.equal(missing.status, 400);
+  assert.match(missing.body, /business type/);
+  const unknown = await req('POST', '/vendor/onboarding/registration', { cookie: shop.cookie, body: { ...fields, entity: 'co-op' } });
+  assert.equal(unknown.status, 400);
+  for (const key of ['llc', 'corporation', 'partnership', 'nonprofit']) {
+    const rejected = await req('POST', '/vendor/onboarding/registration', { cookie: shop.cookie, body: { ...fields, entity: key } });
+    assert.equal(rejected.status, 400, key);
+    assert.match(rejected.body, /9-digit EIN/);
+  }
+  const short = await req('POST', '/vendor/onboarding/registration', { cookie: shop.cookie, body: { ...fields, entity: 'llc', ein: '12-345' } });
+  assert.equal(short.status, 400);
+  assert.match(short.body, /9 digits/);
+  const soleBlank = await req('POST', '/vendor/onboarding/registration', { cookie: shop.cookie, body: { ...fields, entity: 'sole_proprietor' } });
+  assert.equal(soleBlank.status, 200);
+  assert.equal(containsEin(soleBlank.body), false);
+
+  state.brandStatus = 'PENDING';
+  for (const [key, businessType, companyType, industry] of expected) {
+    const saved = await req('POST', '/vendor/onboarding/registration', { cookie: shop.cookie, body: { ...fields, entity: key, ein: EIN } });
+    assert.equal(saved.status, 200, key);
+    assert.equal(containsEin(saved.body), false);
+    const mark = state.profiles.length;
+    const brands = state.brands.length;
+    await a2p.sync(shop.shopId, 'http://shop.example');
+    const slice = state.profiles.slice(mark);
+    const business = slice.find((row) => row.type === 'customer_profile_business_information');
+    const company = slice.find((row) => row.type === 'us_a2p_messaging_profile_information');
+    assert.equal(business.business_type, businessType);
+    assert.equal(business.hasEin, true);
+    assert.equal(company.company_type, companyType);
+    if (industry) assert.equal(business.business_industry, industry);
+    assert.equal(state.brands.length, brands + 1);
+    assert.equal(state.brands.at(-1).brandType, 'STANDARD');
+    assert.equal(state.brands.at(-1).skipAutomaticSecVet, true);
+    const rec = store.root.db.onboarding.shops[shop.shopId];
+    rec.a2p = { status: 'not_started' };
+    rec.registration.ein = EIN_DIGITS;
+    store.root.save();
+  }
+  const soleMark = state.profiles.length;
+  const soleBrands = state.brands.length;
+  await req('POST', '/vendor/onboarding/registration', { cookie: shop.cookie, body: { ...fields, entity: 'sole_proprietor' } });
+  await a2p.sync(shop.shopId, 'http://shop.example');
+  const soleSlice = state.profiles.slice(soleMark);
+  assert.equal(soleSlice.some((row) => row.type === 'sole_proprietor_information'), true);
+  assert.equal(soleSlice.some((row) => row.hasEin), false);
+  assert.equal(state.brands.length, soleBrands + 1);
+  assert.equal(state.brands.at(-1).brandType, 'SOLE_PROPRIETOR');
+
+  const rec = store.root.db.onboarding.shops[shop.shopId];
+  rec.a2p = { status: 'not_started' };
+  rec.registration = { ...fields, country: 'US', contactPhone: shop.phone, ein: EIN_DIGITS, ready: true };
+  delete rec.registration.entity;
+  store.root.save();
+  const brandsBefore = state.brands.length;
+  await a2p.sync(shop.shopId, 'http://shop.example');
+  assert.equal(state.brands.length, brandsBefore);
+  assert.equal(rec.flags.includes('needs_business_type'), true);
+  const queued = await req('GET', '/admin/onboarding', { admin: true, accept: 'text/html' });
+  assert.match(queued.body, /Needs business type/);
+  assert.match(queued.body, /Not set/);
+  assert.equal(containsEin(queued.body), false);
+  const edited = await req('POST', `/admin/onboarding/${shop.shopId}/entity`, { admin: true, body: { entity: 'corporation', confirm: '1' } });
+  assert.equal(edited.status, 200);
+  assert.equal(containsEin(edited.body), false);
+  assert.match(edited.body, /"entity":"corporation"/);
+  const shown = await req('GET', '/admin/onboarding', { admin: true, accept: 'text/html' });
+  assert.match(shown.body, /value="corporation" selected/);
+  assert.equal(shown.body.includes('Needs business type'), false);
+  assert.equal(containsEin(shown.body), false);
+  await a2p.sync(shop.shopId, 'http://shop.example');
+  assert.equal(state.profiles.at(-1).company_type === 'private' || state.profiles.some((row) => row.business_type === 'Corporation' && row.hasEin), true);
+  assert.equal(logs.some(containsEin), false);
+  assert.equal(network, 0);
 });

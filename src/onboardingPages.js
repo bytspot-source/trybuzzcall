@@ -24,8 +24,13 @@ function flagLabel(flag) {
   return {
     duplicate_phone: 'Duplicate phone', duplicate_email: 'Duplicate email', name_mismatch: 'Name mismatch',
     provisioning_failure: 'Provisioning failure', rejected_registration: 'Rejected registration',
-    low_balance: 'Low balance', cap_hit: 'Cap hit',
+    low_balance: 'Low balance', cap_hit: 'Cap hit', needs_business_type: 'Needs business type',
   }[flag] || flag;
+}
+const ENTITY_OPTIONS = [['llc', 'LLC'], ['corporation', 'Corporation'], ['partnership', 'Partnership'], ['sole_proprietor', 'Sole proprietor'], ['nonprofit', 'Nonprofit']];
+function entitySelect(selected) {
+  const options = ENTITY_OPTIONS.map(([value, label]) => `<option value="${esc(value)}"${value === selected ? ' selected' : ''}>${esc(label)}</option>`).join('');
+  return `<label class="field">Business type<select name="entity" required><option value=""${selected ? '' : ' selected'} disabled>Choose a business type</option>${options}</select><small>LLC, corporation, partnership, and nonprofit need an EIN. Sole proprietor does not.</small></label>`;
 }
 function ten(phone) {
   const m = /^\+1(\d{10})$/.exec(String(phone || ''));
@@ -83,9 +88,10 @@ function checklist(model) {
   const regStatus = `<p>Status: ${badge(String(model.registration || '').replaceAll('_', ' '), tone(model.registration))}${model.registrationError ? ` ${esc(model.registrationError)}` : ''}</p>`;
   const held = model.registration === 'approved' ? '<p>Customer text-backs are on.</p>' : '<p>Until carrier registration is approved, missed-call buzzes still come to you, and customer text-backs wait.</p>';
   const form = model.manualRegistration === false ? '' : `<form method="post" action="/vendor/onboarding/registration">${locked}
+${entitySelect(reg.entity)}
 <label class="field">Legal name<input name="legalName" required maxlength="120" value="${esc(reg.legalName || '')}" autocomplete="organization"></label>
-<label class="field">EIN <span class="unit-label">(optional)</span><input name="ein" inputmode="numeric" autocomplete="off" maxlength="11" value="" placeholder="${reg.einMasked ? esc(reg.einMasked) : 'XX-XXXXXXX'}"></label>
-<p class="muted">${reg.einOnFile ? `An EIN ending ${esc(reg.einMasked)} is saved. Leave this blank to keep it.` : 'Leave the EIN blank for a sole proprietor registration. With an EIN, BuzzCall submits a low-volume standard brand.'}</p>
+<label class="field">EIN <span class="unit-label">(required except sole proprietor)</span><input name="ein" inputmode="numeric" autocomplete="off" maxlength="11" value="" placeholder="${reg.einMasked ? esc(reg.einMasked) : 'XX-XXXXXXX'}"></label>
+<p class="muted">${reg.einOnFile ? `An EIN ending ${esc(reg.einMasked)} is saved. Leave this blank to keep it.` : 'Leave this blank only for a sole proprietor. Every other business type needs a 9-digit EIN.'}</p>
 <label class="field">Street<input name="street" required maxlength="120" value="${esc(reg.street || '')}" autocomplete="address-line1"></label>
 <label class="field">City<input name="city" required maxlength="80" value="${esc(reg.city || '')}" autocomplete="address-level2"></label>
 <label class="field">State<input name="region" required maxlength="2" value="${esc(reg.region || '')}" autocomplete="address-level1"></label>
@@ -113,11 +119,13 @@ function queuePage(rows) {
 <form method="post" action="/admin/onboarding/${esc(row.id)}/suspend"><button class="button button-danger" type="submit">Suspend</button></form>
 <form method="post" action="/admin/onboarding/${esc(row.id)}/provision"><label class="field">Assign a number<input name="phoneNumber" placeholder="+14045550199" required></label><label class="checkbox-field"><input type="checkbox" name="confirm_phones" value="1" required><span>I am assigning this number myself. Do not buy one.</span></label><button class="button button-primary" type="submit">Provision manually</button></form>
 ${row.manualRegistration ? `<form method="post" action="/admin/onboarding/${esc(row.id)}/registration"><label class="field">Record the carrier result<select name="status"><option value="approved">Approved</option><option value="rejected">Rejected</option></select></label><label class="field">Reason<input name="reason" maxlength="300"></label><button class="button button-outline" type="submit">Save registration result</button></form>` : ''}
+${shop && row.manualRegistration && row.registrationForm ? `<form method="post" action="/admin/onboarding/${esc(row.id)}/entity">${entitySelect(row.registrationForm.entity)}<label class="field">EIN, if this type needs one<input name="ein" inputmode="numeric" autocomplete="off" maxlength="11" value="" placeholder="${esc(row.registrationForm.einMasked || '9 digits')}"></label><label class="checkbox-field"><input type="checkbox" name="confirm" value="1" required><span>I am correcting this business type.</span></label><button class="button button-outline" type="submit">Save business type</button></form>` : ''}
 <form method="post" action="/admin/onboarding/${esc(row.id)}/allow-phone"><label class="checkbox-field"><input type="checkbox" name="confirm" value="1" required><span>Allow another shop on ${esc(row.phone || 'this cell')}.</span></label><button class="button button-outline" type="submit">Allow another shop</button></form>` : '';
     return `<article class="panel"><div class="panel-header"><h2>${esc(row.name || 'Shop')}</h2>${badge(row.status || 'pending')}</div><div class="panel-body">
 <dl class="detail-list"><dt>Email</dt><dd>${esc(row.email || '')}</dd><dt>Alert cell</dt><dd>${esc(row.phone || '')}</dd>
 <dt>Verified</dt><dd>${badge(row.verified, tone(row.verified))}</dd><dt>Trial</dt><dd>${badge(row.trial, tone(row.trial))}</dd>
 <dt>Number</dt><dd>${badge(String(row.number || '').replaceAll('_', ' '), tone(row.number))}${row.line ? ` ${esc(row.line)}` : ''}${row.numberError ? `<br>${esc(row.numberError)}` : ''}</dd>
+<dt>Business type</dt><dd>${esc((ENTITY_OPTIONS.find(([value]) => value === row.registrationForm?.entity) || [])[1] || 'Not set')}</dd>
 <dt>Registration</dt><dd>${badge(String(row.registration || '').replaceAll('_', ' '), tone(row.registration))}${row.registrationError ? `<br>${esc(row.registrationError)}` : ''}${row.registrationForm?.einMasked ? `<br>EIN ${esc(row.registrationForm.einMasked)}` : ''}</dd>
 <dt>Attention</dt><dd>${flags || 'None'}</dd></dl>${actions}${shop ? `<p><a class="text-action" href="/admin/vendors/${esc(row.id)}">Open vendor ${icon('arrow')}</a></p>` : ''}</div></article>`;
   }).join('') : '<p>No shops are in onboarding.</p>';
