@@ -7,6 +7,7 @@ const billing = require('./billing');
 const booking = require('./booking');
 const connect = require('./connect');
 const deposits = require('./deposits');
+const disputes = require('./disputes');
 const pages = require('./workspacePages');
 const adminPages = require('./adminPages');
 const paymentPages = require('./paymentPages');
@@ -150,9 +151,37 @@ function register(app, { requireAdmin, BASE, sameOrigin }) {
   }));
   app.post('/vendor/logout', safe(async (req,res) => { await vendors.logout(req); vendors.setCookie(res); reply(req,res,{ok:true},'/vendor/login'); }));
   app.get('/vendor', requireVendor, safe(async (req,res) => {
+    res.set('Permissions-Policy','camera=(), microphone=(), geolocation=(self), payment=()'); // optional check-in location
     show(res, adminPages.renderVendor({ businessName: config.env.BUSINESS_NAME || req.vendor.name, ownerEmail: req.vendor.email,
       shop:req.vendor, leads:store.db.leads, calls:store.db.calls || [], bookings:store.db.bookings, alerts:store.db.alerts,
       billing:billing.summary(),connect:connect.summary(),deposits:deposits.summary(),cfg:booking.cfg(),fees:booking.leadFeeTotals(), demoAllowed:sec.demoAllowed(), optedOut:phone=>store.isOptedOut(phone) }));
+  }));
+  // Vendor "I'm here" check-in for one of this vendor's own bookings (the store is the signed-in vendor's).
+  app.post('/vendor/bookings/:id/checkin', requireVendor, safe(async (req,res) => {
+    const b = store.findBooking(req.params.id);
+    if (!b) throw vendors.error('Booking not found.',404);
+    const r = disputes.checkIn(b,{lat:req.body.lat,lng:req.body.lng,accuracy:req.body.accuracy,ip:sec.clientIp(req),source:'portal'});
+    if (!r.ok) throw vendors.error(require('./disputePages').REASONS[r.reason] || 'Check-in could not be recorded.',409);
+    await vendors.persist(context.current().store);
+    reply(req,res,r,'/vendor#bookings');
+  }));
+  // Respond to a no-show claim with a note and/or photo.
+  const disputeView = (req, extra = {}) => {
+    const d = deposits.find(req.params.id);
+    if (!d || !d.dispute) throw vendors.error('Claim not found.',404);
+    return { deposit:d, booking:store.findBooking(d.bookingId), shopName:config.env.BUSINESS_NAME || req.vendor.name, action:`/vendor/disputes/${encodeURIComponent(d.id)}/proof`,
+      open:disputes.isOpen(d), mode:connect.mode() === 'mock' && !sec.demoAllowed() ? 'unconfigured' : connect.mode(), backHref:'/vendor#payments', ...extra };
+  };
+  app.get('/vendor/disputes/:id', requireVendor, safe(async (req,res) => show(res,require('./disputePages').proofPage(disputeView(req)))));
+  app.post('/vendor/disputes/:id/proof', requireVendor, safe(async (req,res) => {
+    const view = disputeView(req);
+    const r = app.locals.submitProof(view.deposit, req.body, 'portal');
+    if (r.ok) {
+      await vendors.persist(context.current().store);
+      await app.locals.platformAlert(`BUZZ ${view.shopName}: vendor sent proof (portal) for no-show claim on booking ${view.deposit.bookingId}. Review: ${String(BASE).replace(/\/+$/,'')}/admin/deposits?shop=${encodeURIComponent(req.vendor.id)}`, 'BuzzCall: vendor sent no-show proof');
+    }
+    if (json(req)) return res.status(r.ok ? 200 : 400).json(r);
+    res.status(r.ok ? 200 : 400).type('html').send(require('./disputePages').proofPage({ ...view, open:disputes.isOpen(view.deposit), message:r.ok ? 'Thanks, your proof was added. BuzzCall will review it.' : '', error:r.ok ? '' : r.error }));
   }));
   app.get('/vendor/settings', requireVendor, safe(async (req,res) => show(res,pages.settings({shop:req.vendor,values:settingsValues()}))));
   app.post('/vendor/settings', requireVendor, safe(async (req,res) => {

@@ -7,6 +7,8 @@
 //
 // Persist state in store.db.deposits (array) and store.db.vendorDebt ({ [accountId]: cents }).
 // Mock mode (no STRIPE_SECRET_KEY): same state machine, fake ids, mock clock (offsetMs) for demo fast-forward.
+// Statuses: held -> scheduled -> released | refunded; paused (customer NO, vendor did not check in) and disputed
+// (customer NO after the vendor checked in: payout held for admin review). Dispute handling lives in src/disputes.js.
 const crypto = require('crypto');
 const store = require('./store');
 const connect = require('./connect');
@@ -118,7 +120,7 @@ function recordEvent(type, depositId, extra = {}) {
 function createHeld(booking, payment = {}) {
   bucket();
   let d = findByBooking(booking.id);
-  if (d && ['held', 'scheduled', 'paused', 'released', 'refunded'].includes(d.status) && d.paid) return d;
+  if (d && ['held', 'scheduled', 'paused', 'disputed', 'released', 'refunded'].includes(d.status) && d.paid) return d;
   const amountCents = Math.round(Number(booking.amount || 0) * 100);
   const fee = platformFeeCents(amountCents);
   const acct = connect.accountId();
@@ -154,6 +156,7 @@ function createHeld(booking, payment = {}) {
       createdAt: iso(),
       updatedAt: iso(),
     };
+    if (booking.vendorCheckIn) d.vendorCheckIn = booking.vendorCheckIn;
     bucket().deposits.unshift(d);
   } else {
     Object.assign(d, {
@@ -182,11 +185,16 @@ function onBookingPaid(booking, payment) {
   return createHeld(booking, payment || {});
 }
 
-async function releaseDeposit(d, { force = false } = {}) {
+async function releaseDeposit(d, { force = false, by = 'admin' } = {}) {
   if (!d || d.status === 'refunded') return { ok: false, reason: 'refunded' };
   if (d.status === 'released' && d.transferId) return { ok: true, already: true, deposit: d };
-  if (d.status === 'paused' && !force) return { ok: false, reason: 'paused' };
+  if ((d.status === 'paused' || d.status === 'disputed') && !force) return { ok: false, reason: d.status };
   if (!force && Date.parse(d.releaseAt) > now()) return { ok: false, reason: 'too_early' };
+  if (force && (d.status === 'paused' || d.status === 'disputed' || d.payoutPaused)) {
+    // An explicit release (admin, or dispute auto-release) lifts the hold even if the payout must wait for Connect.
+    d.payoutPaused = false;
+    if (d.dispute) require('./disputes').markResolved(d, 'vendor', by);
+  }
 
   const acct = d.connectAccountId || connect.accountId();
   if (!acct) {
@@ -240,6 +248,7 @@ async function releaseDeposit(d, { force = false } = {}) {
 async function refundDeposit(d, { reason = 'admin' } = {}) {
   if (!d) return { ok: false, reason: 'not_found' };
   if (d.status === 'refunded') return { ok: true, already: true, deposit: d };
+  if (d.dispute && !d.dispute.resolution) require('./disputes').markResolved(d, 'customer', reason);
 
   // After transfer: reverse transfer first (or record vendor_debt if reverse fails / short balance).
   if (d.transferId && d.status === 'released' && !String(d.transferId).startsWith('zero_')) {
@@ -316,11 +325,13 @@ function pauseForNoshow(d) {
 function pendingNoshow(phone) {
   if (!phone) return null;
   return bucket().deposits.find((d) => d.phone === phone && d.noshowSentAt && !d.noshowReply
-    && ['scheduled', 'held', 'paused'].includes(d.status)) || null;
+    && ['scheduled', 'held', 'paused', 'disputed'].includes(d.status)) || null;
 }
 
 // YES/NO reply handler. Returns null if this number has no pending check (so SMS conversation continues).
-function handleNoshowReply(phone, body) {
+// A NO opens a dispute (src/disputes.js): 'disputed' when the vendor checked in, else 'paused' as before. The result
+// carries the customer reply, the vendor's reply-with-proof text (vendorText) and the admin buzz (adminAlert).
+function handleNoshowReply(phone, body, { base = '' } = {}) {
   const d = pendingNoshow(phone);
   if (!d) return null;
   const letters = require('./optout').letters(body);
@@ -332,15 +343,7 @@ function handleNoshowReply(phone, body) {
     return { deposit: d, answer: 'yes', reply: null };
   }
   if (letters === 'NO' || /^NO\b/i.test(String(body || '').trim())) {
-    pauseForNoshow(d);
-    const shop = d.shopName || env.BUSINESS_NAME || 'the shop';
-    return {
-      deposit: d,
-      answer: 'no',
-      reply: "Thanks, we've paused the payment and will follow up within 1 business day.",
-      ownerAlert: `BUZZ ${shop}: NO-SHOW reported for booking ${d.bookingId}. Deposit $${money(d.amountCents)} paused. Customer: ${phone}.`,
-      shopAlert: `BuzzCall: a customer said you did not show for their appointment (booking ${d.bookingId}). Payout paused. We'll follow up.`,
-    };
+    return require('./disputes').openOnNo(d, { base });
   }
   return null; // not a clear YES/NO — leave for normal conversation (check stays pending)
 }
@@ -350,7 +353,7 @@ async function sendDueNoshowChecks({ sendSms } = {}) {
   const zone = shopTime.timeZone();
   for (const d of bucket().deposits) {
     if (d.noshowSentAt || d.noshowReply) continue;
-    if (!['held', 'scheduled', 'paused'].includes(d.status) && d.status !== 'released') continue;
+    if (!['held', 'scheduled', 'paused', 'disputed'].includes(d.status) && d.status !== 'released') continue;
     if (d.status === 'refunded') continue;
     const due = Date.parse(d.noshowCheckAt || 0);
     if (!Number.isFinite(due) || due > now()) continue;
@@ -396,8 +399,10 @@ async function processDueReleases() {
 // Combined tick: safe across restarts (state is persisted; Stripe calls use idempotency keys).
 async function tick({ sendSms } = {}) {
   const noshows = await sendDueNoshowChecks({ sendSms });
+  const disputes = await require('./disputes').tick({ sendSms });
   const releases = await processDueReleases();
-  return { noshows: noshows.length, releases: releases.filter((r) => r.ok && !r.already).length };
+  return { noshows: noshows.length, releases: releases.filter((r) => r.ok && !r.already).length + disputes.autoReleased,
+    followups: disputes.followups, autoReleased: disputes.autoReleased };
 }
 
 // Demo/mock: advance the deposits clock (and optionally process due work).
@@ -450,7 +455,7 @@ async function handleWebhookEvent(event) {
       // If payouts were pending connect, attach account id for future releases.
       if (o && o.id && o.charges_enabled) {
         for (const d of bucket().deposits) {
-          if (d.payoutPendingConnect && !d.connectAccountId && ['held', 'scheduled', 'paused'].includes(d.status)) {
+          if (d.payoutPendingConnect && !d.connectAccountId && ['held', 'scheduled', 'paused', 'disputed'].includes(d.status)) {
             d.connectAccountId = o.id;
             d.payoutPendingConnect = false;
             d.updatedAt = iso();
@@ -466,8 +471,16 @@ async function handleWebhookEvent(event) {
 
 function summary() {
   const rows = list();
-  const counts = { held: 0, scheduled: 0, paused: 0, released: 0, refunded: 0 };
+  const counts = { held: 0, scheduled: 0, paused: 0, disputed: 0, released: 0, refunded: 0 };
   for (const d of rows) counts[d.status] = (counts[d.status] || 0) + 1;
+  const disputes = require('./disputes');
+  // Read-only view rows: booking context + repeat-claim flag for the admin timeline (records are not mutated).
+  const view = rows.slice(0, 100).map((d) => {
+    const b = store.findBooking(d.bookingId);
+    const booking = b ? { name: b.name || null, service: b.service || b.need || null, slotLabel: b.slotLabel || null, slotStart: b.slotStart || null, createdAt: b.createdAt || null } : null;
+    return { ...d, booking, customerFlag: d.dispute || d.noshowReply === 'no' ? disputes.flagFor(d.phone) : null,
+      timeline: d.dispute || d.vendorCheckIn ? disputes.fullTimeline(d, b) : [] };
+  });
   return {
     mode: cfg().live ? (connect.mode() === 'live' ? 'live' : 'test') : 'mock',
     now: iso(),
@@ -476,7 +489,8 @@ function summary() {
     noshowHours: cfg().noshowHours,
     platformFeePct: cfg().platformFeePct,
     vendorDebt: { ...bucket().vendorDebt },
-    deposits: rows.slice(0, 100),
+    autoReleaseHours: disputes.cfg().autoReleaseHours,
+    deposits: view,
   };
 }
 

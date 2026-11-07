@@ -25,6 +25,8 @@ const consent = require('./consent');
 const { say } = require('./voice');
 const smsPage = require('./smsPage');
 const outcomes = require('./outcomes'); // outcomes log: every entry point is failure-safe (never breaks call/SMS handling)
+const disputes = require('./disputes'); // vendor check-in, no-show disputes, proof, auto-release, repeat-claim flags
+const disputePages = require('./disputePages');
 
 const app = express();
 app.disable('x-powered-by');
@@ -136,20 +138,26 @@ app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, re
   };
   return destination.shop ? vendors.run(destination.shop.id, handle, { suspended: true }) : handle();
 });
-app.use(express.urlencoded({ extended: false, limit: '100kb' }));
-app.use(express.json({ limit: '100kb' }));
+// Vendor proof forms carry one client-compressed photo (data URL), so they get a larger body limit; everything else 100kb.
+const PROOF_UPLOAD = /^\/(v\/proof\/[^/]+|vendor\/disputes\/[^/]+\/proof)$/;
+const bodyParsers = (limit) => [express.urlencoded({ extended: false, limit }), express.json({ limit })];
+{
+  const [smallForm, smallJson] = bodyParsers('100kb'), [bigForm, bigJson] = bodyParsers('1mb');
+  app.use((req, res, next) => (PROOF_UPLOAD.test(req.path) && req.method === 'POST' ? bigForm : smallForm)(req, res, next));
+  app.use((req, res, next) => (PROOF_UPLOAD.test(req.path) && req.method === 'POST' ? bigJson : smallJson)(req, res, next));
+}
 // Central CSRF guard: every state-changing request (anything but GET/HEAD/OPTIONS) to an admin or billing endpoint
 // (/admin/*, /api/billing/*, /billing/*, including the mock billing routes) must come from this site. Registered once,
 // before every such route, so a new route can't forget it. Case-insensitive because Express routing is.
 // Private business/payment pages must never be stored in shared caches or leak capability URLs as referrers.
 app.use((req, res, next) => {
-  if (/^\/(admin|vendor|api\/billing|billing|pay|payment)(\/|$)/i.test(req.path)) {
+  if (/^\/(admin|vendor|v|api\/billing|billing|pay|payment)(\/|$)/i.test(req.path)) {
     res.set('Cache-Control', 'private, no-store');
     res.set('Referrer-Policy', 'no-referrer');
   }
   next();
 });
-const ORIGIN_GUARDED = /^\/(admin|vendor|api\/billing|billing)(\/|$)/i;
+const ORIGIN_GUARDED = /^\/(admin|vendor|v|api\/billing|billing)(\/|$)/i;
 app.use((req, res, next) => (['GET', 'HEAD', 'OPTIONS'].includes(req.method) || !ORIGIN_GUARDED.test(req.path) ? next() : sameOrigin(req, res, next)));
 // Never serve editor/backup leftovers (e.g. public/terms.html.bak-*) or dotfiles from public/.
 app.use((req, res, next) => (/\.(bak|orig|swp)\b|~$|\/\./i.test(req.path) ? res.status(404).send('Not found') : next()));
@@ -505,6 +513,13 @@ app.post('/twilio/sms', verifyTwilio, routeTwilio(), async (req, res) => {
     return twiml(res, '');
   }
   if (store.isOptedOut(from)) return twiml(res, ''); // opted out: no conversation until START
+  // The shop owner's own phone replying while a no-show claim is open: the text / MMS photo is the vendor's proof.
+  const proof = disputes.handleVendorMessage(from, body, req.body, { base: BASE });
+  if (proof) {
+    if (proof.reply) await sendSms(from, proof.reply, { kind: 'owner' });
+    if (proof.adminAlert) await platformAlert(proof.adminAlert, 'BuzzCall: vendor sent no-show proof');
+    return twiml(res, '');
+  }
   if (kw === 'maybe') { // longer message mentioning stop with no job context: don't guess; pause the bot, ask the owner
     const lead = store.findOpenLead(from);
     if (lead) { lead.messages.push({ dir: 'in', body }); }
@@ -523,11 +538,18 @@ app.post('/twilio/sms', verifyTwilio, routeTwilio(), async (req, res) => {
   const emailStep = outcomes.emailReply(from, body, { base: BASE, sendVerify: (to, link) => mail.outcomeVerify(to, link, consent.shopName()) });
   if (emailStep) { await sendSms(from, emailStep.reply); return twiml(res, ''); }
   // No-show check YES/NO: only when a check is pending for this number (does not collide with booking conversation).
-  const noshow = deposits.handleNoshowReply(from, body);
+  const noshow = deposits.handleNoshowReply(from, body, { base: BASE });
   if (noshow) {
     if (noshow.reply) await sendSms(from, noshow.reply);
-    if (noshow.ownerAlert) await owner(null, noshow.ownerAlert);
-    if (noshow.shopAlert && env.OWNER_PHONE) await sendSms(env.OWNER_PHONE, noshow.shopAlert, { kind: 'owner' });
+    if (noshow.vendorText) await owner(null, noshow.vendorText); // the shop owner (vendor) in this shop's context
+    if (noshow.adminAlert) await platformAlert(noshow.adminAlert, 'BuzzCall: no-show claim');
+    return twiml(res, '');
+  }
+  // KEEP: only while a dispute follow-up ("Reply KEEP to keep your claim") is pending for this number.
+  const keep = disputes.handleKeep(from, body, { base: BASE });
+  if (keep) {
+    if (keep.reply) await sendSms(from, keep.reply);
+    if (keep.adminAlert) await platformAlert(keep.adminAlert, 'BuzzCall: no-show claim needs review');
     return twiml(res, '');
   }
   let lead = store.findOpenLead(from) || store.createLead(from);
@@ -595,9 +617,13 @@ async function onBooked(lead, b) {
   if (ask) { lead.messages.push({ dir: 'out', body: ask }); store.save(); await sendSms(lead.phone, ask); }
   const status = b.status === 'held' ? `slot held, deposit pending ($${b.amount}, hold expires ${new Date(b.holdExpiresAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })})`
     : b.depositSkipped ? `BOOKED (no deposit; deposit off: ${b.depositSkipped})` : 'BOOKED (no deposit)';
-  if (b.service) await owner(lead.id, `BUZZ ${env.BUSINESS_NAME || ''}: ${status.replace('slot held', 'time held')}: ${lead.name || 'Caller (name not given)'}, ${lead.need}, ${b.slotLabel}. tel:${lead.phone}`);
-  else await owner(lead.id, `${tag(lead)}BUZZ ${env.BUSINESS_NAME || ''}: ${status}: ${lead.name || 'Caller (name not given)'}, ${lead.need}, ${b.slotLabel}. Tap to call: tel:${lead.phone}`);
+  const arrive = b.status === 'confirmed' ? checkinNote(b) : '';
+  if (b.service) await owner(lead.id, `BUZZ ${env.BUSINESS_NAME || ''}: ${status.replace('slot held', 'time held')}: ${lead.name || 'Caller (name not given)'}, ${lead.need}, ${b.slotLabel}. tel:${lead.phone}${arrive}`);
+  else await owner(lead.id, `${tag(lead)}BUZZ ${env.BUSINESS_NAME || ''}: ${status}: ${lead.name || 'Caller (name not given)'}, ${lead.need}, ${b.slotLabel}. Tap to call: tel:${lead.phone}${arrive}`);
 }
+// Vendor's signed one-tap "I'm here" link (src/disputes.js), appended to the booking buzz once the booking is confirmed
+// (no deposit: at booking; deposit: in the BOOKED + PAID buzz).
+const checkinNote = (b) => ` Tap when you arrive: ${disputes.checkinLink(BASE, b)}`;
 
 const money = (n) => (Number.isInteger(n) ? String(n) : Number(n).toFixed(2));
 const feeNote = (b) => b.lead_fee_status === 'waived' ? 'lead fee waived (pilot)' : `lead fee $${money(b.lead_fee || 0)}${b.lead_fee_status === 'collected' ? ' (auto-deducted)' : ''}`;
@@ -621,8 +647,8 @@ async function onPaid(id, payment = {}) {
   if (lead.messages) { lead.messages.push({ dir: 'out', body: msg }); store.save(); }
   await sendSms(b.phone, msg);
   if (b.service) { // appointment trades: 'BOOKED + PAID: <name>, <service>, <time>, $50 deposit'
-    await owner(b.leadId, `BOOKED + PAID: ${b.name || 'Caller (name not given)'}, ${b.service}, ${b.slotLabel}, $${money(b.amount)} deposit${b.details ? `. Notes: ${b.details}` : ''}. tel:${b.phone}${refundNote(b)}`);
-  } else await owner(b.leadId, `${tag(lead)}BOOKED + PAID $${b.amount}: ${b.name || 'Caller (name not given)'}, ${b.need}, ${b.slotLabel}, ${feeNote(b)}, tel:${b.phone}${refundNote(b)}`);
+    await owner(b.leadId, `BOOKED + PAID: ${b.name || 'Caller (name not given)'}, ${b.service}, ${b.slotLabel}, $${money(b.amount)} deposit${b.details ? `. Notes: ${b.details}` : ''}. tel:${b.phone}${refundNote(b)}${checkinNote(b)}`);
+  } else await owner(b.leadId, `${tag(lead)}BOOKED + PAID $${b.amount}: ${b.name || 'Caller (name not given)'}, ${b.need}, ${b.slotLabel}, ${feeNote(b)}, tel:${b.phone}${refundNote(b)}${checkinNote(b)}`);
   return b;
 }
 
@@ -889,8 +915,19 @@ app.post('/admin/connect/mock/complete', connectMockOnly, requireAdmin, (req, re
   if (wantsJson(req)) return res.json(connect.summary());
   res.redirect(303, '/admin#connect');
 });
-// ---------- Deposit protection admin (held / scheduled / paused / released / refunded) ----------
-app.get('/admin/deposits', requireAdmin, (req, res) => {
+// ---------- Deposit protection admin (held / scheduled / paused / disputed / released / refunded) ----------
+// ?shop=<vendor id> opens a vendor shop's deposits (no param: the legacy/platform line). Admin-only; the id only picks
+// which store an authenticated admin is looking at.
+const depositShop = (req, res, next) => {
+  const id = String(req.query.shop || '');
+  if (!id) return next();
+  if (!vendors.get(id)) return res.status(404).json({ error: 'shop not found' });
+  return vendors.run(id, () => next(), { suspended: true });
+};
+const shopQs = () => (shopContext.shopId() ? `?shop=${encodeURIComponent(shopContext.shopId())}` : '');
+const backToDeposits = (res) => res.redirect(303, `/admin/deposits${shopQs()}`);
+const flushShop = async () => { if (shopContext.current()) await vendors.flush(shopContext.current().store); };
+app.get('/admin/deposits', requireAdmin, depositShop, (req, res) => {
   if (wantsJson(req)) return res.json(deposits.summary());
   res.type('html').send(adminPages.depositsPage({
     businessName: env.BUSINESS_NAME || 'Your business',
@@ -898,36 +935,143 @@ app.get('/admin/deposits', requireAdmin, (req, res) => {
     connect: connect.summary(),
     demoAllowed: sec.demoAllowed(),
     mode: connect.mode(),
+    shopQs: shopQs(),
+    shops: vendors.all().filter((s) => s.status !== 'provisioning').map((s) => ({ id: s.id, name: s.name })),
+    currentShop: shopContext.shopId(),
   }));
 });
-app.post('/admin/deposits/:id/refund', requireAdmin, async (req, res) => {
+app.post('/admin/deposits/:id/refund', requireAdmin, depositShop, async (req, res) => {
   const d = deposits.find(req.params.id);
   if (!d) return res.status(404).json({ error: 'deposit not found' });
   try {
     const r = await deposits.refundDeposit(d, { reason: 'admin' });
+    await flushShop();
     if (wantsJson(req)) return res.json(r);
-    res.redirect(303, '/admin/deposits');
+    backToDeposits(res);
   } catch (e) { console.error('deposit refund failed:', e.message); return res.status(500).json({ error: 'refund failed' }); }
 });
-app.post('/admin/deposits/:id/release', requireAdmin, async (req, res) => {
+app.post('/admin/deposits/:id/release', requireAdmin, depositShop, async (req, res) => {
   const d = deposits.find(req.params.id);
   if (!d) return res.status(404).json({ error: 'deposit not found' });
   try {
     const r = await deposits.releaseDeposit(d, { force: true });
+    await flushShop();
     if (wantsJson(req)) return res.json(r);
-    res.redirect(303, '/admin/deposits');
+    backToDeposits(res);
   } catch (e) { console.error('deposit release failed:', e.message); return res.status(500).json({ error: 'release failed' }); }
 });
+// Plain-text evidence summary (paste into a Stripe dispute response).
+app.get('/admin/deposits/:id/evidence.txt', requireAdmin, depositShop, (req, res) => {
+  const d = deposits.find(req.params.id);
+  if (!d) return res.status(404).type('text').send('deposit not found');
+  const text = disputes.evidenceText(d, store.findBooking(d.bookingId), { shop: env.BUSINESS_NAME || d.shopName });
+  res.set('Content-Disposition', `attachment; filename="evidence-${d.bookingId.replace(/[^A-Za-z0-9_-]/g, '')}.txt"`).type('text/plain; charset=utf-8').send(text);
+});
+// A photo the vendor uploaded as proof (portal / proof link). Served only to the admin, only for its own deposit.
+app.get('/admin/deposits/:id/photo/:pid', requireAdmin, depositShop, (req, res) => {
+  const d = deposits.find(req.params.id);
+  const p = d && disputes.getPhoto(d, req.params.pid);
+  if (!p) return res.status(404).type('text').send('not found');
+  res.set({ 'Content-Disposition': 'inline', 'Content-Security-Policy': "default-src 'none'; sandbox" }).type(p.type).send(Buffer.from(p.data, 'base64'));
+});
+// Stored "require full prepay" flag for a flagged repeat claimer (platform-wide, by salted phone hash).
+app.post('/admin/deposits/:id/prepay', requireAdmin, depositShop, (req, res) => {
+  const d = deposits.find(req.params.id);
+  if (!d) return res.status(404).json({ error: 'deposit not found' });
+  const f = disputes.setRequirePrepay(d.phone, sec.on(req.body?.on));
+  if (!f) return res.status(409).json({ error: 'customer is not flagged' });
+  if (wantsJson(req)) return res.json({ ok: true, flag: f });
+  backToDeposits(res);
+});
 // Demo/mock only: fast-forward deposit timers (gated to mock + DEMO_MODE / non-production).
-app.post('/admin/deposits/demo/advance', requireAdmin, async (req, res) => {
+app.post('/admin/deposits/demo/advance', requireAdmin, depositShop, async (req, res) => {
   if (connect.mode() !== 'mock' || !sec.demoAllowed()) return res.status(404).json({ error: 'demo advance unavailable' });
   const hours = Number(req.body?.hours ?? req.query?.hours ?? 24);
   try {
     const r = await deposits.mockAdvance(hours, { sendSms: (to, body) => sendSms(to, body) });
+    await flushShop();
     if (wantsJson(req)) return res.json(r);
-    res.redirect(303, '/admin/deposits');
+    backToDeposits(res);
   } catch (e) { return res.status(e.status || 500).json({ error: e.message || 'advance failed' }); }
 });
+
+// ---------- Vendor check-in and proof links (signed, single booking, expiring; src/disputes.js) ----------
+const disputeLinkLimit = formLimit('DISPUTE_LINK_RATE_MAX', 60);
+const linkHeaders = (res, geo = false) => {
+  res.set({ 'Cache-Control': 'private, no-store', 'Referrer-Policy': 'no-referrer', 'X-Robots-Tag': 'noindex' });
+  if (geo) res.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=(self), payment=()');
+};
+// Runs fn inside the token's shop. Returns null when the shop is gone.
+async function inTokenShop(p, fn) {
+  if (!p.s) return shopContext.run(null, fn);
+  if (!vendors.get(p.s)) return null;
+  return vendors.run(p.s, fn, { suspended: true });
+}
+const linkMode = () => (connect.mode() === 'mock' && !sec.demoAllowed() ? 'unconfigured' : connect.mode());
+async function checkinRoute(req, res) {
+  linkHeaders(res, true);
+  const p = disputes.readToken(req.params.token, 'ci');
+  if (!p) return res.status(404).type('html').send(disputePages.checkinPage({ error: 'not_found', mode: 'live' }));
+  const out = await inTokenShop(p, async () => {
+    const b = store.findBooking(p.b);
+    const w = b ? disputes.windowFor(b) : null;
+    const view = { booking: b, shopName: env.BUSINESS_NAME, action: `/v/checkin/${req.params.token}`, windowState: b ? disputes.windowState(b) : 'unknown',
+      opensAt: w && new Date(w.opensAt).toISOString(), closesAt: w && new Date(w.closesAt).toISOString(), mode: linkMode() };
+    if (!b) return { status: 404, html: disputePages.checkinPage({ ...view, error: 'not_found' }) };
+    if (b.vendorCheckIn) return { status: 200, html: disputePages.checkinPage({ ...view, result: { ok: true, already: true, checkIn: b.vendorCheckIn } }) };
+    if (disputes.expired(p)) return { status: 410, html: disputePages.checkinPage({ ...view, error: 'expired' }) };
+    if (req.method === 'GET') {
+      const ws = view.windowState;
+      return { status: 200, html: disputePages.checkinPage(ws === 'open' && disputes.checkable(b) ? view : { ...view, error: !disputes.checkable(b) ? 'not_confirmed' : ws === 'early' ? 'too_early' : ws === 'late' ? 'too_late' : 'no_time' }) };
+    }
+    const r = disputes.checkIn(b, { lat: req.body?.lat, lng: req.body?.lng, accuracy: req.body?.accuracy, ip: sec.clientIp(req), source: 'link' });
+    await flushShop();
+    if (wantsJson(req)) return { json: r, status: r.ok ? 200 : 409 };
+    return { status: r.ok ? 200 : 409, html: disputePages.checkinPage(r.ok ? { ...view, result: r } : { ...view, error: r.reason }) };
+  });
+  if (!out) return res.status(404).type('html').send(disputePages.checkinPage({ error: 'not_found', mode: 'live' }));
+  if (out.json) return res.status(out.status).json(out.json);
+  res.status(out.status).type('html').send(out.html);
+}
+app.get('/v/checkin/:token', disputeLinkLimit, checkinRoute);
+app.post('/v/checkin/:token', disputeLinkLimit, checkinRoute);
+// Applies a vendor proof submission (note + optional photo data URL). Shared by the signed link and the portal.
+function submitProof(d, body, source) {
+  const photo = body && body.photo ? disputes.decodePhoto(String(body.photo)) : null;
+  if (photo && photo.error) return { ok: false, error: photo.error };
+  const r = disputes.addEvidence(d, { source, text: body && body.note, photo });
+  if (!r.ok) return { ok: false, error: r.reason === 'empty' ? 'Add a note or a photo first.' : r.reason === 'photo_limit' ? 'This claim already has the maximum number of photos. Add a note instead.' : r.reason === 'limit' ? 'This claim already has the maximum amount of proof.' : 'This claim is closed.' };
+  return { ok: true, evidence: r.evidence };
+}
+app.locals.submitProof = submitProof;
+async function proofRoute(req, res) {
+  linkHeaders(res);
+  const p = disputes.readToken(req.params.token, 'pf');
+  const notFound = () => res.status(404).type('html').send(disputePages.proofPage({ open: false, error: 'This link is not valid.', mode: 'live' }));
+  if (!p || typeof p.d !== 'string') return notFound();
+  const out = await inTokenShop(p, async () => {
+    const d = deposits.find(p.d);
+    if (!d || d.bookingId !== p.b) return null;
+    const b = store.findBooking(d.bookingId);
+    const view = { deposit: d, booking: b, shopName: env.BUSINESS_NAME || d.shopName, action: `/v/proof/${req.params.token}`, mode: linkMode() };
+    if (disputes.expired(p)) return { status: 410, html: disputePages.proofPage({ ...view, open: false, error: 'This link has expired. Reply to the BuzzCall text instead.' }) };
+    if (req.method === 'GET') return { status: 200, html: disputePages.proofPage({ ...view, open: disputes.isOpen(d) }) };
+    const r = submitProof(d, req.body, 'link');
+    if (r.ok) {
+      await flushShop();
+      const sid = shopContext.shopId();
+      await platformAlert(`BUZZ ${env.BUSINESS_NAME || d.shopName}: vendor sent proof (proof link) for no-show claim on booking ${d.bookingId}. Review: ${BASE}/admin/deposits${sid ? `?shop=${encodeURIComponent(sid)}` : ''}`, 'BuzzCall: vendor sent no-show proof');
+    }
+    if (wantsJson(req)) return { json: r, status: r.ok ? 200 : 400 };
+    return { status: r.ok ? 200 : 400, html: disputePages.proofPage({ ...view, open: disputes.isOpen(d), message: r.ok ? 'Thanks, your proof was added. BuzzCall will review it.' : '', error: r.ok ? '' : r.error }) };
+  });
+  if (!out) return notFound();
+  if (out.json) return res.status(out.status).json(out.json);
+  res.status(out.status).type('html').send(out.html);
+}
+app.get('/v/proof/:token', disputeLinkLimit, proofRoute);
+app.post('/v/proof/:token', disputeLinkLimit, proofRoute);
+app.locals.platformAlert = (msg, subject) => platformAlert(msg, subject);
 
 // Authenticated, server-rendered workspace. Only explicitly selected non-secret values reach templates.
 app.get('/admin/legacy', requireAdmin, (req, res) => {
