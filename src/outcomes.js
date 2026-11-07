@@ -21,9 +21,13 @@ const store = require('./store');
 const shopContext = require('./shopContext');
 const sec = require('./security');
 
-const STAGES = ['missed', 'no_consent', 'consented', 'conversed', 'slot_offered', 'booked', 'deposit_paid', 'no_show_reported', 'refunded', 'opted_out'];
+const STAGES = ['missed', 'no_consent', 'consented', 'conversed', 'slot_offered', 'booked', 'deposit_paid', 'vendor_checked_in', 'no_show_reported', 'disputed',
+  'dispute_resolved_vendor', 'dispute_resolved_customer', 'refunded', 'opted_out'];
 // Forward-only progression. no_consent and consented are alternatives at the same rank; opted_out always wins.
-const RANK = { missed: 0, no_consent: 1, consented: 1, conversed: 2, slot_offered: 3, booked: 4, deposit_paid: 5, no_show_reported: 6, refunded: 7, opted_out: 99 };
+// No-show disputes (src/disputes.js): vendor_checked_in -> no_show_reported -> disputed (vendor checked in or sent
+// proof) -> dispute_resolved_vendor | dispute_resolved_customer (same rank: the first resolution sticks) -> refunded.
+const RANK = { missed: 0, no_consent: 1, consented: 1, conversed: 2, slot_offered: 3, booked: 4, deposit_paid: 5, vendor_checked_in: 6, no_show_reported: 7,
+  disputed: 8, dispute_resolved_vendor: 9, dispute_resolved_customer: 9, refunded: 10, opted_out: 99 };
 const DEFAULT_MAX = 10000;
 const PHONE_LINK_DAYS = 7; // an SMS reply is tied to that caller's latest call record within this many days
 const EMAIL_ASK = 'Want a confirmation by email? Reply with your email or SKIP.';
@@ -211,6 +215,39 @@ const refunded = safe('refunded', (depositOrBooking) => {
   store.save();
   return r;
 });
+const forDeposit = (depositOrBooking) => {
+  const bookingId = depositOrBooking && (depositOrBooking.bookingId || depositOrBooking.id);
+  const phone = depositOrBooking && depositOrBooking.phone;
+  return (bookingId && Object.values(table()).find((x) => x && x.booking_id === bookingId)) || latestForPhone(phone);
+};
+// 8) Vendor tapped "I'm here" for the booking.
+const vendorCheckedIn = safe('vendorCheckedIn', (b) => {
+  const r = forDeposit(b);
+  if (!r) return null;
+  r.vendor_checked_in_at = r.vendor_checked_in_at || new Date().toISOString();
+  setStage(r, 'vendor_checked_in');
+  store.save();
+  return r;
+});
+// 9) The vendor contested a no-show claim (checked in, or sent proof).
+const disputed = safe('disputed', (d) => {
+  const r = forDeposit(d);
+  if (!r) return null;
+  r.disputed_at = r.disputed_at || new Date().toISOString();
+  setStage(r, 'disputed');
+  store.save();
+  return r;
+});
+// 10) Dispute resolved: 'vendor' (payout released) or 'customer' (refunded).
+const disputeResolved = safe('disputeResolved', (d, side) => {
+  const r = forDeposit(d);
+  if (!r || !['vendor', 'customer'].includes(side)) return null;
+  r.dispute_resolution = r.dispute_resolution || side;
+  r.dispute_resolved_at = r.dispute_resolved_at || new Date().toISOString();
+  setStage(r, side === 'vendor' ? 'dispute_resolved_vendor' : 'dispute_resolved_customer');
+  store.save();
+  return r;
+});
 // Instant owner buzz sent for this call (missedBuzz). The owner's own reply is not observable by BuzzCall today, so
 // owner_response_ms stays null; owner_buzz_latency_ms = missed call -> owner buzzed.
 const ownerBuzzed = safe('ownerBuzzed', (callSid, outcome) => {
@@ -284,11 +321,12 @@ const verify = safe('verify', (token) => {
 // ---------- exports (admin) ----------
 const COLUMNS = ['call_sid', 'shop_id', 'shop_slug', 'created_at', 'hour_of_day', 'weekday', 'time_zone', 'caller_phone', 'phone_verified', 'verification_method', 'verified_at',
   'consent_digits', 'textback_sent', 'service', 'urgency', 'urgency_keyword', 'callback_time', 'slots_offered', 'booking_id', 'deposit_amount', 'result_stage',
-  'owner_buzzed_at', 'owner_buzz_outcome', 'owner_buzz_latency_ms', 'owner_response_ms', 'email', 'email_unverified', 'email_verified', 'email_verified_at', 'training_excluded', 'updated_at'];
+  'owner_buzzed_at', 'owner_buzz_outcome', 'owner_buzz_latency_ms', 'owner_response_ms', 'email', 'email_unverified', 'email_verified', 'email_verified_at', 'training_excluded',
+  'vendor_checked_in_at', 'disputed_at', 'dispute_resolution', 'dispute_resolved_at', 'updated_at'];
 // No phone, email, name or CallSid: the caller and the call are salted hashes; free text was scrubbed at capture.
 const TRAINING_COLUMNS = ['outcome_id', 'caller_hash', 'shop_id', 'shop_slug', 'created_date', 'hour_of_day', 'weekday', 'phone_verified', 'verification_method',
   'service', 'urgency', 'callback_time', 'slots_offered', 'deposit_amount', 'result_stage', 'reached_consented', 'reached_booked', 'reached_deposit_paid',
-  'owner_buzz_latency_ms', 'email_provided', 'email_verified'];
+  'owner_buzz_latency_ms', 'email_provided', 'email_verified', 'reached_vendor_checked_in', 'reached_disputed', 'dispute_resolution'];
 function cell(v) {
   if (v === null || v === undefined) return '';
   let s = typeof v === 'object' ? JSON.stringify(v) : String(v);
@@ -313,6 +351,7 @@ function trainingRow(r, salt) {
     service: r.service_deid, urgency: r.urgency, callback_time: r.callback_time_deid, slots_offered: r.slots_offered, deposit_amount: r.deposit_amount,
     result_stage: r.result_stage, reached_consented: !!st.consented, reached_booked: !!st.booked, reached_deposit_paid: !!st.deposit_paid,
     owner_buzz_latency_ms: r.owner_buzz_latency_ms, email_provided: !!(r.email || r.email_unverified), email_verified: !!r.email_verified,
+    reached_vendor_checked_in: !!st.vendor_checked_in, reached_disputed: !!st.disputed, dispute_resolution: r.dispute_resolution || null,
   };
 }
 const sortNewest = (rows) => rows.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
@@ -331,5 +370,5 @@ function counts(rows) {
 const reset = () => { hooks.beforeWrite = null; };
 
 module.exports = { STAGES, RANK, EMAIL_ASK, DEFAULT_MAX, hooks, safe, maxRecords, emailStepOn, urgencyOf, scrub, setStage, prune, get, latestForPhone,
-  missed, consent, conversation, booked, paid, noShowReported, refunded, ownerBuzzed, askEmail, emailReply, lookupToken, verify, validEmail,
+  missed, consent, conversation, booked, paid, noShowReported, refunded, vendorCheckedIn, disputed, disputeResolved, ownerBuzzed, askEmail, emailReply, lookupToken, verify, validEmail,
   COLUMNS, TRAINING_COLUMNS, toCsv, cell, hashSalt, saltedHash, trainingRow, recordsOf, fullCsv, trainingCsv, counts, reset };
