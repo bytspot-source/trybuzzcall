@@ -29,15 +29,15 @@ const { app } = require('../src/server');
 
 const TEST_KEY = 'sk_test_' + 'fake'.repeat(6); // never a real key; the fake client below is used
 function fakeStripe(acct = {}) {
-  const calls = { create: [], retrieve: [], links: [], sessions: [] };
+  const calls = { create: [], options: [], retrieve: [], links: [], sessions: [] };
   const account = { id: 'acct_test_shop1', charges_enabled: false, details_submitted: false, payouts_enabled: false,
     requirements: { currently_due: ['external_account'], disabled_reason: 'requirements.past_due' }, ...acct };
   const client = {
     calls, account,
-    accounts: {
-      create: async (p) => { calls.create.push(p); return { ...account }; },
+    v2: { core: { accounts: {
+      create: async (p, o) => { calls.create.push(p); calls.options.push(o); return { ...account }; },
       retrieve: async (id) => { calls.retrieve.push(id); return { ...account, id }; },
-    },
+    } } },
     accountLinks: { create: async (p) => { calls.links.push(p); return { url: 'https://connect.stripe.com/setup/s/test_link' }; } },
     checkout: { sessions: { create: async (p, o) => { calls.sessions.push({ p, o }); return { id: 'cs_test_1', url: 'https://checkout.stripe.com/c/pay/cs_test_1' }; } } },
   };
@@ -218,10 +218,16 @@ test('live/test onboarding: creates an Express account once, then an Account Lin
   assert.equal(r1.headers.get('location'), 'https://connect.stripe.com/setup/s/test_link');
   assert.equal(f.calls.create.length, 1);
   const p = f.calls.create[0];
-  assert.equal(p.type, 'express');
-  assert.ok(p.capabilities.transfers.requested);
-  assert.equal(p.business_profile.name, 'Test Plumbing');
-  assert.equal(p.business_profile.url, 'https://shop.example');
+  assert.equal(p.type, undefined);
+  assert.equal(p.dashboard, 'express');
+  assert.equal(p.identity.country, 'US');
+  assert.equal(p.defaults.responsibilities.losses_collector, 'stripe');
+  assert.equal(p.defaults.responsibilities.fees_collector, 'stripe');
+  assert.equal(p.configuration.merchant.capabilities.card_payments.requested, true);
+  assert.equal(p.configuration.recipient, undefined);
+  assert.equal(p.display_name, 'Test Plumbing');
+  assert.equal(p.defaults.profile.business_url, 'https://shop.example');
+  assert.equal(f.calls.options[0].apiVersion, '2026-10-28.preview');
   assert.deepEqual(f.calls.links[0], { account: 'acct_test_shop1', type: 'account_onboarding',
     refresh_url: 'https://shop.example/admin/connect/refresh', return_url: 'https://shop.example/admin/connect/return' });
   assert.equal(store.getOverride().stripeConnect.accountId, 'acct_test_shop1');
@@ -377,6 +383,39 @@ test('connect webhook: unpaid (async) session does not mark paid; booking tied t
   assert.equal(store.findBooking(b.id).paid, false);
 });
 
+test('connect webhook: v2 thin account event reloads capabilities', async (t) => {
+  reset(t, { STRIPE_SECRET_KEY: TEST_KEY, STRIPE_CONNECT_WEBHOOK_SECRET: SECRET });
+  quiet(t);
+  store.setOverride({ stripeConnect: { accountId: 'acct_ready', mode: 'test', chargesEnabled: false, source: 'onboarding' } });
+  const f = fakeStripe();
+  f.v2.core.accounts.retrieve = async (id) => {
+    f.calls.retrieve.push(id);
+    return {
+    id, object: 'v2.core.account', dashboard: 'express',
+    configuration: {
+      merchant: { capabilities: {
+        card_payments: { status: 'active', status_details: [] },
+        stripe_balance: { payouts: { status: 'active', status_details: [] } },
+      } },
+    },
+    requirements: { entries: [], summary: { minimum_deadline: null } },
+    defaults: { responsibilities: { fees_collector: 'stripe', losses_collector: 'stripe' } },
+  }; };
+  connect.setStripe(f);
+  const thin = {
+    id: 'evt_thin_acct', object: 'v2.core.event', type: 'v2.core.account[configuration.merchant].capability_status_updated',
+    livemode: false, related_object: { id: 'acct_ready', type: 'v2.core.account', url: '/v2/core/accounts/acct_ready' },
+  };
+  const r = await req('/stripe/connect/webhook', { method: 'POST', ...signed(thin, SECRET) });
+  assert.equal(r.status, 200);
+  assert.equal((await r.json()).received, true);
+  assert.equal(connect.status(), 'charges_enabled');
+  assert.equal(connect.summary().payoutsEnabled, true);
+  assert.equal(connect.summary().lossesCollector, 'stripe');
+  assert.equal(connect.chargeAccount(), null);
+  assert.deepEqual(f.calls.retrieve, ['acct_ready']);
+});
+
 test('connect webhook: account.updated sets status; deauthorized turns deposits off', async (t) => {
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY, STRIPE_CONNECT_WEBHOOK_SECRET: SECRET });
   quiet(t);
@@ -410,6 +449,68 @@ test('/health reports connect readiness without exposing anything secret', async
   const h = await (await req('/health')).json();
   assert.equal(h.connect, true); assert.equal(h.connectStatus, 'charges_enabled');
   assert.ok(!JSON.stringify(h).includes(TEST_KEY));
+});
+
+test('admin and vendor onboarding return the Stripe error instead of a generic 500', async (t) => {
+  reset(t, { STRIPE_SECRET_KEY: TEST_KEY });
+  quiet(t);
+  const secretKey = process.env.STRIPE_SECRET_KEY;
+  const stripeMessage = 'You tried to create an Accounts v1 connected account using the legacy type field with your platform as the losses collector.';
+  const f = fakeStripe();
+  f.v2.core.accounts.create = async () => {
+    const err = new Error(stripeMessage + ' sk_test_should_not_leak');
+    err.statusCode = 400;
+    err.code = 'account_invalid';
+    err.requestId = 'req_test_onboard';
+    throw err;
+  };
+  connect.setStripe(f);
+  const logs = [];
+  const orig = console.error;
+  console.error = (...args) => logs.push(args.map((part) => String(part)).join(' '));
+  t.after(() => { console.error = orig; });
+  const admin = await req('/admin/connect/onboard', { method: 'POST', headers: { ...auth, origin: BASE, accept: 'application/json' } });
+  assert.equal(admin.status, 400);
+  const adminBody = await admin.json();
+  assert.match(adminBody.error, /could not start payout onboarding/i);
+  assert.match(adminBody.error, /account_invalid/);
+  assert.match(adminBody.error, /legacy type field/);
+  assert.doesNotMatch(adminBody.error, /sk_test_/);
+  const vendors = require('../src/vendors');
+  const password = 'correct-horse-battery';
+  const created = await vendors.create({ name: 'Onboard Error Shop', email: 'connect-err@example.com' });
+  t.after(() => {
+    const dir = store.root.db.vendorDirectory;
+    if (!dir) return;
+    dir.shops = (dir.shops || []).filter((shop) => shop.email !== 'connect-err@example.com');
+    dir.sessions = (dir.sessions || []).filter((session) => session.shopId !== created.shop.id);
+  });
+  await vendors.activate(created.token, password, password);
+  const logged = await vendors.login('connect-err@example.com', password);
+  // Node fetch will not send a Host header, and vendor POSTs must match both PUBLIC_BASE_URL and the request host.
+  const vendor = await new Promise((resolve, reject) => {
+    const url = new URL(BASE + '/vendor/connect/onboard');
+    const http = require('http');
+    const request = http.request({
+      hostname: url.hostname, port: url.port, path: url.pathname, method: 'POST',
+      headers: { cookie: `buzzcall_vendor=${logged.token}`, accept: 'application/json', host: 'shop.example', origin: 'https://shop.example' },
+    }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => resolve({ status: response.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    request.on('error', reject);
+    request.end();
+  });
+  assert.equal(vendor.status, 400);
+  const vendorBody = JSON.parse(vendor.body);
+  assert.match(vendorBody.error, /could not start payout onboarding/i);
+  assert.doesNotMatch(vendorBody.error, /temporarily unavailable/i);
+  assert.doesNotMatch(vendorBody.error, /sk_test_/);
+  const loggedText = logs.join('\n');
+  assert.equal(loggedText.includes(secretKey), false);
+  assert.equal(loggedText.includes('sk_test_'), false);
+  assert.match(loggedText, /req_test_onboard/);
 });
 
 test('legal pages: deposits collected by BuzzCall, Stripe Connected Account Agreement linked; no draft banners', () => {

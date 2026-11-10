@@ -52,8 +52,7 @@ app.post('/stripe/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   let event;
   try {
     if (process.env.STRIPE_WEBHOOK_SECRET) {
-      const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY || 'sk_unused');
-      event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'] || '', process.env.STRIPE_WEBHOOK_SECRET);
+      event = connect.constructEvent(req.body, req.headers['stripe-signature'] || '', process.env.STRIPE_WEBHOOK_SECRET);
     } else if (unsignedStripeOk()) event = JSON.parse(req.body.toString('utf8')); // dev/mock only
     else return res.status(503).send('Webhook not configured');
   } catch (e) { console.error('stripe webhook rejected:', e.message); return res.status(400).send('Webhook error'); }
@@ -95,7 +94,7 @@ app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, re
   let event;
   try {
     const secret = process.env.STRIPE_CONNECT_WEBHOOK_SECRET;
-    if (secret) event = require('stripe').webhooks.constructEvent(req.body, req.headers['stripe-signature'] || '', secret);
+    if (secret) event = connect.constructEvent(req.body, req.headers['stripe-signature'] || '', secret);
     else if (connect.mode() === 'mock' && sec.demoAllowed()) event = JSON.parse(req.body.toString('utf8')); // dev/mock only
     else return res.status(503).send('Connect webhook not configured');
   } catch (e) { console.error('connect webhook rejected:', e.message); return res.status(400).send('Webhook error'); }
@@ -104,7 +103,8 @@ app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, re
   if (!destination) return ignore('unassigned or conflicting shop');
   const handle = async () => {
   const acct = connect.accountId();
-  if (!event || !event.account || !acct || event.account !== acct) return ignore('account mismatch');
+  const eventAcct = connect.eventAccountId(event);
+  if (!event || !eventAcct || !acct || eventAcct !== acct) return ignore('account mismatch');
   if (!connect.livemodeOk(event)) return ignore('livemode mismatch');
   const o = event.data?.object || {};
   try {
@@ -131,7 +131,12 @@ app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, re
         connect.deauthorize();
         await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: Stripe was disconnected from BuzzCall. Vendor payouts are paused until you reconnect Stripe. Customer deposits still work on the platform.`);
         break;
-      default: return ignore('unhandled type');
+      default:
+        if (connect.isV2AccountEvent(event.type)) {
+          try { await deposits.handleWebhookEvent(event); } catch (e) { console.error('deposits v2 account event:', e.message); }
+          break;
+        }
+        return ignore('unhandled type');
     }
   } catch (e) { console.error('connect webhook error:', e.message); return res.status(500).send('connect handler error'); }
   if (shopContext.current()) await vendors.flush(shopContext.current().store);
@@ -895,7 +900,13 @@ async function startOnboarding(req, res) {
     const r = await connect.onboard(BASE, connectPrefill());
     if (wantsJson(req)) return res.json({ ok: true, url: r.url, accountId: r.accountId, created: r.created });
     res.redirect(303, r.url);
-  } catch (e) { console.error('connect onboarding failed:', e.message); res.status(502).type('text').send('Could not start Stripe onboarding. Check the server logs and try again.'); }
+  } catch (e) {
+    const status = e.status >= 400 && e.status <= 599 ? e.status : 502;
+    const message = e.expose ? e.message : 'Could not start Stripe onboarding. Check the server logs and try again.';
+    console.error('connect onboarding failed:', message);
+    if (wantsJson(req)) return res.status(status).json({ error: message });
+    res.status(status).type('text').send(message);
+  }
 }
 app.post('/admin/connect/onboard', requireAdmin, startOnboarding);
 // Stripe sends the owner here when an onboarding link expired. GET must not create anything: with an existing account

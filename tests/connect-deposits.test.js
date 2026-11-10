@@ -31,17 +31,17 @@ const shopTime = require('../src/shopTime');
 const TEST_KEY = 'sk_test_' + 'fake'.repeat(6);
 
 function fakeStripe(acct = {}) {
-  const calls = { create: [], retrieve: [], links: [], sessions: [], transfers: [], reversals: [], refunds: [] };
+  const calls = { create: [], options: [], retrieve: [], links: [], sessions: [], transfers: [], reversals: [], refunds: [] };
   const account = {
-    id: 'acct_express_1', type: 'express', charges_enabled: false, details_submitted: false, payouts_enabled: false,
+    id: 'acct_express_1', charges_enabled: false, details_submitted: false, payouts_enabled: false,
     requirements: { currently_due: ['external_account'], disabled_reason: 'requirements.past_due' }, ...acct,
   };
   const client = {
     calls, account,
-    accounts: {
-      create: async (p) => { calls.create.push(p); return { ...account, id: account.id }; },
+    v2: { core: { accounts: {
+      create: async (p, o) => { calls.create.push(p); calls.options.push(o); return { ...account, id: account.id }; },
       retrieve: async (id) => { calls.retrieve.push(id); return { ...account, id }; },
-    },
+    } } },
     accountLinks: { create: async (p) => { calls.links.push(p); return { url: 'https://connect.stripe.com/setup/e/test' }; } },
     checkout: {
       sessions: {
@@ -108,8 +108,12 @@ test('onboarding link creation (mocked Stripe): Express account + account link w
   const r = await connect.onboard('https://shop.example', { name: 'Test Plumbing', url: 'https://shop.example' });
   assert.equal(r.url, 'https://connect.stripe.com/setup/e/test');
   assert.equal(f.calls.create.length, 1);
-  assert.equal(f.calls.create[0].type, 'express');
-  assert.ok(f.calls.create[0].capabilities.transfers.requested);
+  assert.equal(f.calls.create[0].type, undefined);
+  assert.equal(f.calls.create[0].dashboard, 'express');
+  assert.equal(f.calls.create[0].defaults.responsibilities.losses_collector, 'stripe');
+  assert.equal(f.calls.create[0].configuration.merchant.capabilities.card_payments.requested, true);
+  assert.equal(f.calls.create[0].configuration.recipient, undefined);
+  assert.equal(f.calls.options[0].apiVersion, '2026-10-28.preview');
   assert.deepEqual(f.calls.links[0], {
     account: 'acct_express_1', type: 'account_onboarding',
     refresh_url: 'https://shop.example/admin/connect/refresh',
@@ -120,6 +124,36 @@ test('onboarding link creation (mocked Stripe): Express account + account link w
   await connect.onboard('https://shop.example');
   assert.equal(f.calls.create.length, 1);
   assert.equal(f.calls.links.length, 2);
+});
+
+test('v2 capability status: card_payments does not unlock separate-charge transfers', async (t) => {
+  reset(t, { STRIPE_SECRET_KEY: TEST_KEY });
+  const f = fakeStripe();
+  const account = {
+    id: 'acct_express_1', object: 'v2.core.account', dashboard: 'express',
+    configuration: { merchant: { capabilities: {
+      card_payments: { status: 'active', status_details: [] },
+      stripe_balance: { payouts: { status: 'active', status_details: [] } },
+    } } },
+    requirements: { entries: [{ description: 'individual.id_number', awaiting_action_from: 'user', minimum_deadline: { status: 'currently_due' } }],
+      summary: { minimum_deadline: { status: 'currently_due' } } },
+    defaults: { responsibilities: { fees_collector: 'stripe', losses_collector: 'stripe' } },
+  };
+  f.v2.core.accounts.retrieve = async (id) => ({ ...account, id });
+  connect.setStripe(f);
+  store.setOverride({ stripeConnect: { accountId: 'acct_express_1', mode: 'test', source: 'onboarding', chargesEnabled: false } });
+  await connect.refresh();
+  assert.equal(connect.summary().chargesEnabled, true);
+  assert.equal(connect.summary().payoutsEnabled, true);
+  assert.equal(connect.summary().detailsSubmitted, false);
+  assert.deepEqual(connect.summary().requirementsDue, ['individual.id_number']);
+  assert.equal(connect.summary().transfersEnabled, false);
+  assert.equal(connect.chargeAccount(), null);
+  account.requirements = { entries: [], summary: { minimum_deadline: null } };
+  account.configuration.recipient = { capabilities: { stripe_balance: { stripe_transfers: { status: 'active', status_details: [] } } } };
+  await connect.refresh();
+  assert.equal(connect.summary().detailsSubmitted, true);
+  assert.equal(connect.chargeAccount(), 'acct_express_1');
 });
 
 test('holding at booking: platform Checkout (no stripeAccount); deposit row scheduled', async (t) => {

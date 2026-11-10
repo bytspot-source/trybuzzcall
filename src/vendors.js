@@ -260,8 +260,10 @@ async function stripeShop(event, connected = false) {
     return booking && !booking.connectAccount && booking.stripeSessionId === object.id ? {legacy:true} : null;
   }
   let matches;
-  if (connected) {
-    matches = list.filter(c => (c.store.getOverride().stripeConnect?.accountId || (c.id === 'legacy' ? process.env.STRIPE_CONNECT_ACCOUNT_ID : null)) === event.account && !!event.account);
+  const related = event.related_object;
+  const account = event.account || (related && related.id && (related.type === 'v2.core.account' || String(related.id).startsWith('acct_')) ? related.id : null);
+  if (connected || /^v2\.core\.account(?:\.|\[)/.test(event.type || '')) {
+    matches = list.filter(c => (c.store.getOverride().stripeConnect?.accountId || (c.id === 'legacy' ? process.env.STRIPE_CONNECT_ACCOUNT_ID : null)) === account && !!account);
   } else {
     const subscription = typeof object.subscription === 'string' ? object.subscription : object.subscription?.id;
     const customer = typeof object.customer === 'string' ? object.customer : object.customer?.id;

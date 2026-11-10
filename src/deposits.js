@@ -415,6 +415,21 @@ async function mockAdvance(hours, { sendSms } = {}) {
   return { now: iso(), offsetMs: bucket().depositsMeta.offsetMs, ...result };
 }
 
+function attachReadyAccount() {
+  const ready = connect.chargeAccount();
+  if (!ready) return true;
+  let changed = false;
+  for (const d of bucket().deposits) {
+    if (d.payoutPendingConnect && !d.connectAccountId && ['held', 'scheduled', 'paused', 'disputed'].includes(d.status)) {
+      d.connectAccountId = ready;
+      d.payoutPendingConnect = false;
+      d.updatedAt = iso();
+      changed = true;
+    }
+  }
+  if (changed) store.save();
+  return true;
+}
 async function handleWebhookEvent(event) {
   if (!event || !event.type) return false;
   const o = event.data?.object || {};
@@ -452,19 +467,14 @@ async function handleWebhookEvent(event) {
     }
     case 'account.updated':
       connect.applyAccount(o);
-      // If payouts were pending connect, attach account id for future releases.
-      if (o && o.id && o.charges_enabled) {
-        for (const d of bucket().deposits) {
-          if (d.payoutPendingConnect && !d.connectAccountId && ['held', 'scheduled', 'paused', 'disputed'].includes(d.status)) {
-            d.connectAccountId = o.id;
-            d.payoutPendingConnect = false;
-            d.updatedAt = iso();
-          }
-        }
-        store.save();
-      }
-      return true;
+      return attachReadyAccount();
     default:
+      if (connect.isV2AccountEvent(event.type)) {
+        // Thin events carry the account id, not its capabilities. Fetch the current v2 account.
+        if (!(o && o.id && (o.object === 'v2.core.account' || o.configuration))) await connect.refresh();
+        else connect.applyAccount(o);
+        return attachReadyAccount();
+      }
       return false;
   }
 }

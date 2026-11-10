@@ -99,7 +99,8 @@ function register(app, { requireAdmin, BASE, sameOrigin }) {
     try { await fn(req,res,next); }
     catch (e) {
       const status = e.status >= 400 && e.status <= 599 ? e.status : 500;
-      const message = status >= 500 ? 'The workspace is temporarily unavailable. Please try again later.' : e.message;
+      // Connect onboarding sets expose so a Stripe 4xx/5xx is shown. Other 5xx stay generic.
+      const message = e.expose || status < 500 ? e.message : 'The workspace is temporarily unavailable. Please try again later.';
       if (res.headersSent) return next(e);
       return json(req) ? res.status(status).json({ error: message }) : res.status(status).type('html').send(pages.message({ title: 'Unable to complete this request', message, status }));
     }
