@@ -286,6 +286,7 @@ async function sync(shopId, base) {
     save();
     return rec.a2p;
   }
+  require('./onboardingStore').expireEin(reg);
   if (!rec.a2p.brandSid && spec.flow !== 'sole_proprietor' && digits(reg.ein).length !== 9) {
     rec.a2p.reason = 'This business type needs a 9-digit EIN before it can be submitted.';
     save();

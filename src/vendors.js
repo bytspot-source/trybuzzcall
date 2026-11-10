@@ -135,7 +135,7 @@ async function activate(token, password, passwordConfirm) {
   shop.account.passwordHash = encoded; delete shop.account.invite;
   shop.account.version++; await persist(); return publicShop(shop);
 }
-async function login(email, password) {
+async function login(email, password, meta = {}) {
   healthy();
   email = typeof email === 'string' ? email.trim().toLowerCase() : '';
   if (typeof password !== 'string' || password.length > 128 || !validEmail(email)) throw error('Email or password is incorrect.', 401);
@@ -152,7 +152,19 @@ async function login(email, password) {
     directory().sessions = directory().sessions.filter(s => s !== oldest);
   }
   const token = crypto.randomBytes(32).toString('base64url');
-  directory().sessions.push({ hash: digest(token), shopId: shop.id, version: shop.account.version, expiresAt: now + SESSION_MS });
+  const device = crypto.createHash('sha256').update(`${meta.ip || ''}|${String(meta.ua || '').slice(0, 200)}`).digest('hex').slice(0, 20);
+  shop.knownDevices = Array.isArray(shop.knownDevices) ? shop.knownDevices : [];
+  const known = shop.knownDevices.includes(device);
+  if (!known) {
+    shop.knownDevices = [...shop.knownDevices, device].slice(-20);
+    if (shop.knownDevices.length > 1) {
+      try {
+        require('./email').ownerNotice(shop.email, 'New sign-in to your BuzzCall shop',
+          `A new device signed in to ${shop.name || 'your shop'} at ${new Date(now).toISOString()} from ${meta.ip || 'an unknown network'}. If this was not you, reset your password.`);
+      } catch { /* email is best-effort */ }
+    }
+  }
+  directory().sessions.push({ hash: digest(token), shopId: shop.id, version: shop.account.version, expiresAt: now + SESSION_MS, device });
   await persist(); return { token, shop: publicShop(shop) };
 }
 const COOKIE = 'buzzcall_vendor';
@@ -246,18 +258,34 @@ async function candidates() {
   for (const shop of all().filter(s => s.status !== 'provisioning')) out.push({ id: shop.id, shop, store: await scopedStore(shop) });
   return out;
 }
+const MONEY_EVENTS = new Set(['charge.refunded', 'charge.refund.updated', 'charge.dispute.created', 'charge.dispute.closed', 'radar.early_fraud_warning.created']);
 async function stripeShop(event, connected = false) {
-  if (!all().length) return { legacy: true };
+  if (!all().length && event?.type !== 'payout.failed') return { legacy: true };
   const object = event.data?.object || {};
   const tags = [object.metadata?.shopId, object.subscription_details?.metadata?.shopId, object.parent?.subscription_details?.metadata?.shopId].filter(Boolean);
   if (new Set(tags).size > 1) return null;
   const tagged = tags[0];
+  if (!connected && event.type === 'payout.failed') return { legacy: true };
+  if (!connected && MONEY_EVENTS.has(event.type)) {
+    const hit = require('./deposits').lookupPayment(object);
+    if (!hit) return null;
+    if (hit.shopId && hit.shopId !== 'legacy') {
+      const shop = get(hit.shopId);
+      return shop ? { shop } : null;
+    }
+    return { legacy: true };
+  }
   const list = await candidates();
   if (!connected && ['checkout.session.completed','checkout.session.async_payment_succeeded'].includes(event.type) && object.mode === 'payment') {
+    if (object.metadata?.bookingId && object.client_reference_id && object.metadata.bookingId !== object.client_reference_id) return null;
+    if (tagged) {
+      const shop = get(tagged);
+      if (!shop || shop.status === 'provisioning') return null;
+      return { shop };
+    }
     const id = object.metadata?.bookingId || object.client_reference_id;
     const booking = id && root.findBooking(id);
-    if (tagged || object.metadata?.bookingId && object.client_reference_id && object.metadata.bookingId !== object.client_reference_id) return null;
-    return booking && !booking.connectAccount && booking.stripeSessionId === object.id ? {legacy:true} : null;
+    return booking && booking.stripeSessionId === object.id ? { legacy: true } : null;
   }
   let matches;
   if (connected) {

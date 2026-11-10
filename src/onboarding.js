@@ -13,6 +13,7 @@ const a2p = require('./a2p');
 const {
   CODE_TTL_MS, MAX_ATTEMPTS, GRANT_MS, enabled, provisionEnabled, a2pEnabled,
   peek, data, save, redact, publicRegistration, shopRecord, takeHeld, namesMismatch, limiters,
+  protectEin, spendApprovalRequired,
 } = storeApi;
 
 const hash = (value) => crypto.createHash('sha256').update(String(value)).digest('hex');
@@ -27,6 +28,8 @@ function sendAllowed(phone, ip) {
 }
 async function sendCode({ setupId, phone, ip, businessName }) {
   if (!sec.isNanp(phone)) return fail('Use a US or Canada mobile number.', 422);
+  const line = await require('./lookup').lineType(phone);
+  if (!line.ok) return fail(line.error || 'Use a mobile number.', 422);
   if (!sendAllowed(phone, ip || 'unknown')) return fail('Too many codes were sent. Try again later.', 429);
   const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
   data().verifications[setupId] = {
@@ -35,7 +38,7 @@ async function sendCode({ setupId, phone, ip, businessName }) {
   save();
   const name = String(businessName || 'Your shop').replace(/[\u0000-\u001F\u007F]/g, '').trim().slice(0, 80) || 'Your shop';
   const sms = require('./sms');
-  const sent = await sms.sendSms(phone, `${name}: Your BuzzCall code is ${code}. It expires in 10 minutes. Reply STOP to opt out.`, { kind: 'owner' });
+  const sent = await sms.sendSms(phone, `${name}: Your BuzzCall code is ${code}. It expires in 10 minutes. Reply STOP to opt out.`, { kind: 'otp' });
   if (!sent.ok && !sent.logOnly) return fail('We could not text that code. Try again in a few minutes.', 502);
   return { ok: true };
 }
@@ -159,6 +162,14 @@ async function advance(shopId, base) {
     save();
     return rec;
   }
+  if (spendApprovalRequired() && !rec.spendApproved) {
+    if (!rec.number?.phone && rec.number?.status !== 'manual') rec.number = { ...(rec.number || {}), status: 'pending_admin' };
+    if (!rec.a2p?.brandSid && rec.a2p && !['approved', 'rejected', 'manual'].includes(rec.a2p.status)) rec.a2p.status = 'pending_admin';
+    rec.spendBlocked = true;
+    save();
+    return rec;
+  }
+  rec.spendBlocked = false;
   const before = rec.a2p?.status;
   if (!rec.number?.phone && rec.number?.status !== 'manual') {
     try { await provision.ensureNumber(shopId, base); } catch (e) { console.error('[onboarding] number:', redact(e && e.message)); }
@@ -224,7 +235,7 @@ async function saveRegistration(shopId, body, base) {
   if (rec.a2p?.brandSid) return fail('Registration was already submitted. It updates when the carrier finishes review.', 409);
   const parsed = registrationFrom(body, rec.registration);
   if (!parsed.ok) return parsed;
-  rec.registration = parsed.registration;
+  rec.registration = protectEin(parsed.registration);
   rec.a2p.flow = require('./a2p').entitySpec(parsed.registration.entity).flow;
   rec.flags = (rec.flags || []).filter((flag) => flag !== 'needs_business_type');
   const shop = vendors.get(shopId);
@@ -247,7 +258,7 @@ async function setEntity(shopId, body, base) {
     entity: body?.entity, ein: body?.ein || '',
   }, src);
   if (!parsed.ok) return parsed;
-  rec.registration = parsed.registration;
+  rec.registration = protectEin(parsed.registration);
   rec.a2p ||= { status: 'not_started' };
   rec.a2p.flow = require('./a2p').entitySpec(parsed.registration.entity).flow;
   rec.flags = (rec.flags || []).filter((flag) => flag !== 'needs_business_type');
@@ -366,6 +377,17 @@ function startPoller() {
   pollTimer.unref?.();
 }
 
+async function approveSpend(shopId, base) {
+  const rec = shopRecord(shopId);
+  if (!rec) return fail('Shop not found', 404);
+  rec.spendApproved = true;
+  rec.spendApprovedAt = new Date().toISOString();
+  rec.spendBlocked = false;
+  save();
+  const next = await advance(shopId, base);
+  return { ok: true, shop: next };
+}
+
 function checklistModel(shopId) {
   const shop = vendors.get(shopId);
   const view = shop && viewShop(shop);
@@ -379,7 +401,7 @@ function checklistModel(shopId) {
 }
 
 module.exports = {
-  enabled, sendCode, verify, grantFor, setPassword, advance, saveRegistration, setEntity, queue, viewShop,
+  enabled, sendCode, verify, grantFor, setPassword, advance, approveSpend, saveRegistration, setEntity, queue, viewShop,
   allowPhone, markRegistration, startPoller, checklistModel, flushHeld, redact, publicRegistration,
   resetLimits: storeApi.resetLimits,
 };

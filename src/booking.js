@@ -110,10 +110,14 @@ function hold(lead, slot) {
   const c = cfg();
   const end = slot.end || new Date(Date.parse(slot.start) + c.slotMin * 60000).toISOString();
   if (isTaken(slot.start, end)) return null;
+  const prepay = require('./disputes').prepayFor(lead.phone, { email: lead.email });
+  const mustPay = !!prepay;
+  const amount = mustPay ? (c.amount > 0 ? c.amount : 1) : (c.deposit ? c.amount : 0);
   const b = { id: crypto.randomBytes(6).toString('hex'), leadId: lead.id, phone: lead.phone, name: lead.name, need: lead.need,
+    ...(lead.email ? { email: lead.email } : {}),
     ...(lead.service ? { service: lead.service, details: lead.details || null } : {}),
-    slotStart: slot.start, slotEnd: end, slotLabel: slot.label, status: c.deposit ? 'held' : 'confirmed', paid: false,
-    amount: c.deposit ? c.amount : 0, holdExpiresAt: new Date(Date.now() + c.holdMin * 60000).toISOString(),
+    slotStart: slot.start, slotEnd: end, slotLabel: slot.label, status: (c.deposit || mustPay) ? 'held' : 'confirmed', paid: false,
+    amount, requirePrepay: mustPay || undefined, holdExpiresAt: new Date(Date.now() + c.holdMin * 60000).toISOString(),
     createdAt: new Date().toISOString() };
   store.db.bookings.unshift(b); store.save(); return b;
 }
@@ -136,6 +140,7 @@ function connectParams(b, acct) {
 // Kept for callers that previously skipped deposits when Connect was missing. Platform charges no longer need Connect;
 // prefer leaving the hold + pay link. Still available for explicit skip paths.
 function skipDeposit(b, reason = 'stripe_not_connected') {
+  if (b && b.requirePrepay) return b;
   b.status = 'confirmed'; b.amount = 0; b.depositSkipped = reason; b.holdExpiresAt = null; store.save();
   return b;
 }
@@ -167,6 +172,12 @@ function leadFeeTotals() {
 // Returns the pay URL. Charges always run on the platform account (separate charges + delayed transfers).
 // A missing Connect account does NOT block the deposit: funds are held and payout stays pending until Connect is ready.
 async function depositLink(b, BASE) {
+  const blocked = require('./deposits').velocityBlock();
+  if (blocked) {
+    b.depositBlocked = blocked === 'count' ? 'daily_count' : 'daily_amount';
+    store.save();
+    throw Object.assign(new Error('This shop has reached its daily deposit limit. BuzzCall will review it.'), { status: 429 });
+  }
   await connect.ensureFresh();
   const acct = connect.chargeAccount(); // optional payout destination; may be null
   if (env.STRIPE_SECRET_KEY) {

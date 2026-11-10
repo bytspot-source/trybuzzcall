@@ -212,12 +212,14 @@ test('NO without a check-in keeps the existing pause', (t) => {
 // ---------- full SMS path: NO, vendor MMS proof, follow-up, auto-release ----------
 test('SMS flow: customer NO, vendor MMS proof (MediaUrl stored, not downloaded), follow-up, auto-release after 48h with no reply', async (t) => {
   reset(t);
-  const { b, d } = paidBooking({ startInHours: -13 });
+  const { b, d } = paidBooking({ startInHours: 0.5 });
+  disputes.checkIn(b, { lat: '33.75', lng: '-84.39', accuracy: '18', ip: '198.51.100.10' });
+  advance(14);
   pendingCheck(d);
   await form('/twilio/sms', { From: b.phone, Body: 'NO' });
   await settle();
-  assert.equal(d.status, 'paused');
-  assert.ok(sentTo(b.phone).some((l) => /paused the payment/.test(l)));
+  assert.equal(d.status, 'disputed');
+  assert.ok(sentTo(b.phone).some((l) => /holding the payment/.test(l)));
   assert.ok(sentTo(OWNER).some((l) => /Pat says you didn't show/.test(l)), 'vendor (shop owner) texted');
   assert.ok(sentTo(OWNER).some((l) => /NO-SHOW claim/.test(l)), 'admin buzzed');
   // Vendor replies with an MMS photo from the owner phone.
@@ -242,7 +244,7 @@ test('SMS flow: customer NO, vendor MMS proof (MediaUrl stored, not downloaded),
   assert.equal(send.sent[0].body, "Peach State Plumbing says they were there and sent proof. Reply KEEP to keep your claim, or we'll release payment in 48 hours.");
   advance(47);
   await deposits.tick({ sendSms: send });
-  assert.equal(d.status, 'paused', 'not before 48h');
+  assert.equal(d.status, 'disputed', 'not before 48h');
   advance(1.5);
   const r2 = await deposits.tick({ sendSms: send });
   assert.equal(r2.autoReleased, 1);
@@ -424,6 +426,7 @@ test('demo fast-forward: advancing 48h in mock mode auto-releases a contested cl
   store.db.depositsMeta.offsetMs += (Date.parse(new Date(deposits.now()).toISOString().slice(0, 10) + 'T12:00:00Z') + 86400000) - deposits.now();
   pendingCheck(d);
   deposits.handleNoshowReply(b.phone, 'NO');
+  disputes.addEvidence(d, { source: 'portal', photo: { type: 'image/jpeg', data: Buffer.from([0xFF, 0xD8, 0xFF, 0xD9]).toString('base64'), bytes: 4 } });
   const post = (hours) => admin('/admin/deposits/demo/advance', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json', origin: URL0 }, body: JSON.stringify({ hours }) });
   const r1 = await (await post(0)).json();
   assert.equal(r1.followups, 1);

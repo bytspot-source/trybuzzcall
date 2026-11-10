@@ -398,8 +398,11 @@ test('platform webhook (/stripe/webhook) still works for deposits in mock/dev mo
   reset(t);
   quiet(t);
   const b = fakeBooking();
+  b.stripeSessionId = 'cs_evt_p';
   const r = await req('/stripe/webhook', { method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: 'evt_p', type: 'checkout.session.completed', data: { object: { mode: 'payment', payment_status: 'paid', metadata: { bookingId: b.id } } } }) });
+    body: JSON.stringify({ id: 'evt_p', type: 'checkout.session.completed', data: { object: {
+      id: 'cs_evt_p', mode: 'payment', payment_status: 'paid', amount_total: 4900, currency: 'usd',
+      metadata: { bookingId: b.id }, client_reference_id: b.id } } }) });
   assert.equal(r.status, 200);
   assert.equal(store.findBooking(b.id).paid, true);
 });

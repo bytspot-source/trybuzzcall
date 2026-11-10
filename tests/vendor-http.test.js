@@ -720,7 +720,7 @@ test('vendor isolation and verified provider routing over local HTTP', { timeout
       slotLabel:'Legacy appointment',holdExpiresAt:new Date(Date.now()+3600000).toISOString()};
     f.store.root.db.bookings.push(booking);await f.vendors.persist();
     const event={id:'evt_legacy_fixture',type:'checkout.session.completed',data:{object:{id:booking.stripeSessionId,
-      mode:'payment',payment_status:'paid',metadata:{bookingId:booking.id},client_reference_id:booking.id}}};
+      mode:'payment',payment_status:'paid',amount_total:4900,currency:'usd',metadata:{bookingId:booking.id},client_reference_id:booking.id}}};
     const wrong=structuredClone(event);wrong.data.object.id='cs_unrecognized';
     const before=f.snapshot();check(!!json(await f.post('/stripe/webhook',{origin:null,body:wrong})).ignored,'Stored session must match');f.unchanged(before);
     json(await f.post('/stripe/webhook',{origin:null,body:event}));

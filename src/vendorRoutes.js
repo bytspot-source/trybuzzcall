@@ -76,6 +76,12 @@ function validateSettings(body) {
     const number = Number(values[key]);
     if (!Number.isFinite(number) || number < min || number > max || key !== 'DEPOSIT_AMOUNT' && !Number.isInteger(number)) throw vendors.error(`Invalid ${key.toLowerCase().replaceAll('_',' ')}.`);
   }
+  const depositCap = sec.num(process.env.DEPOSIT_AMOUNT_MAX, 150);
+  const nextDeposit = Number(values.DEPOSIT_AMOUNT);
+  const prevDeposit = Number(store.getOverride().values?.DEPOSIT_AMOUNT);
+  if (Number.isFinite(nextDeposit) && nextDeposit > depositCap && !(Number.isFinite(prevDeposit) && nextDeposit <= prevDeposit)) {
+    throw vendors.error(`Deposits are capped at $${depositCap}. Ask BuzzCall if this shop needs a higher amount.`);
+  }
   if (values.SERVICES && !validServices(values.SERVICES)) throw vendors.error('Services must use name:minutes, with durations from 15 to 720 minutes.');
   if (values.BUSINESS_TYPE !== undefined && values.BUSINESS_TYPE !== '') Object.assign(values, tradeValues({ businessType: values.BUSINESS_TYPE, tradeName: values.BUSINESS_TRADE_LABEL, flow: values.BUSINESS_FLOW }));
   if (values.BOOKING_LINK) { try { const url = new URL(values.BOOKING_LINK); if (url.protocol !== 'https:' || url.username || url.password) throw Error(); } catch { throw vendors.error('Booking links must use HTTPS without embedded credentials.'); } }
@@ -146,7 +152,7 @@ function register(app, { requireAdmin, BASE, sameOrigin }) {
     reply(req,res,{ok:true},'/vendor/login');
   }));
   app.post('/vendor/login', authAttempt(async (req,res) => {
-    const result = await vendors.login(req.body.email,req.body.password);
+    const result = await vendors.login(req.body.email, req.body.password, { ip: sec.clientIp(req), ua: req.get('user-agent') || '' });
     vendors.setCookie(res,result.token); reply(req,res,{ok:true},'/vendor');
   }));
   app.post('/vendor/logout', safe(async (req,res) => { await vendors.logout(req); vendors.setCookie(res); reply(req,res,{ok:true},'/vendor/login'); }));
@@ -276,6 +282,39 @@ function register(app, { requireAdmin, BASE, sameOrigin }) {
     const sms = require('./sms');
     show(res,pages.vendorDetail({shop:{...vendors.publicShop(shop),subscriptionStatus:stats.subscriptionStatus,payoutStatus:stats.payoutStatus},stats,settings:child.getOverride().values || {},
       smsCaps:shop.smsCaps || {},capDefaults:{hour:sms.shopMax('hour',null),day:sms.shopMax('day',null)}}));
+  }));
+  app.post('/admin/vendors/:id/deposit-amount', requireAdmin, safe(async (req, res) => {
+    if (!bool(req.body.confirm)) throw vendors.error('Confirm the deposit amount.', 409);
+    const amount = Number(req.body.amount);
+    const cap = sec.num(process.env.DEPOSIT_AMOUNT_MAX, 150);
+    if (!Number.isFinite(amount) || amount < 0 || amount > 10000) throw vendors.error('Enter a deposit amount from 0 to 10000.');
+    if (amount > cap && !bool(req.body.confirm_above_cap)) throw vendors.error(`Confirm raising the deposit above the $${cap} cap.`, 409);
+    await vendors.run(req.params.id, async () => {
+      const values = { ...store.getOverride().values, DEPOSIT_AMOUNT: String(amount) };
+      config.apply(values);
+      await vendors.persist(context.current().store);
+    }, { suspended: true });
+    const rootStore = require('./store').root;
+    const audit = (rootStore.db.moneyAudit ||= []);
+    audit.unshift({ at: new Date().toISOString(), action: 'deposit_amount', actor: 'admin', ip: sec.clientIp(req), shopId: req.params.id, amount });
+    rootStore.save();
+    res.redirect(303, `/admin/vendors/${encodeURIComponent(req.params.id)}`);
+  }));
+  app.post('/admin/vendors/:id/connect/approve', requireAdmin, safe(async (req, res) => {
+    if (!bool(req.body.confirm)) throw vendors.error('Confirm payout approval.', 409);
+    const attached = await vendors.run(req.params.id, async () => {
+      const state = connect.approvePayouts();
+      if (!state) throw vendors.error('This shop has no Connect account yet.', 409);
+      const n = deposits.attachPayable();
+      await vendors.persist(context.current().store);
+      return n;
+    }, { suspended: true });
+    const rootStore = require('./store').root;
+    const audit = (rootStore.db.moneyAudit ||= []);
+    audit.unshift({ at: new Date().toISOString(), action: 'connect_approve', actor: 'admin', ip: sec.clientIp(req), shopId: req.params.id, attached });
+    rootStore.save();
+    if (json(req)) return res.json({ ok: true, attached });
+    res.redirect(303, `/admin/vendors/${encodeURIComponent(req.params.id)}`);
   }));
   app.post('/admin/vendors/:id/invite',requireAdmin,safe(async(req,res)=>show(res,pages.invitation(await vendors.invite(req.params.id)))));
   app.post('/admin/vendors/:id/status',requireAdmin,safe(async(req,res)=>reply(req,res,await vendors.setStatus(req.params.id,req.body.status),`/admin/vendors/${encodeURIComponent(req.params.id)}`)));

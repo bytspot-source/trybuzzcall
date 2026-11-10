@@ -37,7 +37,9 @@ function state() {
   const s = stored();
   if (s && s.accountId && s.mode === mode() && !s.deauthorized) return s;
   const id = envId();
-  if (id && mode() !== 'mock') return { accountId: id, mode: mode(), source: 'env', chargesEnabled: false, unverified: true };
+  // Env fallback is NOT a payout destination. chargesEnabled stays false until Stripe
+  // confirms the account (ensureFresh / account.updated). Deposits must use payableAccount().
+  if (id && mode() !== 'mock') return { accountId: id, mode: mode(), source: 'env', chargesEnabled: false, payoutsEnabled: false, unverified: true };
   return null;
 }
 const accountId = () => state()?.accountId || null;
@@ -50,10 +52,33 @@ function fromAccount(a, source) {
     payoutsEnabled: !!a.payouts_enabled, requirementsDue: [...(a.requirements?.currently_due || [])].slice(0, 20),
     disabledReason: a.requirements?.disabled_reason || null, checkedAt: new Date().toISOString(), accountType: 'express' };
 }
+function keepApproval(next, prev) {
+  if (!prev) return next;
+  if (prev.needsPayoutApproval) {
+    next.needsPayoutApproval = true;
+    next.payoutsApproved = !!prev.payoutsApproved;
+    if (prev.payoutsApprovedAt) next.payoutsApprovedAt = prev.payoutsApprovedAt;
+  }
+  return next;
+}
+function notifyConnect(kind, detail) {
+  try {
+    const mail = require('./email');
+    const shop = shopContext.current()?.shop;
+    const who = shop?.name || 'Legacy line';
+    mail.adminAlert(`BuzzCall: Connect ${kind}`, `${who}: ${detail}`);
+    if (shop?.email) mail.ownerNotice(shop.email, `BuzzCall payout account ${kind}`, `${who}: ${detail}`);
+  } catch (e) { console.error('[connect] notify failed:', e.message); }
+}
 // Account object (from retrieve or an account.updated event) -> state. Ignores other accounts.
 function applyAccount(a) {
   if (!a || !a.id || a.id !== accountId()) return false;
-  save(fromAccount(a, state()?.source || 'onboarding'));
+  const prev = state();
+  const next = keepApproval(fromAccount(a, prev?.source || 'onboarding'), prev);
+  save(next);
+  if (prev && prev.accountId === next.accountId && (prev.chargesEnabled !== next.chargesEnabled || prev.payoutsEnabled !== next.payoutsEnabled || prev.disabledReason !== next.disabledReason)) {
+    notifyConnect('updated', `charges ${next.chargesEnabled ? 'on' : 'off'}, payouts ${next.payoutsEnabled ? 'on' : 'off'}${next.disabledReason ? `, ${next.disabledReason}` : ''}.`);
+  }
   return true;
 }
 async function refresh() {
@@ -69,10 +94,32 @@ async function ensureFresh(maxAgeMs = 5 * 60000) {
   if (s.checkedAt && Date.now() - Date.parse(s.checkedAt) < maxAgeMs) return s;
   try { return await refresh(); } catch (e) { console.error('[connect] account refresh failed:', e.message); return state(); }
 }
-// Connected Express account ready for payouts (transfers), or null.
+// Connected Express account with charges enabled, or null. This is NOT enough to pay a
+// brand-new account: payableAccount() also requires admin approval (P12).
 function chargeAccount() {
   const s = state();
   return s && s.chargesEnabled ? s.accountId : null;
+}
+// Payout destination. Unverified env fallback (chargesEnabled false) is never returned.
+// A Connect account created by this app stays unpaid until an admin approves it.
+function payableAccount() {
+  const s = state();
+  if (!s || !s.chargesEnabled || s.unverified) return null;
+  if (s.needsPayoutApproval && !s.payoutsApproved) return null;
+  return s.accountId;
+}
+function approvePayouts() {
+  const s = stored();
+  if (!s || !s.accountId || s.deauthorized) return null;
+  save({ ...s, needsPayoutApproval: true, payoutsApproved: true, payoutsApprovedAt: new Date().toISOString() });
+  return stored();
+}
+function flagNewAccount(record) {
+  const next = { ...record, needsPayoutApproval: true, payoutsApproved: false };
+  save(next);
+  const shop = shopContext.current();
+  notifyConnect('account created', `New Express account ${next.accountId} needs admin approval before deposits can be paid out${shop ? ` (shop ${shop.id})` : ''}.`);
+  return next;
 }
 // Deposits are always taken on the platform when Stripe (or mock) is available; Connect only gates payouts.
 const depositsReady = () => mode() === 'mock' || !!key();
@@ -98,13 +145,15 @@ async function onboardAccount(BASE, prefill = {}) {
   const prefix = shopContext.current() ? '/vendor/connect' : '/admin/connect';
   if (mode() === 'mock') {
     let s = stored();
+    let created = false;
     if (!s || s.mode !== 'mock' || s.deauthorized) {
       s = { accountId: `acct_mock_${crypto.randomBytes(6).toString('hex')}`, mode: 'mock', source: 'onboarding', chargesEnabled: false,
         detailsSubmitted: false, payoutsEnabled: false, requirementsDue: ['mock onboarding'], accountType: 'express' };
-      save(s);
+      s = flagNewAccount(s);
+      created = true;
     }
     if (shopContext.current()) await persistAccount();
-    return { url: `${BASE}${prefix}/mock`, accountId: s.accountId, created: true };
+    return { url: `${BASE}${prefix}/mock`, accountId: s.accountId, created };
   }
   let id = accountId(), created = false;
   if (!id) {
@@ -121,7 +170,7 @@ async function onboardAccount(BASE, prefill = {}) {
     const a = await stripe().accounts.create(params, ...(shopContext.current()
       ? [{ idempotencyKey: `connect-${shopContext.shopId()}-${mode()}` }] : []));
     id = a.id; created = true;
-    save(fromAccount(a, 'onboarding'));
+    flagNewAccount(fromAccount(a, 'onboarding'));
   }
   if (shopContext.current()) await persistAccount();
   const link = await stripe().accountLinks.create({ account: id, type: 'account_onboarding',
@@ -134,7 +183,12 @@ function mockComplete() {
   save({ ...s, chargesEnabled: true, detailsSubmitted: true, payoutsEnabled: true, requirementsDue: [], checkedAt: new Date().toISOString() });
   return stored();
 }
-function deauthorize() { const s = state(); if (s) save({ ...s, chargesEnabled: false, deauthorized: true }); }
+function deauthorize() {
+  const s = state();
+  if (!s) return;
+  save({ ...s, chargesEnabled: false, deauthorized: true });
+  notifyConnect('disconnected', 'Stripe was disconnected. Vendor payouts stay paused until an admin reconnects and approves the account.');
+}
 
 // Livemode guard for Connect webhook events: test keys only accept test events, live keys only live events.
 const livemodeOk = (event) => mode() === 'mock' || event.livemode === undefined || !!event.livemode === (mode() === 'live');
@@ -151,8 +205,9 @@ function summary() {
   return { mode: mode(), status: status(), label: statusLabel(), accountId: s?.accountId || null, source: s?.source || null,
     chargesEnabled: !!s?.chargesEnabled, detailsSubmitted: !!s?.detailsSubmitted, payoutsEnabled: !!s?.payoutsEnabled,
     requirementsDue: s?.requirementsDue || [], disabledReason: s?.disabledReason || null, checkedAt: s?.checkedAt || null,
-    depositsReady: depositsReady(), payoutsReady: payoutsReady(), accountType: s?.accountType || 'express' };
+    depositsReady: depositsReady(), payoutsReady: !!payableAccount(), accountType: s?.accountType || 'express',
+    needsPayoutApproval: !!s?.needsPayoutApproval, payoutsApproved: !!s?.payoutsApproved };
 }
 
-module.exports = { mode, state, accountId, status, statusLabel, summary, refresh, ensureFresh, chargeAccount, depositsReady,
-  payoutsReady, onboard, mockComplete, deauthorize, applyAccount, livemodeOk, applicationFeeCents, stripe, setStripe };
+module.exports = { mode, state, accountId, status, statusLabel, summary, refresh, ensureFresh, chargeAccount, payableAccount,
+  approvePayouts, depositsReady, payoutsReady, onboard, mockComplete, deauthorize, applyAccount, livemodeOk, applicationFeeCents, stripe, setStripe };

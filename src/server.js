@@ -74,13 +74,28 @@ app.post('/stripe/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   if (['checkout.session.completed', 'checkout.session.async_payment_succeeded'].includes(event.type)) {
     const s = event.data.object;
     if (!s.mode || s.mode === 'payment') {
-      const id = s.metadata?.bookingId || s.client_reference_id;
-      if (id && s.payment_status !== 'unpaid') {
-        await onPaid(id, {
-          sessionId: s.id,
-          paymentIntentId: typeof s.payment_intent === 'string' ? s.payment_intent : s.payment_intent?.id,
-        });
+      if (s.payment_status === 'unpaid') return res.json({ received: true, ignored: 'unpaid' });
+      const id = s.metadata?.bookingId;
+      const booking = id && store.findBooking(id);
+      const problem = deposits.sessionProblem(s, booking);
+      if (problem) return res.json({ received: true, ignored: problem });
+      if (process.env.STRIPE_SECRET_KEY && typeof event.livemode === 'boolean' && !!event.livemode !== (connect.mode() === 'live')) {
+        return res.json({ received: true, ignored: 'livemode mismatch' });
       }
+      let payment = deposits.chargeFromSession(s);
+      if (!payment.chargeId && payment.paymentIntentId && process.env.STRIPE_SECRET_KEY) {
+        try {
+          const stripe = connect.stripe();
+          if (stripe.paymentIntents?.retrieve) {
+            const pi = await stripe.paymentIntents.retrieve(payment.paymentIntentId);
+            const latest = pi && pi.latest_charge;
+            payment.chargeId = typeof latest === 'string' ? latest : latest?.id || null;
+            payment.cardFingerprint = payment.cardFingerprint || latest?.payment_method_details?.card?.fingerprint || null;
+            if (pi?.id) payment.paymentIntentId = pi.id;
+          }
+        } catch (e) { console.error('[deposits] payment intent retrieve failed:', e.message); }
+      }
+      await onPaid(id, { ...payment, sessionId: s.id, livemode: event.livemode, email: booking.email || null });
     }
   }
   try { await deposits.handleWebhookEvent(event); } catch (e) { console.error('deposits webhook error:', e.message); }
@@ -158,7 +173,7 @@ app.use((req, res, next) => {
   }
   next();
 });
-const ORIGIN_GUARDED = /^\/(admin|vendor|v|api\/billing|billing)(\/|$)/i;
+const ORIGIN_GUARDED = /^\/(admin|vendor|v|onboarding|api\/billing|billing)(\/|$)/i;
 app.use((req, res, next) => (['GET', 'HEAD', 'OPTIONS'].includes(req.method) || !ORIGIN_GUARDED.test(req.path) ? next() : sameOrigin(req, res, next)));
 // Never serve editor/backup leftovers (e.g. public/terms.html.bak-*) or dotfiles from public/.
 app.use((req, res, next) => (/\.(bak|orig|swp)\b|~$|\/\./i.test(req.path) ? res.status(404).send('Not found') : next()));
@@ -586,6 +601,7 @@ async function platformAlert(msg, subject) {
   await shopContext.run(null, () => owner(null, msg));
   mail.adminAlert(subject, msg);
 }
+deposits.setAlert((msg, subject) => platformAlert(msg, subject));
 sms.setCapAlert(async ({ scope, per = 'hour', max, shopId, shopName } = {}) => {
   if (scope === 'shop' && shopId) {
     const who = `${String(shopName || 'Vendor').slice(0, 80)} (vendor ${shopId.slice(0, 8)})`;
@@ -787,6 +803,8 @@ const billingReply = (req, res, result) => wantsHtml(req) ? res.redirect(303, '/
 app.post('/setup', setupLimit, async (req, res) => {
   const body = req.body && typeof req.body === 'object' ? req.body : {};
   const json = wantsJson(req);
+  const captcha = await require('./captcha').check(body.captchaToken || body['cf-turnstile-response'] || body['g-recaptcha-response'], req);
+  if (!captcha.ok) return json ? res.status(400).json({ ok: false, error: captcha.error }) : res.status(400).type('html').send(setupPages.errorsHtml([{ message: captcha.error }]));
   const { values, issues, errors, warnings } = setupRules.validate(body);
   if (String(body.website || '').trim()) { // honeypot: bots fill hidden fields; pretend success, store nothing
     return json ? res.json({ ok: true, id: null }) : res.type('html').send(setupPages.thanksHtml({}));
@@ -921,6 +939,16 @@ const connectMockOnly = (req, res, next) => (connect.mode() !== 'mock' ? res.sta
 app.get('/admin/connect/mock', connectMockOnly, requireAdmin, (req, res) => {
   res.type('html').send(paymentPages.connectOnboarding({ connect: connect.summary(), businessName: env.BUSINESS_NAME || 'Your business' }));
 });
+app.post('/admin/connect/approve', requireAdmin, async (req, res) => {
+  if (!sec.on(req.body?.confirm)) return res.status(409).json({ error: 'Confirm payout approval' });
+  const s = connect.approvePayouts();
+  if (!s) return res.status(409).json({ error: 'No Connect account to approve' });
+  const attached = deposits.attachPayable();
+  logMoney(req, 'connect_approve', { accountId: s.accountId, attached });
+  await flushShop();
+  if (wantsJson(req)) return res.json({ ...connect.summary(), attached });
+  res.redirect(303, '/admin#connect');
+});
 app.post('/admin/connect/mock/complete', connectMockOnly, requireAdmin, (req, res) => {
   const s = connect.mockComplete();
   if (!s) return res.status(409).json({ error: 'start onboarding first' });
@@ -939,6 +967,14 @@ const depositShop = (req, res, next) => {
 const shopQs = () => (shopContext.shopId() ? `?shop=${encodeURIComponent(shopContext.shopId())}` : '');
 const backToDeposits = (res) => res.redirect(303, `/admin/deposits${shopQs()}`);
 const flushShop = async () => { if (shopContext.current()) await vendors.flush(shopContext.current().store); };
+app.post('/admin/deposits/archive-non-live', requireAdmin, depositShop, async (req, res) => {
+  if (!sec.on(req.body?.confirm)) return res.status(409).json({ error: 'Confirm archive of non-live deposits' });
+  const result = deposits.archiveNonLive();
+  logMoney(req, 'archive_non_live', result);
+  await flushShop();
+  if (wantsJson(req)) return res.json(result);
+  backToDeposits(res);
+});
 app.get('/admin/deposits', requireAdmin, depositShop, (req, res) => {
   if (wantsJson(req)) return res.json(deposits.summary());
   res.type('html').send(adminPages.depositsPage({
@@ -956,17 +992,35 @@ app.post('/admin/deposits/:id/refund', requireAdmin, depositShop, async (req, re
   const d = deposits.find(req.params.id);
   if (!d) return res.status(404).json({ error: 'deposit not found' });
   try {
+    logMoney(req, 'refund', { depositId: d.id, bookingId: d.bookingId });
     const r = await deposits.refundDeposit(d, { reason: 'admin' });
     await flushShop();
     if (wantsJson(req)) return res.json(r);
     backToDeposits(res);
   } catch (e) { console.error('deposit refund failed:', e.message); return res.status(500).json({ error: 'refund failed' }); }
 });
+function moneyActor(req) {
+  const creds = basicCreds(req);
+  const user = creds && creds.user ? String(creds.user).slice(0, 40) : 'admin';
+  return `admin:${user}`;
+}
+function logMoney(req, action, extra = {}) {
+  const root = store.root;
+  const log = (root.db.moneyAudit ||= []);
+  log.unshift({ at: new Date().toISOString(), action, actor: moneyActor(req), ip: sec.clientIp(req), shopId: shopContext.shopId() || 'legacy', ...extra });
+  if (log.length > 500) log.length = 500;
+  root.save();
+}
 app.post('/admin/deposits/:id/release', requireAdmin, depositShop, async (req, res) => {
   const d = deposits.find(req.params.id);
   if (!d) return res.status(404).json({ error: 'deposit not found' });
+  const held = d.status === 'disputed' || d.status === 'paused' || d.payoutPaused || d.cardDispute;
+  if (held && !sec.on(req.body?.confirm_release)) {
+    return res.status(409).json({ error: 'Confirm force-release of this held deposit', needsConfirm: true });
+  }
   try {
-    const r = await deposits.releaseDeposit(d, { force: true });
+    logMoney(req, 'release', { depositId: d.id, bookingId: d.bookingId, held: !!held });
+    const r = await deposits.releaseDeposit(d, { force: true, by: moneyActor(req) });
     await flushShop();
     if (wantsJson(req)) return res.json(r);
     backToDeposits(res);
@@ -990,7 +1044,8 @@ app.get('/admin/deposits/:id/photo/:pid', requireAdmin, depositShop, (req, res) 
 app.post('/admin/deposits/:id/prepay', requireAdmin, depositShop, (req, res) => {
   const d = deposits.find(req.params.id);
   if (!d) return res.status(404).json({ error: 'deposit not found' });
-  const f = disputes.setRequirePrepay(d.phone, sec.on(req.body?.on));
+  logMoney(req, 'prepay', { depositId: d.id, on: sec.on(req.body?.on) });
+  const f = disputes.setRequirePrepay(d.phone, sec.on(req.body?.on), { email: d.email, fingerprint: d.cardFingerprint });
   if (!f) return res.status(409).json({ error: 'customer is not flagged' });
   if (wantsJson(req)) return res.json({ ok: true, flag: f });
   backToDeposits(res);
@@ -1105,17 +1160,22 @@ async function maintainShops() {
   }
 }
 setInterval(() => { booking.expireHolds(); maintainShops().catch(() => {}); }, 60000).unref();
-async function depositsTickAll() {
-  const run = async () => {
-    try {
-      await deposits.tick({ sendSms: (to, body) => sendSms(to, body) });
-    } catch (e) { console.error('[deposits] tick failed:', e.message); }
-  };
-  await run();
-  for (const shop of vendors.all().filter((s) => s.status !== 'provisioning')) {
-    try { await vendors.run(shop.id, run, { suspended: true }); }
-    catch (e) { console.error('[deposits] shop tick failed:', e.message); }
-  }
+let depositsTickFlight = null;
+function depositsTickAll() {
+  if (depositsTickFlight) return depositsTickFlight;
+  depositsTickFlight = (async () => {
+    const run = async () => {
+      try {
+        await deposits.tick({ sendSms: (to, body) => sendSms(to, body) });
+      } catch (e) { console.error('[deposits] tick failed:', e.message); }
+    };
+    await run();
+    for (const shop of vendors.all().filter((s) => s.status !== 'provisioning')) {
+      try { await vendors.run(shop.id, run, { suspended: true }); }
+      catch (e) { console.error('[deposits] shop tick failed:', e.message); }
+    }
+  })().finally(() => { depositsTickFlight = null; });
+  return depositsTickFlight;
 }
 setInterval(() => { depositsTickAll().catch(() => {}); }, 60000).unref();
 app.locals.maintainShops = maintainShops;
@@ -1187,12 +1247,21 @@ function placeholderPasswords() {
 function bootChecks() {
   const mode = sec.modeInfo(), problems = [];
   console.log(`[mode] ${mode.production ? `production (${mode.reasons.join(', ')})` : 'development'}; demo/mock routes ${sec.demoAllowed() ? 'ON' : 'OFF'}${mode.production && sec.demoAllowed() ? ' (DEMO_MODE=1)' : ''}; twilio ${live ? 'live' : 'log-only'}; stripe ${env.STRIPE_SECRET_KEY ? 'on' : 'mock'}`);
+  const stripeKey = process.env.STRIPE_SECRET_KEY || '';
+  if (mode.production && /^(sk|rk)_live_/.test(stripeKey) && sec.on(process.env.DEMO_MODE)) {
+    const msg = 'DEMO_MODE=1 is set together with a live Stripe key. Refusing to start.';
+    console.error(`[security] FATAL: ${msg}`);
+    problems.push(msg);
+  }
   if (!mode.production) return problems;
   const pw = env.ADMIN_PASSWORD || '';
   if (!pw) problems.push('ADMIN_PASSWORD is not set (admin disabled)');
   else if (pw.length < 16 || [...placeholderPasswords()].some((p) => sec.safeEqual(p, pw))) problems.push('ADMIN_PASSWORD is weak (shorter than 16 characters or the .env.example placeholder)');
   if (!env.OWNER_PHONE || env.OWNER_PHONE === sec.PLACEHOLDER_PHONE) console.error('[security] WARNING: OWNER_PHONE is not set: owner alerts are recorded on /admin but not texted.');
-  for (const p of problems) console.error(`[security] WARNING: ${p}. Set a long random ADMIN_PASSWORD (20+ chars).`);
+  for (const p of problems) {
+    if (/live Stripe key/.test(p)) continue;
+    console.error(`[security] WARNING: ${p}. Set a long random ADMIN_PASSWORD (20+ chars).`);
+  }
   return problems;
 }
 app.locals.bootChecks = bootChecks;
@@ -1260,6 +1329,7 @@ process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e 
 process.on('uncaughtException', (e) => { console.error('[uncaughtException]', e && e.stack ? e.stack : e); process.exit(1); });
 {
   const problems = bootChecks();
+  if (problems.some((p) => /live Stripe key/.test(p))) { console.error('[security] refusing to start: DEMO_MODE=1 with a live Stripe key.'); process.exit(1); }
   if (problems.length && sec.isProduction() && sec.on(process.env.ADMIN_PASSWORD_STRICT)) { console.error('[security] ADMIN_PASSWORD_STRICT=1: refusing to start.'); process.exit(1); }
 }
 const port = env.PORT || 3000;

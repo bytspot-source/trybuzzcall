@@ -25,6 +25,8 @@ const CAPS = {
   hour: { windowMs: 3600000, env: 'OUTBOUND_MAX_PER_HOUR', def: 200, lim: null, key: null, alerted: 0 },
   day: { windowMs: 86400000, env: 'OUTBOUND_MAX_PER_DAY', def: 500, lim: null, key: null, alerted: 0 },
 };
+// Global daily cap for onboarding OTP texts. 0 = off. Counts in addition to the platform caps.
+const OTP_CAP = { windowMs: 86400000, env: 'OTP_MAX_PER_DAY', def: 200, lim: null, key: null, alerted: 0 };
 // Per-shop caps (each vendor, and the legacy single shop, separately): OUTBOUND_SHOP_MAX_PER_HOUR (default 100) and
 // OUTBOUND_SHOP_MAX_PER_DAY (default 300); 0 = off. A platform administrator can set a per-vendor limit (shop.smsCaps).
 // The platform-wide CAPS above stay on top as the total, so one busy or abused line cannot use up every shop's texts.
@@ -84,6 +86,7 @@ function writeLog(logPath, to, body, kind, result) {
 }
 
 // opts.kind: 'caller' (default; counts toward the hourly/daily caps) | 'owner' (alerts to the shop owner)
+//   | 'otp' (onboarding codes: platform caps + OTP_MAX_PER_DAY, no shop-name or A2P hold)
 // opts.force: send even to an opted-out number (only for the one confirmation of a plain-language opt-out, and HELP).
 async function sendSms(to, body, opts = {}) {
   const kind = opts.kind || 'caller';
@@ -120,6 +123,22 @@ async function sendSms(to, body, opts = {}) {
         return { ok: false, skipped: 'a2p_held', held: true };
       }
     }
+    if (kind === 'otp') {
+      const otpMax = capMax(OTP_CAP);
+      if (otpMax > 0 && capLim(OTP_CAP).blocked('otp')) {
+        console.error(`[security] OTP daily cap reached (${otpMax}/day): not texting ${maskPhone(to)}`);
+        return { ok: false, skipped: 'otp_cap' };
+      }
+      const platform = Object.entries(CAPS).filter(([, c]) => capMax(c) > 0);
+      for (const [per, c] of platform) {
+        if (capLim(c).blocked('all')) {
+          console.error(`[security] outbound SMS platform cap reached (${capMax(c)}/${per}): not texting OTP to ${maskPhone(to)}`);
+          return { ok: false, skipped: per === 'day' ? 'cap_day' : 'cap' };
+        }
+      }
+      for (const [, c] of platform) capLim(c).hit('all');
+      if (otpMax > 0) capLim(OTP_CAP).hit('otp');
+    }
     if (kind === 'caller') {
       const blocked = capCheck(context ? context.shop : null);
       if (blocked) {
@@ -151,5 +170,5 @@ async function sendSms(to, body, opts = {}) {
 }
 // Tests inject a fake Twilio client (never hits the network).
 const setClient = (c) => { client = c; injectedClient = !!c; };
-const resetCap = () => { for (const c of Object.values(CAPS)) { c.lim = null; c.key = null; c.alerted = 0; } shopLimits.clear(); noNameAlerted.clear(); };
+const resetCap = () => { for (const c of [...Object.values(CAPS), OTP_CAP]) { c.lim = null; c.key = null; c.alerted = 0; } shopLimits.clear(); noNameAlerted.clear(); };
 module.exports = { sendSms, live: !!client, setClient, setCapAlert, setNoNameAlert, resetCap, shopMax, OPTED_OUT_CODES };
