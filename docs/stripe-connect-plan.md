@@ -1,8 +1,21 @@
 # Stripe Connect plan: deposits go to the shop owner, not BuzzCall
 
-Status: research + plan only (no code changes, no Stripe account actions, no signups).
-Written: 2026-10-23 (America/New_York). Entity: TryBuzzCall LLC (Georgia LLC, wholly owned by Bytspot Inc.).
+Status: **implemented for the pilot as direct charges.** No Stripe account has been created or changed by this work, and nothing here is a live signup.
+Written: 2026-10-23, updated 2026-11-10 (America/New_York). Entity: TryBuzzCall LLC (Georgia LLC, wholly owned by Bytspot Inc.).
 Everything marked "ESTIMATE" or "VERIFY" must be re-checked against live Stripe pages before launch.
+
+## What the code does now
+
+`DEPOSIT_MODEL` defaults to `direct`. A deposit Checkout Session is created on the shop's connected account (`stripeAccount` / `Stripe-Account`). BuzzCall does not transfer, hold, release, or record `vendor_debt` for that payment. The old separate-charges functions stay in the tree and return immediately unless `DEPOSIT_MODEL` is `platform_hold` or `transfer`. Existing deposit rows are not migrated or deleted.
+
+The account type is one function, `accountCreateParams()` in `src/connect.js`, selected by `CONNECT_DASHBOARD`:
+
+- `full` (default). v1 `accounts.create` with `controller.stripe_dashboard.type=full`, `controller.fees.payer=account`, `controller.losses.payments=stripe`, `controller.requirement_collection=stripe`, and `card_payments` requested. Stripe's controller-property docs map those four values to a Standard account, including when they are left as the defaults. The installed `stripe` package is 16.12.0 and cannot call `POST /v2/core/accounts`. The v2 shape of the same choice is `dashboard=full`, `fees_collector=stripe`, `losses_collector=stripe`.
+- `express`. Legacy `type=express` plus `transfers`. Stripe's account-type mapping sets `losses.payments=application` for Express, so the platform is liable. Do not use this for the pilot unless that liability is accepted. It cannot be edited later: `controller.stripe_dashboard.type` is immutable. Stripe's direct-charge recommendation table also allows an Express dashboard when negative-balance liability is assigned to Stripe. This code does not create that hybrid (`stripe_dashboard.type=express` together with `losses.payments=stripe`). It would be a third choice, and the installed SDK still cannot create the Accounts v2 form of it.
+
+Checkout is refused unless `charges_enabled` is true, `disabled_reason` is empty, the account is not paused or deauthorized, and an admin has approved it. An account id already stored for another shop is refused. The pilot cap is `DEPOSIT_AMOUNT_MAX` (default 50) and `DEPOSIT_APPLICATION_FEE_CENTS` (default 0).
+
+Docs checked 2026-11-10: [controller properties](https://docs.stripe.com/connect/migrate-to-controller-properties), [direct-charge refunds and disputes](https://docs.stripe.com/connect/saas/tasks/refunds-disputes), [Connect disputes](https://docs.stripe.com/connect/disputes), [integration recommendations](https://docs.stripe.com/connect/integration-recommendations), [Radar with Connect](https://docs.stripe.com/connect/radar), [Accounts v2 configuration](https://docs.stripe.com/connect/accounts-v2/connected-account-configuration). Confirmed there: a direct-charge refund and the disputed amount are debited from the connected account; the dispute fee follows `fees.payer` / `fees_collector`; application fees are not part of this pilot. Not confirmed from those pages: a platform-forced payout delay on a full-dashboard account (Platform controls exist; this app does not set them), and whether the Radar "platform controls for direct charges" toggle applies to a full-dashboard account (the Radar table says the platform page cannot configure Radar for those accounts).
 
 ## 0. Recommendation (short)
 
@@ -16,10 +29,7 @@ Why it fits a tiny SMB pilot:
 - The owner gets the full Stripe Dashboard to issue refunds (including partials for the "trip fee" case), see disputes and set payouts. BuzzCall does not need to build refund or dispute tooling for the pilot.
 - It is the lowest integration effort (hosted onboarding via Account Links, no KYC UI).
 
-**Important finding about the current code:** `src/booking.js` already has a *destination charge* path, enabled by `STRIPE_CONNECT_ACCOUNT_ID`. It has three problems:
-1. Destination charges are created on the platform. Funds sit in BuzzCall's balance first. BuzzCall's balance is debited for refunds and chargebacks, and BuzzCall pays the Stripe fees.
-2. This contradicts Terms §5, which says the shop is responsible for refunds and chargebacks.
-3. With no `STRIPE_CONNECT_ACCOUNT_ID`, `depositLink()` still creates a normal platform-account charge. That is exactly what you want to stop. The new design should **fail closed**.
+**Code, as of the direct-charge pilot:** `depositLink()` fail-closes when a Stripe key is set and the shop cannot take a direct charge. There is no destination charge and no platform-account deposit Checkout. `public/terms.html` still describes the older hold-and-transfer model. That page is counsel's to change; the app no longer moves the deposit.
 
 Sources: https://docs.stripe.com/connect/charges and https://docs.stripe.com/connect/best-practices
 

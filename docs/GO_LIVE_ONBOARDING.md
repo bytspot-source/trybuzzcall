@@ -35,8 +35,9 @@ All three flags ship **off**. Deploy this build first and confirm a setup still 
 
 **Stripe**
 
-- Test-mode checkout from `/vendor/billing/checkout` with a 14-day trial and a card.
-- Webhook secret set. Connect (deposits) stays a separate later step; onboarding does not start a Connect account.
+- Test-mode subscription checkout from `/vendor/billing/checkout` with a 14-day trial and a card. That charge stays on BuzzCall's platform account. It is not a customer deposit.
+- Platform webhook secret set, scoped to **Your account**, for subscription events only. See `docs/GO_LIVE_PAYMENTS.md`.
+- Customer deposits are a separate Connect step and stay off until you do it. The shop links its own account from the signed-in vendor portal. The default account is a full-dashboard account (`CONNECT_DASHBOARD=full`): the shop pays Stripe's fees, Stripe is the losses collector, and the shop refunds in its own Dashboard. Checkout is a direct charge on that account, capped at `DEPOSIT_AMOUNT_MAX` (default $50) with `DEPOSIT_APPLICATION_FEE_CENTS` defaulting to 0. Deposits do not go live until `charges_enabled` is true, there is no `disabled_reason`, and an admin approves the account in the platform queue. Onboarding does not start a Connect account by itself, and it does not turn on `AUTO_*` flags.
 
 **Resend**
 

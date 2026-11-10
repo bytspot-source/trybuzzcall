@@ -406,11 +406,11 @@ test('vendor isolation and verified provider routing over local HTTP', { timeout
     status(await f.post('/vendor/settings', { cookie: a.cookie, body: { BUSINESS_NAME: 'Aster updated', BUSINESS_CITY: 'Los Angeles, CA',
       BUSINESS_TZ: 'America/Los_Angeles', BUSINESS_DAYS: '0,1,2,3,4,5,6', BUSINESS_HOURS: '09:00-17:00',
       SERVICES: 'Fixture consultation:60', SLOT_MINUTES: '60', HOLD_MINUTES: '45', BOOKING_LEAD_MINUTES: '30',
-      BOOKING_ENABLED: '1', DEPOSIT_ENABLED: '1', DEPOSIT_AMOUNT: '65', BOOKING_LINK: 'https://booking.example/aster' } }), 200);
+      BOOKING_ENABLED: '1', DEPOSIT_ENABLED: '1', DEPOSIT_AMOUNT: '50', BOOKING_LINK: 'https://booking.example/aster' } }), 200);
     check(await f.shopSnapshot(b) === bBefore, 'Safe settings did not change another shop');
     check(f.vendors.get(a.id).name === 'Aster updated' && f.vendors.get(b.id).name === b.name, 'Only own roster name changed');
     check(process.env.TZ === 'UTC', 'Vendor time zones never change process-wide TZ');
-    for (const [shop, zone, amount] of [[a, 'America/Los_Angeles', 65], [b, 'America/New_York', 49]]) {
+    for (const [shop, zone, amount] of [[a, 'America/Los_Angeles', 50], [b, 'America/New_York', 49]]) {
       await f.vendors.run(shop.id, async () => {
         await new Promise(resolve => setImmediate(resolve));
         check(f.config.env.BUSINESS_TZ === zone && f.booking.cfg().amount === amount, 'Effective settings remain shop-local');
@@ -614,6 +614,9 @@ test('vendor isolation and verified provider routing over local HTTP', { timeout
     }
     const bBefore = await f.shopSnapshot(b);
     const valid = event(accounts[0], bookingA.id, a.id);
+    valid.data.object.id = bookingA.stripeSessionId;
+    valid.data.object.amount_total = 4900;
+    valid.data.object.currency = 'usd';
     const accepted = json(await f.post('/stripe/connect/webhook', { origin: null, body: valid }));
     check(accepted.received === true && !accepted.ignored, 'Matched event is processed');
     check(bookingA.paid && bookingA.status === 'confirmed' && !bookingB.paid, 'Only matched shop A booking is paid');
@@ -625,8 +628,15 @@ test('vendor isolation and verified provider routing over local HTTP', { timeout
     const nextB = await f.seedBooking(b, { phone: '+14705550126' });
     const first = f.messages.length;
     f.barrier(2);
-    const responses = await Promise.all([f.post('/stripe/connect/webhook', { origin: null, body: event(accounts[0], nextA.id, a.id) }),
-      f.post('/stripe/connect/webhook', { origin: null, body: event(accounts[1], nextB.id, b.id) })]);
+    const pay = (account, booking, shopId) => {
+      const payload = event(account, booking.id, shopId);
+      payload.data.object.id = booking.stripeSessionId;
+      payload.data.object.amount_total = Math.round(Number(booking.amount) * 100);
+      payload.data.object.currency = 'usd';
+      return payload;
+    };
+    const responses = await Promise.all([f.post('/stripe/connect/webhook', { origin: null, body: pay(accounts[0], nextA, a.id) }),
+      f.post('/stripe/connect/webhook', { origin: null, body: pay(accounts[1], nextB, b.id) })]);
     for (const response of responses) check(json(response).received === true, 'Concurrent payment acknowledged');
     check(nextA.paid && nextB.paid && !bookingB.paid, 'Concurrent callbacks pay only their selected bookings');
     const sentTogether = f.messages.slice(first);
@@ -724,7 +734,7 @@ test('vendor isolation and verified provider routing over local HTTP', { timeout
     const wrong=structuredClone(event);wrong.data.object.id='cs_unrecognized';
     const before=f.snapshot();check(!!json(await f.post('/stripe/webhook',{origin:null,body:wrong})).ignored,'Stored session must match');f.unchanged(before);
     json(await f.post('/stripe/webhook',{origin:null,body:event}));
-    check(booking.paid,'Only a matched legacy payment marks the root booking paid');
+    check(!booking.paid,'A direct charge is not marked paid on the platform webhook');
     for(const shop of f.shops) check(await f.vendors.run(shop.id,()=>f.store.db.bookings.length===0),'No vendor booking is created');
   });
 

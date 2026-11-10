@@ -182,19 +182,19 @@ test('NO after a vendor check-in -> disputed (not paused), admin buzzed with the
   pendingCheck(d);
   const r = deposits.handleNoshowReply(b.phone, 'No', { base: 'https://shop.example' });
   assert.equal(r.answer, 'no');
-  assert.equal(d.status, 'disputed');
-  assert.equal(d.payoutPaused, true, 'payout held for admin review');
+  assert.equal(d.status, 'recorded');
+  assert.equal(d.reputation, 'checked_in_noshow');
   assert.equal(r.disputed, true);
   assert.match(r.adminAlert, /VENDOR CHECKED IN/);
   assert.match(r.adminAlert, /with location/);
+  assert.match(r.reply, /does not hold this deposit/);
   assert.match(r.vendorText, /^BuzzCall: Pat says you didn't show for Fri, Nov 6, 10:00 AM\. Reply with a photo or details, or open https:\/\/shop\.example\/v\/proof\/\S+ to respond\./);
-  assert.ok(d.dispute.followupDueAt, 'customer follow-up queued (vendor checked in)');
-  assert.equal(outcomeFor(b).result_stage, 'disputed');
-  // Not released by the normal scheduler while disputed.
+  assert.equal(d.dispute.followupDueAt, null, 'direct charges do not queue a KEEP follow-up');
+  assert.equal(outcomeFor(b).result_stage, 'no_show_reported');
   advance(30);
-  assert.equal((await deposits.releaseDeposit(d)).reason, 'disputed');
+  assert.equal((await deposits.releaseDeposit(d)).reason, 'direct_model');
   await deposits.processDueReleases();
-  assert.equal(d.status, 'disputed');
+  assert.equal(d.status, 'recorded');
 });
 
 test('NO without a check-in keeps the existing pause', (t) => {
@@ -202,9 +202,10 @@ test('NO without a check-in keeps the existing pause', (t) => {
   const { b, d } = paidBooking({ startInHours: -13 });
   pendingCheck(d);
   const r = deposits.handleNoshowReply(b.phone, 'NO');
-  assert.equal(d.status, 'paused');
-  assert.match(r.reply, /paused the payment/i);
-  assert.match(r.adminAlert, /did not check in: payout PAUSED/);
+  assert.equal(d.status, 'recorded');
+  assert.equal(d.reputation, 'noshow');
+  assert.match(r.reply, /does not hold this deposit/i);
+  assert.match(r.adminAlert, /did not check in/);
   assert.equal(d.dispute.followupDueAt, null, 'no follow-up until the vendor sends proof');
   assert.equal(outcomeFor(b).result_stage, 'no_show_reported');
 });
@@ -218,8 +219,8 @@ test('SMS flow: customer NO, vendor MMS proof (MediaUrl stored, not downloaded),
   pendingCheck(d);
   await form('/twilio/sms', { From: b.phone, Body: 'NO' });
   await settle();
-  assert.equal(d.status, 'disputed');
-  assert.ok(sentTo(b.phone).some((l) => /holding the payment/.test(l)));
+  assert.equal(d.status, 'recorded');
+  assert.ok(sentTo(b.phone).some((l) => /does not hold this deposit/.test(l)));
   assert.ok(sentTo(OWNER).some((l) => /Pat says you didn't show/.test(l)), 'vendor (shop owner) texted');
   assert.ok(sentTo(OWNER).some((l) => /NO-SHOW claim/.test(l)), 'admin buzzed');
   // Vendor replies with an MMS photo from the owner phone.
@@ -239,21 +240,17 @@ test('SMS flow: customer NO, vendor MMS proof (MediaUrl stored, not downloaded),
   store.db.depositsMeta.offsetMs += (Date.parse(new Date(deposits.now()).toISOString().slice(0, 10) + 'T12:00:00Z') + 86400000) - deposits.now();
   const send = capture();
   const r1 = await deposits.tick({ sendSms: send });
-  assert.equal(r1.followups, 1);
-  assert.equal(send.sent[0].to, b.phone);
-  assert.equal(send.sent[0].body, "Peach State Plumbing says they were there and sent proof. Reply KEEP to keep your claim, or we'll release payment in 48 hours.");
+  assert.equal(r1.followups, 0, 'direct charges do not ask the customer to KEEP');
+  assert.equal(send.sent.length, 0);
   advance(47);
   await deposits.tick({ sendSms: send });
-  assert.equal(d.status, 'disputed', 'not before 48h');
+  assert.equal(d.status, 'recorded', 'direct charges are not released by BuzzCall');
   advance(1.5);
   const r2 = await deposits.tick({ sendSms: send });
-  assert.equal(r2.autoReleased, 1);
-  assert.equal(d.status, 'released');
-  assert.equal(d.dispute.resolution, 'vendor');
-  assert.equal(d.dispute.resolvedBy, 'auto');
-  assert.equal(outcomeFor(b).result_stage, 'dispute_resolved_vendor');
-  assert.equal(outcomeFor(b).dispute_resolution, 'vendor');
-  assert.equal(send.sent.length, 1, 'only one follow-up text');
+  assert.equal(r2.autoReleased, 0);
+  assert.equal(d.status, 'recorded');
+  assert.equal(d.dispute.resolution, null);
+  assert.equal(send.sent.length, 0, 'no KEEP follow-up and no auto-release text');
 });
 
 test('KEEP keeps the claim for admin review (no auto-release); KEEP only counts while a follow-up is pending', async (t) => {
@@ -263,24 +260,13 @@ test('KEEP keeps the claim for admin review (no auto-release); KEEP only counts 
   store.db.depositsMeta.offsetMs += (Date.parse(new Date(deposits.now()).toISOString().slice(0, 10) + 'T12:00:00Z') + 86400000) - deposits.now();
   pendingCheck(d);
   deposits.handleNoshowReply(b.phone, 'NO');
-  assert.equal(disputes.handleKeep(b.phone, 'KEEP'), null, 'follow-up not sent yet: KEEP is not consumed');
+  assert.equal(disputes.handleKeep(b.phone, 'KEEP'), null, 'no payout follow-up, so KEEP is not a money action');
   const send = capture();
   await deposits.tick({ sendSms: send });
-  assert.match(send.sent[0].body, /says they were there \(they checked in at .+\)\. Reply KEEP/);
-  await form('/twilio/sms', { From: b.phone, Body: 'Keep.' });
-  await settle();
-  assert.equal(d.dispute.customerReply, 'keep');
-  assert.ok(sentTo(b.phone).some((l) => /your claim stays open/.test(l)));
-  assert.ok(sentTo(OWNER).some((l) => /replied KEEP/.test(l)), 'admin buzzed');
-  advance(100);
-  await deposits.tick({ sendSms: send });
-  assert.equal(d.status, 'disputed');
-  assert.equal(d.dispute.resolution, null);
-  // Admin decides: refund -> resolved for the customer.
-  await deposits.refundDeposit(d);
-  assert.equal(d.dispute.resolution, 'customer');
-  assert.equal(outcomeFor(b).dispute_resolution, 'customer');
-  assert.equal(outcomeFor(b).result_stage, 'refunded');
+  assert.equal(send.sent.length, 0);
+  assert.equal((await deposits.refundDeposit(d)).reason, 'vendor_dashboard');
+  assert.equal(d.status, 'recorded');
+  assert.equal(d.reputation, 'checked_in_noshow');
 });
 
 test('quiet hours: the follow-up waits until 8am shop time', async (t) => {
@@ -294,13 +280,9 @@ test('quiet hours: the follow-up waits until 8am shop time', async (t) => {
   deposits.handleNoshowReply(b.phone, 'NO');
   const send = capture();
   await deposits.tick({ sendSms: send });
-  assert.equal(send.sent.length, 0, 'no text at night');
-  const p = shopTime.parts(Date.parse(d.dispute.followupDueAt), 'America/New_York');
-  assert.equal(p.hour, 8);
-  assert.equal(p.day, 11);
-  store.db.depositsMeta.offsetMs += Date.parse('2026-11-11T08:00:30-05:00') - deposits.now();
-  await deposits.tick({ sendSms: send });
-  assert.equal(send.sent.length, 1);
+  assert.equal(send.sent.length, 0, 'no KEEP text in the direct-charge model');
+  assert.equal(d.dispute.followupDueAt, null);
+  assert.equal(d.reputation, 'checked_in_noshow');
 });
 
 test('opt-out: an opted-out customer is never texted the follow-up and the claim waits for admin (no auto-release)', async (t) => {
@@ -314,10 +296,10 @@ test('opt-out: an opted-out customer is never texted the follow-up and the claim
   const send = capture();
   await deposits.tick({ sendSms: send });
   assert.equal(send.sent.length, 0);
-  assert.equal(d.dispute.followupSkipped, 'opted_out');
   advance(200);
   await deposits.tick({ sendSms: send });
-  assert.equal(d.status, 'disputed');
+  assert.equal(d.status, 'recorded');
+  assert.equal(d.reputation, 'checked_in_noshow');
 });
 
 test('repeat-claim flag: 2+ NO claims in 90 days flags the claim and the customer; threshold configurable; prepay flag stored', async (t) => {
@@ -429,10 +411,10 @@ test('demo fast-forward: advancing 48h in mock mode auto-releases a contested cl
   disputes.addEvidence(d, { source: 'portal', photo: { type: 'image/jpeg', data: Buffer.from([0xFF, 0xD8, 0xFF, 0xD9]).toString('base64'), bytes: 4 } });
   const post = (hours) => admin('/admin/deposits/demo/advance', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json', origin: URL0 }, body: JSON.stringify({ hours }) });
   const r1 = await (await post(0)).json();
-  assert.equal(r1.followups, 1);
+  assert.equal(r1.followups, 0);
   const r2 = await (await post(49)).json();
-  assert.equal(r2.autoReleased, 1);
-  assert.equal(d.status, 'released');
+  assert.equal(r2.autoReleased, 0);
+  assert.equal(d.status, 'recorded');
 });
 
 // Last: creating a vendor shop changes number routing for the rest of the process.
@@ -466,7 +448,7 @@ test('vendor portal: check-in button on the appointment day and proof upload for
     assert.equal(b.vendorCheckIn.source, 'portal');
     pendingCheck(d);
     const r = deposits.handleNoshowReply(b.phone, 'NO', { base: 'https://shop.example' });
-    assert.equal(d.status, 'disputed');
+    assert.equal(d.status, 'recorded');
     assert.match(r.adminAlert, new RegExp(`/admin/deposits\\?shop=${shop.id}`));
   });
   const pay = await (await fetch(`${URL0}/vendor`, { headers: { cookie } })).text();

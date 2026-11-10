@@ -121,30 +121,33 @@ function postRaw(pathname, { body, headers = {} }) {
   });
 }
 
-test('P1: signed platform webhook pays a vendor booking and rejects a bad session', async (t) => {
-  reset(t, { STRIPE_SECRET_KEY: TEST_KEY, STRIPE_WEBHOOK_SECRET: SECRET });
+test('P1: signed connect webhook pays a vendor booking and rejects a bad session', async (t) => {
+  reset(t, { STRIPE_SECRET_KEY: TEST_KEY, STRIPE_WEBHOOK_SECRET: SECRET, STRIPE_CONNECT_WEBHOOK_SECRET: SECRET });
   const created = await vendors.create({ name: 'Vendor Harden', email: 'vendor-harden@example.com', values: { BUSINESS_TYPE: 'plumbing', BUSINESS_NAME: 'Vendor Harden' } });
   const shop = vendors.get(created.shop.id);
   const bookingId = await vendors.run(shop.id, () => {
-    const b = bookingRow(49, { stripeSessionId: 'cs_vendor_ok', phone: '+14045550111' });
+    store.setOverride({ stripeConnect: { accountId: 'acct_vendor_ok', mode: 'test', chargesEnabled: true, source: 'onboarding', payoutsApproved: true } });
+    const b = bookingRow(49, { stripeSessionId: 'cs_vendor_ok', phone: '+14045550111', connectAccount: 'acct_vendor_ok' });
     store.save();
     return b.id;
   });
+  let n = 0;
   const session = (over = {}) => ({
-    id: 'evt_vendor_ok', type: 'checkout.session.completed', livemode: false,
+    id: `evt_vendor_${n++}`, type: 'checkout.session.completed', livemode: false, account: 'acct_vendor_ok',
     data: { object: { id: 'cs_vendor_ok', mode: 'payment', payment_status: 'paid', amount_total: 4900, currency: 'usd',
       client_reference_id: bookingId, metadata: { bookingId, shopId: shop.id },
       payment_intent: { id: 'pi_vendor', latest_charge: 'ch_vendor' }, ...over } },
   });
+  const postConnect = (signedEvent) => postRaw('/stripe/connect/webhook', { body: signedEvent.payload, headers: { 'stripe-signature': signedEvent.signature } });
   const badRef = signed(session({ client_reference_id: 'other-booking' }));
-  const ignored = await postRaw('/stripe/webhook', { body: badRef.payload, headers: { 'stripe-signature': badRef.signature } });
+  const ignored = await postConnect(badRef);
   assert.equal(ignored.status, 200);
   assert.match(ignored.body, /ignored/);
   const badAmount = signed(session({ amount_total: 100, client_reference_id: bookingId }));
-  const amountRes = await postRaw('/stripe/webhook', { body: badAmount.payload, headers: { 'stripe-signature': badAmount.signature } });
+  const amountRes = await postConnect(badAmount);
   assert.match(amountRes.body, /amount/);
   const ok = signed(session());
-  const paidRes = await postRaw('/stripe/webhook', { body: ok.payload, headers: { 'stripe-signature': ok.signature } });
+  const paidRes = await postConnect(ok);
   assert.equal(paidRes.status, 200, paidRes.body);
   assert.equal(JSON.parse(paidRes.body).received, true);
   assert.equal(JSON.parse(paidRes.body).ignored, undefined);
@@ -170,43 +173,22 @@ test('P2/P6: livemode guard, source_transaction, debt after success, amount in t
   assert.equal(d.stripeMode, 'test');
   assert.equal(d.livemode, false);
   d.stripeMode = 'live';
-  assert.equal((await deposits.releaseDeposit(d)).reason, 'mode_mismatch');
+  assert.equal((await deposits.releaseDeposit(d)).reason, 'direct_model');
   assert.equal(deposits.vendorDebt('acct_express_1'), 500, 'debt untouched on mode mismatch');
-  d.stripeMode = 'test';
-  f.transfers.create = async () => { throw new Error('stripe down'); };
-  const failed = await deposits.releaseDeposit(d);
-  assert.equal(failed.ok, false);
-  assert.equal(deposits.vendorDebt('acct_express_1'), 500, 'debt not taken when the transfer throws');
-  assert.notEqual(d.status, 'released');
-  f.transfers.create = async (p, o) => { f.calls.transfers.push({ p, o }); return { id: 'tr_ok', amount: p.amount }; };
-  const ok = await deposits.releaseDeposit(d);
-  assert.equal(ok.ok, true);
-  assert.equal(f.calls.transfers[0].p.source_transaction, 'ch_test');
-  assert.match(f.calls.transfers[0].o.idempotencyKey, /^dep-release-.+-4400$/);
-  assert.equal(d.releaseIdempotencyKey, f.calls.transfers[0].o.idempotencyKey);
-  assert.equal(deposits.vendorDebt('acct_express_1'), 0);
+  assert.equal(f.calls.transfers.length, 0, 'no platform transfer in the direct model');
   const archived = deposits.archiveNonLive();
   assert.ok(archived.archived >= 1);
   assert.equal(d.archived, true);
-  assert.equal((await deposits.releaseDeposit(d)).reason, 'archived');
 });
 
-test('P5: refund during release does not leave both a transfer and a refund', async (t) => {
+test('P5: direct charges do not release or refund from BuzzCall', async (t) => {
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY });
-  const f = fakeStripe();
+  fakeStripe();
   store.setOverride({ stripeConnect: { accountId: 'acct_express_1', mode: 'test', chargesEnabled: true, source: 'onboarding' } });
   const { d } = paid(40);
-  let go;
-  f.transfers.create = (p, o) => new Promise((resolve) => { f.calls.transfers.push({ p, o }); go = () => resolve({ id: 'tr_race', amount: p.amount }); });
-  const pending = deposits.releaseDeposit(d);
-  await new Promise((r) => { const i = setInterval(() => { if (go) { clearInterval(i); r(); } }, 5); });
-  const queued = await deposits.refundDeposit(d, { reason: 'admin' });
-  assert.equal(queued.reason, 'release_in_progress');
-  go();
-  await pending;
-  assert.equal(d.status, 'refunded');
-  assert.ok(d.transferReversalId, 'the in-flight transfer is reversed');
-  assert.ok(d.refundId);
+  assert.equal((await deposits.releaseDeposit(d)).reason, 'direct_model');
+  assert.equal((await deposits.refundDeposit(d)).reason, 'vendor_dashboard');
+  assert.equal(d.status, 'recorded');
 });
 
 test('P5/P14: partial refund does not mark the deposit refunded; full refund after release reverses', async (t) => {
@@ -214,12 +196,11 @@ test('P5/P14: partial refund does not mark the deposit refunded; full refund aft
   const f = fakeStripe();
   store.setOverride({ stripeConnect: { accountId: 'acct_express_1', mode: 'test', chargesEnabled: true, source: 'onboarding' } });
   const { d } = paid(49, { paymentIntentId: 'pi_part', chargeId: 'ch_part' });
-  await deposits.releaseDeposit(d);
   await deposits.handleWebhookEvent({ type: 'charge.refunded', livemode: false, data: { object: { id: 'ch_part', payment_intent: 'pi_part', amount: 4900, amount_refunded: 1000, refunded: false } } });
-  assert.equal(d.status, 'released');
+  assert.notEqual(d.status, 'refunded');
   assert.equal(d.partialRefund, true);
   assert.equal(d.refundedCents, 1000);
-  assert.equal(f.calls.reversals.length, 1);
+  assert.equal(f.calls.reversals.length, 0, 'the shop refunds in Stripe; BuzzCall does not reverse a transfer');
   await deposits.handleWebhookEvent({ type: 'charge.refunded', livemode: false, data: { object: { id: 'ch_part', payment_intent: 'pi_part', amount: 4900, amount_refunded: 4900, refunded: true } } });
   assert.equal(d.status, 'refunded');
 });
@@ -233,14 +214,13 @@ test('P3: dispute, early fraud warning, refund update, payout failure, and new-v
   store.setOverride({ stripeConnect: { accountId: 'acct_express_1', mode: 'test', chargesEnabled: true, source: 'onboarding' } });
   const { d } = paid(49, { paymentIntentId: 'pi_disp', chargeId: 'ch_disp' });
   await deposits.handleWebhookEvent({ type: 'charge.dispute.created', livemode: false, data: { object: { id: 'dp_1', charge: 'ch_disp', payment_intent: 'pi_disp', amount: 4900, reason: 'fraudulent', status: 'needs_response' } } });
-  assert.equal(d.status, 'disputed');
-  assert.equal(d.payoutPaused, true);
-  assert.equal(f.calls.disputes.length, 1);
+  assert.equal(d.cardDispute.id, 'dp_1');
+  assert.equal(d.reputation, 'card_dispute');
+  assert.equal(f.calls.disputes.length, 0);
   assert.match(alerts.at(-1).subject, /dispute/);
   const { d: released } = paid(20, { paymentIntentId: 'pi_efw', chargeId: 'ch_efw' });
-  await deposits.releaseDeposit(released);
   await deposits.handleWebhookEvent({ type: 'radar.early_fraud_warning.created', livemode: false, data: { object: { id: 'issfr_1', charge: 'ch_efw', payment_intent: 'pi_efw', fraud_type: 'unauthorized_use_of_card' } } });
-  assert.equal(released.status, 'refunded');
+  assert.notEqual(released.status, 'refunded');
   assert.ok(released.fraudWarning);
   await deposits.handleWebhookEvent({ type: 'charge.refund.updated', livemode: false, data: { object: { id: 're_x', status: 'failed', charge: 'ch_missing' } } });
   assert.ok(alerts.some((a) => /refund update/i.test(a.subject)));
@@ -252,12 +232,8 @@ test('P3: dispute, early fraud warning, refund update, payout failure, and new-v
     store.setOverride({ stripeConnect: { accountId: 'acct_new', mode: 'test', chargesEnabled: true, source: 'onboarding' } });
     const b = bookingRow(30, { status: 'confirmed', paid: true, paidAt: new Date().toISOString(), phone: '+14045550177' });
     const row = deposits.onBookingPaid(b, { chargeId: 'ch_new', paymentIntentId: 'pi_new', livemode: false });
-    const wait = Date.parse(row.releaseAt) - Date.parse(b.slotEnd);
-    assert.ok(wait >= 7 * 86400000 - 1000, 'first vendor jobs wait the new-vendor hold');
-    const early = await deposits.releaseDeposit(row);
-    assert.equal(early.reason, 'too_early');
-    const forced = await deposits.releaseDeposit(row, { force: true, by: 'admin' });
-    assert.equal(forced.ok, true);
+    assert.equal((await deposits.releaseDeposit(row)).reason, 'direct_model');
+    assert.equal(row.status, 'recorded');
   });
 });
 
@@ -266,7 +242,7 @@ test('P10: unverified env fallback is not attached and release waits for charges
   const { d } = paid(25);
   assert.equal(d.connectAccountId, null);
   assert.equal(d.payoutPendingConnect, true);
-  assert.equal((await deposits.releaseDeposit(d)).reason, 'not_connected');
+  assert.equal((await deposits.releaseDeposit(d)).reason, 'direct_model');
   assert.notEqual(d.connectAccountId, 'acct_env_unverified');
 });
 
@@ -279,13 +255,14 @@ test('P13: only an exact NO or NOSHOW pauses the payout', (t) => {
     d.noshowSentAt = new Date().toISOString();
     d.phone = b.phone;
     assert.equal(deposits.handleNoshowReply(b.phone, body), null, body);
-    assert.equal(d.status, 'scheduled', body);
+    assert.equal(d.status, 'recorded', body);
   }
   const { b, d } = paid(10, { phone: '+15550001999' });
   d.noshowSentAt = new Date().toISOString();
   d.phone = b.phone;
   assert.equal(deposits.handleNoshowReply(b.phone, 'NO!').answer, 'no');
-  assert.equal(d.status, 'paused');
+  assert.equal(d.reputation, 'noshow');
+  assert.equal(d.status, 'recorded');
   const again = paid(10, { phone: '+15550001888' });
   again.d.noshowSentAt = new Date().toISOString();
   again.d.phone = again.b.phone;
@@ -305,7 +282,7 @@ test('P7: text-only evidence is not auto-released; reused photos and weak GPS ar
   const tick = await deposits.tick({ sendSms: async () => ({ ok: true }) });
   assert.equal(tick.autoReleased, 0);
   assert.equal(d.dispute.adminReview, true);
-  assert.equal(d.status, 'paused');
+  assert.equal(d.status, 'recorded');
 
   const photo = { type: 'image/jpeg', data: Buffer.from([0xFF, 0xD8, 0xFF, 0xD9]).toString('base64'), bytes: 4 };
   const first = paid(15, { phone: '+14045550223' });
@@ -372,9 +349,8 @@ test('P15/P17/P19: force-release confirm, audit log, live+demo boot refusal, EIN
   assert.doesNotMatch(opened.adminAlert, /\+14045550444/);
   const origin = 'http://shop.example';
   const no = await postRaw(`/admin/deposits/${d.id}/release`, { body: '{}', headers: { ...auth, origin, accept: 'application/json' } });
-  assert.equal(no.status, 409);
-  const yes = await postRaw(`/admin/deposits/${d.id}/release`, { body: JSON.stringify({ confirm_release: '1' }), headers: { ...auth, origin, accept: 'application/json' } });
-  assert.equal(yes.status, 200, yes.body);
+  assert.equal(no.status, 200);
+  assert.equal(JSON.parse(no.body).reason, 'direct_model');
   assert.ok(store.root.db.moneyAudit.some((row) => row.action === 'release' && row.depositId === d.id && row.ip));
 
   const savedNode = process.env.NODE_ENV;

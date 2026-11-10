@@ -217,8 +217,13 @@ function openOnNo(d, { base = '' } = {}) {
   const checkInRec = d.vendorCheckIn || (b && b.vendorCheckIn) || null;
   if (checkInRec && !d.vendorCheckIn) d.vendorCheckIn = checkInRec;
   const at = iso();
-  if (checkInRec) {
-    // Vendor checked in: hold for admin review instead of a plain pause.
+  const direct = !!(dep.directModel && dep.directModel());
+  if (direct) {
+    d.noshowReply = 'no';
+    d.reputation = checkInRec ? 'checked_in_noshow' : 'noshow';
+    d.updatedAt = at;
+    outcome('noShowReported', d);
+  } else if (checkInRec) {
     if (!['refunded', 'released'].includes(d.status)) {
       d.status = 'disputed';
       d.payoutPaused = true;
@@ -239,34 +244,36 @@ function openOnNo(d, { base = '' } = {}) {
     repeatClaim: repeat.flagged ? { count: repeat.count, threshold: repeat.threshold } : null,
   };
   timeline(d, 'customer_no', `Customer replied NO (says the vendor did not show)${repeat.flagged ? `. Repeat claimer: ${repeat.count} claims in ${cfg().flagWindowDays} days` : ''}`, at);
-  if (checkInRec) queueFollowup(d);
+  if (checkInRec && !direct) queueFollowup(d);
   const name = (b && b.name) || 'A customer';
   const when = (b && b.slotLabel) || timeOf(b && b.slotStart);
   const link = proofLink(base, d);
-  const held = ['paused', 'disputed'].includes(d.status);
-  const suffix = !held ? ' BuzzCall will review it.' : checkInRec ? ` You checked in at ${timeOf(checkInRec.at)}, so your payout is on hold for review, not cancelled.` : ' Your payout is paused until this is reviewed.';
+  const held = !direct && ['paused', 'disputed'].includes(d.status);
+  const suffix = direct ? ' BuzzCall does not hold this deposit. Any refund is in your Stripe Dashboard.' : !held ? ' BuzzCall will review it.' : checkInRec ? ` You checked in at ${timeOf(checkInRec.at)}, so your payout is on hold for review, not cancelled.` : ' Your payout is paused until this is reviewed.';
   const vendorText = `BuzzCall: ${name} says you didn't show for ${when}. Reply with a photo or details, or open ${link} to respond.${suffix}`;
   timeline(d, 'vendor_notified', 'Vendor texted a reply-with-proof request', at);
   const shop = shopName(d);
   const sid = shopContext.shopId();
   const review = `${linkBase(base)}/admin/deposits${sid ? `?shop=${encodeURIComponent(sid)}` : ''}`;
   const adminAlert = `BUZZ ${shop}: NO-SHOW claim, booking ${d.bookingId} ($${dep.money(d.amountCents)}). `
-    + (checkInRec ? `VENDOR CHECKED IN ${timeOf(checkInRec.at)}${checkInRec.geo ? ' with location' : ''}: payout held as DISPUTED for your review. ` : 'Vendor did not check in: payout PAUSED. ')
+    + (direct ? 'Record only: the customer paid the shop directly. ' : '')
+    + (checkInRec ? `VENDOR CHECKED IN ${timeOf(checkInRec.at)}${checkInRec.geo ? ' with location' : ''}${direct ? '. ' : ': payout held as DISPUTED for your review. '}` : (direct ? 'Vendor did not check in. ' : 'Vendor did not check in: payout PAUSED. '))
     + (repeat.flagged ? `REPEAT CLAIMER: ${repeat.count} no-show claims in ${cfg().flagWindowDays} days. ` : '')
     + `Customer: ${sec.maskPhone(d.phone)}. Review: ${review}`;
   d.updatedAt = at;
   store.save();
   return {
     deposit: d, answer: 'no',
-    reply: checkInRec ? "Thanks for letting us know. We're holding the payment while we review your claim and will follow up." : "Thanks, we've paused the payment and will follow up within 1 business day.",
+    reply: direct ? "Thanks for telling us. BuzzCall does not hold this deposit. Contact the shop if you want a refund." : checkInRec ? "Thanks for letting us know. We're holding the payment while we review your claim and will follow up." : "Thanks, we've paused the payment and will follow up within 1 business day.",
     vendorText, adminAlert, disputed: !!checkInRec, repeatClaim: d.dispute.repeatClaim,
   };
 }
 
 // ---------- vendor evidence ----------
-const isOpen = (d) => !!(d && d.dispute && !d.dispute.resolution && ['paused', 'disputed'].includes(d.status));
+const isOpen = (d) => !!(d && d.dispute && !d.dispute.resolution && (['paused', 'disputed', 'recorded', 'scheduled'].includes(d.status) || d.reputation === 'noshow' || d.reputation === 'checked_in_noshow'));
 function openDisputes() { return deposits().list().filter(isOpen); }
 function queueFollowup(d) {
+  if (deposits().directModel && deposits().directModel()) return;
   const x = d.dispute;
   if (!x || x.followupSentAt || x.followupDueAt || x.customerReply || x.resolution) return;
   x.followupDueAt = iso();
@@ -461,7 +468,11 @@ async function tick({ sendSms } = {}) {
         continue;
       }
     }
-    // 2) Auto-release after no reply, only with an in-window check-in AND a photo that is not reused.
+    // 2) Auto-release after no reply. Direct charges have no payout to release: the note stays on the record.
+    if (dep.directModel && dep.directModel()) {
+      if (x.autoReleaseAt) { x.autoReleaseAt = null; x.adminReview = true; x.adminReviewReason = 'direct_model'; }
+      continue;
+    }
     if (x.followupSentAt && !x.customerReply && x.autoReleaseAt && Date.parse(x.autoReleaseAt) <= now()) {
       const checkInRec = d.vendorCheckIn || (store.findBooking(d.bookingId) || {}).vendorCheckIn;
       const freshPhoto = (x.evidence || []).some((e) => (e.photoId || (e.media || []).length) && !e.photoReused);

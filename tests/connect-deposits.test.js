@@ -18,8 +18,8 @@ Object.assign(process.env, {
   DATA_DIR: dir, TZ: 'UTC', BUSINESS_TZ: 'UTC', NODE_ENV: 'test', ADMIN_PASSWORD: ADMIN,
   BUSINESS_NAME: 'Test Plumbing', OWNER_PHONE: '+15550000099', BOOKING_ENABLED: '1', DEPOSIT_ENABLED: '1',
   BUSINESS_DAYS: '0,1,2,3,4,5,6', BUSINESS_HOURS: '00:00-23:59', BOOKING_LEAD_MINUTES: '0',
-  PUBLIC_BASE_URL: 'https://shop.example', DEPOSIT_RELEASE_HOURS: '24', NOSHOW_CHECK_HOURS: '12',
-  DEPOSIT_PLATFORM_FEE_PCT: '0',
+  PUBLIC_BASE_URL: 'https://shop.example',   DEPOSIT_RELEASE_HOURS: '24', NOSHOW_CHECK_HOURS: '12',
+  DEPOSIT_PLATFORM_FEE_PCT: '0', DEPOSIT_MODEL: 'platform_hold',
 });
 
 const store = require('../src/store');
@@ -108,8 +108,9 @@ test('onboarding link creation (mocked Stripe): Express account + account link w
   const r = await connect.onboard('https://shop.example', { name: 'Test Plumbing', url: 'https://shop.example' });
   assert.equal(r.url, 'https://connect.stripe.com/setup/e/test');
   assert.equal(f.calls.create.length, 1);
-  assert.equal(f.calls.create[0].type, 'express');
-  assert.ok(f.calls.create[0].capabilities.transfers.requested);
+  assert.equal(f.calls.create[0].type, undefined);
+  assert.equal(f.calls.create[0].controller.losses.payments, 'stripe');
+  assert.ok(f.calls.create[0].capabilities.card_payments.requested);
   assert.deepEqual(f.calls.links[0], {
     account: 'acct_express_1', type: 'account_onboarding',
     refresh_url: 'https://shop.example/admin/connect/refresh',
@@ -131,14 +132,13 @@ test('holding at booking: platform Checkout (no stripeAccount); deposit row sche
   const url = await booking.depositLink(b, 'https://shop.example');
   assert.equal(url, 'https://checkout.stripe.com/c/pay/cs_test_dep');
   assert.equal(f.calls.sessions.length, 1);
-  assert.equal(f.calls.sessions[0].o, undefined); // platform charge
+  assert.deepEqual(f.calls.sessions[0].o, { stripeAccount: 'acct_express_1' });
   assert.equal(f.calls.sessions[0].p.payment_intent_data.transfer_data, undefined);
-  assert.equal(f.calls.sessions[0].p.payment_intent_data.transfer_group, b.id);
-  // Even without Connect, deposits still work
+  assert.equal(f.calls.sessions[0].p.payment_intent_data.application_fee_amount, undefined);
   store.setOverride({});
   const b2 = fakeBooking(20);
-  assert.ok(await booking.depositLink(b2, 'https://shop.example'));
-  assert.equal(f.calls.sessions.length, 2);
+  await assert.rejects(() => booking.depositLink(b2, 'https://shop.example'), { status: 409 });
+  assert.equal(f.calls.sessions.length, 1);
 });
 
 test('mock hold + release after 24h', async (t) => {

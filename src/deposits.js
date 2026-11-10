@@ -1,9 +1,8 @@
 'use strict';
-// Deposit protection via Stripe Connect (separate charges + transfers).
-// Customer pays BuzzCall's platform account; the vendor share is transferred only after the appointment
-// (DEPOSIT_RELEASE_HOURS, default 24). Destination charges transfer immediately, so they cannot hold funds
-// until after the job — separate charges + transfers cleanly support delayed payout, refunds before transfer,
-// and transfer reversals after release.
+// Deposit ledger. The default model (DEPOSIT_MODEL=direct) records a direct charge on the shop's Stripe
+// account and does not transfer, release, refund, or claw back. DEPOSIT_MODEL=platform_hold (or transfer)
+// keeps the old separate-charges path available for tests; product checkout does not use it.
+// YES/NO check-in is reputation and flags only while direct mode is on.
 //
 // Persist state in store.db.deposits (array) and store.db.vendorDebt ({ [accountId]: cents }).
 // Mock mode (no STRIPE_SECRET_KEY): same state machine, fake ids, mock clock (offsetMs) for demo fast-forward.
@@ -22,6 +21,12 @@ const num = (v, d) => (String(v ?? '').trim() !== '' && Number.isFinite(Number(v
 const DAY = 86400000;
 const HOUR = 3600000;
 
+// direct (default): the customer's card is charged on the shop's Stripe account. BuzzCall does not
+// transfer, hold, release, or claw back. platform_hold keeps the old separate-charges path inert-off.
+function directModel() {
+  const v = String(process.env.DEPOSIT_MODEL || 'direct').trim().toLowerCase();
+  return v !== 'platform_hold' && v !== 'transfer';
+}
 const cfg = () => ({
   releaseHours: Math.max(0, num(process.env.DEPOSIT_RELEASE_HOURS, 24)),
   noshowHours: Math.max(0, num(process.env.NOSHOW_CHECK_HOURS, 12)),
@@ -294,7 +299,8 @@ function createHeld(booking, payment = {}) {
     });
     if (d.connectAccountId && d.stripeMode && d.stripeMode !== stripeMode) d.connectAccountId = null;
   }
-  if (d.status === 'held') d.status = 'scheduled';
+  if (directModel()) d.status = 'recorded';
+  else if (d.status === 'held') d.status = 'scheduled';
   recordEvent('held', d.id, { bookingId: booking.id, amountCents, stripeMode: d.stripeMode });
   store.save();
   indexPayment(d);
@@ -313,6 +319,7 @@ function restoreLease(d) {
   store.save();
 }
 async function releaseDeposit(d, { force = false, by = 'admin' } = {}) {
+  if (directModel()) return { ok: false, reason: 'direct_model', deposit: d };
   if (!d || d.archived) return { ok: false, reason: d && d.archived ? 'archived' : 'not_found' };
   if (d.status === 'refunded' || d.status === 'refunding') return { ok: false, reason: d.status === 'refunding' ? 'refunding' : 'refunded' };
   if (d.status === 'released' && d.transferId) return { ok: true, already: true, deposit: d };
@@ -435,6 +442,7 @@ async function releaseDeposit(d, { force = false, by = 'admin' } = {}) {
 }
 
 async function refundDeposit(d, { reason = 'admin', amountCents = null } = {}) {
+  if (directModel()) return { ok: false, reason: 'vendor_dashboard', deposit: d };
   if (!d) return { ok: false, reason: 'not_found' };
   if (d.archived) return { ok: false, reason: 'archived' };
   if (d.status === 'refunded') return { ok: true, already: true, deposit: d };
@@ -540,7 +548,7 @@ function pauseForNoshow(d) {
 function pendingNoshow(phone) {
   if (!phone) return null;
   return bucket().deposits.find((d) => d.phone === phone && d.noshowSentAt && !d.noshowReply
-    && ['scheduled', 'held', 'paused', 'disputed'].includes(d.status)) || null;
+    && ['scheduled', 'held', 'paused', 'disputed', 'recorded'].includes(d.status)) || null;
 }
 
 // YES/NO reply handler. Returns null if this number has no pending check (so SMS conversation continues).
@@ -603,6 +611,7 @@ async function sendDueNoshowChecks({ sendSms } = {}) {
 }
 
 async function processDueReleases() {
+  if (directModel()) return [];
   const out = [];
   for (const d of bucket().deposits) {
     if (d.archived || !modeOk(d)) continue;
@@ -638,7 +647,7 @@ function attachPayable() {
   let n = 0;
   for (const d of bucket().deposits) {
     if (d.archived || !modeOk(d)) continue;
-    if (!['held', 'scheduled', 'paused', 'disputed'].includes(d.status)) continue;
+    if (!['held', 'scheduled', 'paused', 'disputed', 'recorded'].includes(d.status)) continue;
     if (d.connectAccountId && d.connectAccountId !== id) continue;
     if (!d.connectAccountId || d.payoutPendingConnect) {
       d.connectAccountId = id;
@@ -670,7 +679,46 @@ async function mockAdvance(hours, { sendSms } = {}) {
   return { now: iso(), offsetMs: bucket().depositsMeta.offsetMs, ...result };
 }
 
+function eventSeen(id) {
+  return !!(id && store.root.db.processedStripeEvents && store.root.db.processedStripeEvents[id]);
+}
+function rememberEvent(id) {
+  if (!id || eventSeen(id)) return;
+  const root = store.root;
+  const seen = (root.db.processedStripeEvents ||= {});
+  seen[id] = Date.now();
+  const keys = Object.keys(seen);
+  if (keys.length > 5000) delete seen[keys[0]];
+  root.save();
+}
+function mirrorRefund(d, refundedCents, { reason = 'charge.refunded' } = {}) {
+  if (!d) return false;
+  const next = Math.max(d.refundedCents || 0, Math.round(Number(refundedCents) || 0));
+  d.refundedCents = next;
+  d.refundNoted = true;
+  const full = (d.amountCents || 0) > 0 && next >= d.amountCents;
+  if (full) { d.status = 'refunded'; d.refundedAt = iso(); }
+  else if (next > 0) d.partialRefund = true;
+  d.updatedAt = iso();
+  recordEvent(full ? 'refunded_mirrored' : 'partial_refund_mirrored', d.id, { refundedCents: next, reason });
+  store.save();
+  return true;
+}
+function mirrorDispute(d, dispute, { closed = false } = {}) {
+  if (!d || !dispute) return false;
+  d.cardDispute = {
+    id: dispute.id || null, amount: dispute.amount || null, currency: dispute.currency || d.currency,
+    reason: dispute.reason || null, status: dispute.status || (closed ? 'closed' : 'needs_response'),
+    closed: !!closed, at: iso(),
+  };
+  d.reputation = closed ? d.reputation : 'card_dispute';
+  d.updatedAt = iso();
+  recordEvent(closed ? 'dispute_closed' : 'dispute_created', d.id, { disputeId: dispute.id, status: dispute.status });
+  store.save();
+  return true;
+}
 async function applyExternalRefund(d, refundedCents, { reason = 'webhook' } = {}) {
+  if (directModel()) return mirrorRefund(d, refundedCents, { reason });
   if (!d) return false;
   if (d.stripeMode && d.stripeMode !== connect.mode()) {
     recordEvent('refund_mode_mismatch', d.id, { stripeMode: d.stripeMode, keyMode: connect.mode() });
@@ -720,6 +768,14 @@ async function applyExternalRefund(d, refundedCents, { reason = 'webhook' } = {}
 }
 
 async function onCardDispute(d, dispute, { closed = false } = {}) {
+  if (directModel()) {
+    const ok = mirrorDispute(d, dispute, { closed });
+    if (ok) {
+      const shop = d.shopName || env.BUSINESS_NAME || 'Shop';
+      await alertAdmin(`BUZZ ${shop}: card dispute ${dispute.id || ''} ${closed ? (dispute.status || 'closed') : 'opened'} on booking ${d.bookingId}. The shop handles this in its own Stripe Dashboard. Customer ${sec.maskPhone(d.phone || '')}.`, closed ? 'BuzzCall: dispute closed' : 'BuzzCall: card dispute');
+    }
+    return ok;
+  }
   if (!d || !dispute) return false;
   d.cardDispute = {
     id: dispute.id || null, amount: dispute.amount || null, currency: dispute.currency || d.currency,
@@ -895,7 +951,7 @@ function summary() {
 module.exports = {
   cfg, now, list, find, findByBooking, findByPaymentIntent, vendorDebt, setVendorDebt, addVendorDebt,
   platformFeeCents, appointmentMs, releaseAtFor, noshowAtFor, nextAllowedSend, hasSmsConsent,
-  createHeld, onBookingPaid, releaseDeposit, refundDeposit, pauseForNoshow,
+  createHeld, onBookingPaid, releaseDeposit, refundDeposit, pauseForNoshow, directModel, eventSeen, rememberEvent, mirrorRefund, mirrorDispute,
   pendingNoshow, handleNoshowReply, sendDueNoshowChecks, processDueReleases, tick, mockAdvance,
   handleWebhookEvent, summary, money, sessionProblem, chargeFromSession, stripeModeOf, modeOk,
   velocityBlock, archiveNonLive, attachPayable, lookupPayment, indexPayment, replyWord, setAlert,

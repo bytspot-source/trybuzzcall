@@ -76,7 +76,7 @@ function validateSettings(body) {
     const number = Number(values[key]);
     if (!Number.isFinite(number) || number < min || number > max || key !== 'DEPOSIT_AMOUNT' && !Number.isInteger(number)) throw vendors.error(`Invalid ${key.toLowerCase().replaceAll('_',' ')}.`);
   }
-  const depositCap = sec.num(process.env.DEPOSIT_AMOUNT_MAX, 150);
+  const depositCap = booking.depositCap();
   const nextDeposit = Number(values.DEPOSIT_AMOUNT);
   const prevDeposit = Number(store.getOverride().values?.DEPOSIT_AMOUNT);
   if (Number.isFinite(nextDeposit) && nextDeposit > depositCap && !(Number.isFinite(prevDeposit) && nextDeposit <= prevDeposit)) {
@@ -255,7 +255,8 @@ function register(app, { requireAdmin, BASE, sameOrigin }) {
   async function summary(shop) {
     if (shop.status === 'provisioning') return {...vendors.publicShop(shop),subscriptionStatus:'Not provisioned',leadCount:0,bookingCount:0,payoutStatus:'Not connected'};
     return vendors.run(shop.id,()=>({...vendors.publicShop(shop),subscriptionStatus:billing.summary().subscription?.status || 'No subscription',
-      leadCount:store.db.leads.length,bookingCount:store.db.bookings.length,payoutStatus:connect.summary().label}),{suspended:true});
+      leadCount:store.db.leads.length,bookingCount:store.db.bookings.length,payoutStatus:connect.summary().label,
+      needsDepositApproval:!!(connect.summary().accountId && connect.summary().needsPayoutApproval && !connect.summary().payoutsApproved)}),{suspended:true});
   }
   app.get('/admin',requireAdmin,safe(async(req,res)=>{
     const shops = await Promise.all(vendors.all().map(summary));
@@ -286,7 +287,7 @@ function register(app, { requireAdmin, BASE, sameOrigin }) {
   app.post('/admin/vendors/:id/deposit-amount', requireAdmin, safe(async (req, res) => {
     if (!bool(req.body.confirm)) throw vendors.error('Confirm the deposit amount.', 409);
     const amount = Number(req.body.amount);
-    const cap = sec.num(process.env.DEPOSIT_AMOUNT_MAX, 150);
+    const cap = booking.depositCap();
     if (!Number.isFinite(amount) || amount < 0 || amount > 10000) throw vendors.error('Enter a deposit amount from 0 to 10000.');
     if (amount > cap && !bool(req.body.confirm_above_cap)) throw vendors.error(`Confirm raising the deposit above the $${cap} cap.`, 409);
     await vendors.run(req.params.id, async () => {

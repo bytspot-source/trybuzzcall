@@ -61,8 +61,10 @@ const unsigned = (ev) => req('/stripe/webhook', { method: 'POST', headers: { 'co
 test('stripe webhook: unsigned mock events still work in local/demo mode', async (t) => {
   quiet(t);
   const b = fakeBooking();
-  assert.equal((await unsigned(paidEvent(b.id))).status, 200);
-  assert.equal(store.findBooking(b.id).paid, true);
+  const res = await unsigned(paidEvent(b.id));
+  assert.equal(res.status, 200);
+  assert.match(await res.text(), /connected-account webhook/);
+  assert.equal(store.findBooking(b.id).paid, false, 'platform webhook does not collect a direct charge');
 });
 test('stripe webhook: unsigned events refused in production without DEMO_MODE, accepted with DEMO_MODE=1', async (t) => {
   quiet(t);
@@ -71,8 +73,9 @@ test('stripe webhook: unsigned events refused in production without DEMO_MODE, a
   assert.equal((await unsigned(paidEvent(b.id))).status, 503);
   assert.equal(store.findBooking(b.id).paid, false);
   process.env.DEMO_MODE = '1';
-  assert.equal((await unsigned(paidEvent(b.id))).status, 200);
-  assert.equal(store.findBooking(b.id).paid, true);
+  const ok = await unsigned(paidEvent(b.id));
+  assert.equal(ok.status, 200);
+  assert.equal(store.findBooking(b.id).paid, false);
   delete process.env.DEMO_MODE;
 });
 test('stripe webhook: Stripe key set but no webhook secret -> unsigned refused (503), nothing applied', async (t) => {
@@ -94,7 +97,8 @@ test('stripe webhook: with a secret only verified events pass; errors do not ech
   const payload = JSON.stringify(paidEvent(b.id));
   const ok = await req('/stripe/webhook', { method: 'POST', headers: { 'content-type': 'application/json', 'stripe-signature': Stripe.webhooks.generateTestHeaderString({ payload, secret }) }, body: payload });
   assert.equal(ok.status, 200);
-  assert.equal(store.findBooking(b.id).paid, true);
+  assert.match(await ok.text(), /connected-account webhook/);
+  assert.equal(store.findBooking(b.id).paid, false);
 });
 test('connect webhook: unsigned mock events refused in production without DEMO_MODE', async (t) => {
   quiet(t);

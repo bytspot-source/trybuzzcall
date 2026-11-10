@@ -70,33 +70,11 @@ app.post('/stripe/webhook', express.raw({ type: '*/*' }), async (req, res) => {
     }
   }
   catch (e) { console.error('billing webhook error:', e.message); return res.status(500).send('billing handler error'); }
-  // Platform deposit checkouts (separate charges + transfers): mark paid on the platform webhook.
+  // Deposit Checkout Sessions are direct charges on the connected account. They are fulfilled
+  // on /stripe/connect/webhook, not here. This endpoint stays for shop subscriptions.
   if (['checkout.session.completed', 'checkout.session.async_payment_succeeded'].includes(event.type)) {
-    const s = event.data.object;
-    if (!s.mode || s.mode === 'payment') {
-      if (s.payment_status === 'unpaid') return res.json({ received: true, ignored: 'unpaid' });
-      const id = s.metadata?.bookingId;
-      const booking = id && store.findBooking(id);
-      const problem = deposits.sessionProblem(s, booking);
-      if (problem) return res.json({ received: true, ignored: problem });
-      if (process.env.STRIPE_SECRET_KEY && typeof event.livemode === 'boolean' && !!event.livemode !== (connect.mode() === 'live')) {
-        return res.json({ received: true, ignored: 'livemode mismatch' });
-      }
-      let payment = deposits.chargeFromSession(s);
-      if (!payment.chargeId && payment.paymentIntentId && process.env.STRIPE_SECRET_KEY) {
-        try {
-          const stripe = connect.stripe();
-          if (stripe.paymentIntents?.retrieve) {
-            const pi = await stripe.paymentIntents.retrieve(payment.paymentIntentId);
-            const latest = pi && pi.latest_charge;
-            payment.chargeId = typeof latest === 'string' ? latest : latest?.id || null;
-            payment.cardFingerprint = payment.cardFingerprint || latest?.payment_method_details?.card?.fingerprint || null;
-            if (pi?.id) payment.paymentIntentId = pi.id;
-          }
-        } catch (e) { console.error('[deposits] payment intent retrieve failed:', e.message); }
-      }
-      await onPaid(id, { ...payment, sessionId: s.id, livemode: event.livemode, email: booking.email || null });
-    }
+    const s = event.data?.object || {};
+    if (!s.mode || s.mode === 'payment') return res.json({ received: true, ignored: 'direct charge; use the connected-account webhook' });
   }
   try { await deposits.handleWebhookEvent(event); } catch (e) { console.error('deposits webhook error:', e.message); }
   res.json({ received: true });
@@ -104,8 +82,8 @@ app.post('/stripe/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   return destination.shop ? vendors.run(destination.shop.id, handle, { suspended: true }) : handle();
 });
 // Stripe Connect webhook (endpoint scope "Connected accounts", its own signing secret STRIPE_CONNECT_WEBHOOK_SECRET).
-// Deposit Checkout Sessions are now platform charges; this endpoint handles account.updated / deauthorized and any
-// legacy connected-account checkout events. Only events for THIS shop's connected account are acted on.
+// Direct-charge Checkout Sessions are fulfilled here. event.account must be this shop's account, and a paid
+// session must match the booking's stored session id, amount, and currency. Only this shop's account is acted on.
 app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   let event;
   try {
@@ -121,35 +99,72 @@ app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, re
   const acct = connect.accountId();
   if (!event || !event.account || !acct || event.account !== acct) return ignore('account mismatch');
   if (!connect.livemodeOk(event)) return ignore('livemode mismatch');
+  if (event.id && deposits.eventSeen(event.id)) return res.json({ received: true, duplicate: true });
   const o = event.data?.object || {};
   try {
     switch (event.type) {
       case 'checkout.session.completed': case 'checkout.session.async_payment_succeeded': {
         if (o.mode && o.mode !== 'payment') return ignore('not a deposit');
-        const id = o.metadata?.bookingId || o.client_reference_id;
+        if (o.payment_status === 'unpaid') return ignore('unpaid');
+        const id = o.metadata?.bookingId;
         const b = id && store.findBooking(id);
-        if (!b) return ignore('unknown booking');
+        const problem = deposits.sessionProblem(o, b);
+        if (problem) return ignore(problem);
         if (b.connectAccount && b.connectAccount !== event.account) return ignore('booking account mismatch');
-        if (o.payment_status === 'paid' || o.payment_status === 'no_payment_required') await onPaid(id);
+        let payment = deposits.chargeFromSession(o);
+        if (!payment.chargeId && payment.paymentIntentId && process.env.STRIPE_SECRET_KEY) {
+          try {
+            const stripe = connect.stripe();
+            if (stripe.paymentIntents?.retrieve) {
+              const pi = await stripe.paymentIntents.retrieve(payment.paymentIntentId, {}, { stripeAccount: event.account });
+              const latest = pi && pi.latest_charge;
+              payment.chargeId = typeof latest === 'string' ? latest : latest?.id || null;
+              payment.cardFingerprint = payment.cardFingerprint || latest?.payment_method_details?.card?.fingerprint || null;
+            }
+          } catch (e) { console.error('[deposits] payment intent retrieve failed:', e.message); }
+        }
+        await onPaid(id, { ...payment, sessionId: o.id, livemode: event.livemode, email: b.email || null });
         break;
       }
       case 'checkout.session.async_payment_failed': {
-        const b = store.findBooking(o.metadata?.bookingId || o.client_reference_id);
-        if (b && !b.paid) { b.paymentFailed = true; store.save(); }
+        const b = store.findBooking(o.metadata?.bookingId);
+        if (b && b.stripeSessionId === o.id && !b.paid) { b.paymentFailed = true; store.save(); }
+        break;
+      }
+      case 'charge.refunded': {
+        const d = deposits.findByPaymentIntent(typeof o.payment_intent === 'string' ? o.payment_intent : o.payment_intent?.id)
+          || deposits.list().find((x) => x.chargeId === o.id);
+        if (d) deposits.mirrorRefund(d, o.amount_refunded != null ? o.amount_refunded : o.amount, { reason: 'charge.refunded' });
+        else return ignore('unknown charge');
+        break;
+      }
+      case 'charge.dispute.created':
+      case 'charge.dispute.updated':
+      case 'charge.dispute.closed': {
+        const chargeId = typeof o.charge === 'string' ? o.charge : o.charge?.id;
+        const pi = typeof o.payment_intent === 'string' ? o.payment_intent : o.payment_intent?.id;
+        const d = deposits.findByPaymentIntent(pi) || deposits.list().find((x) => x.chargeId === chargeId);
+        if (!d) return ignore('unknown charge');
+        deposits.mirrorDispute(d, o, { closed: event.type === 'charge.dispute.closed' });
+        await owner(null, `BUZZ ${env.BUSINESS_NAME || 'Shop'}: card dispute ${o.id || ''} ${event.type.endsWith('closed') ? 'closed' : 'opened'} on booking ${d.bookingId}. The shop handles it in Stripe. Customer ${sec.maskPhone(d.phone || '')}.`);
         break;
       }
       case 'account.updated':
         connect.applyAccount(o);
-        try { await deposits.handleWebhookEvent(event); } catch (e) { console.error('deposits account.updated:', e.message); }
+        if (!o.charges_enabled || (o.requirements && o.requirements.disabled_reason)) connect.markDepositsPaused(o.requirements?.disabled_reason || 'charges_disabled');
+        else if (o.charges_enabled && !(o.requirements && o.requirements.disabled_reason)) connect.clearDepositsPause();
         break;
       case 'account.application.deauthorized':
         connect.deauthorize();
-        await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: Stripe was disconnected from BuzzCall. Vendor payouts are paused until you reconnect Stripe. Customer deposits still work on the platform.`);
+        connect.markDepositsPaused('deauthorized');
+        await booking.voidOpenSessions(event.account);
+        await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: Stripe was disconnected. Deposit links are stopped and open checkout sessions are voided. The shop keeps any payment already taken and refunds it in Stripe.`);
         break;
       default: return ignore('unhandled type');
     }
   } catch (e) { console.error('connect webhook error:', e.message); return res.status(500).send('connect handler error'); }
   if (shopContext.current()) await vendors.flush(shopContext.current().store);
+  if (event && event.id) deposits.rememberEvent(event.id);
   res.json({ received: true });
   };
   return destination.shop ? vendors.run(destination.shop.id, handle, { suspended: true }) : handle();
@@ -645,8 +660,8 @@ const checkinNote = (b) => ` Tap when you arrive: ${disputes.checkinLink(BASE, b
 const money = (n) => (Number.isInteger(n) ? String(n) : Number(n).toFixed(2));
 const feeNote = (b) => b.lead_fee_status === 'waived' ? 'lead fee waived (pilot)' : `lead fee $${money(b.lead_fee || 0)}${b.lead_fee_status === 'collected' ? ' (auto-deducted)' : ''}`;
 
-// Deposits are held on BuzzCall's platform and paid out after the appointment (src/deposits.js).
-const refundNote = (b) => '. Deposit held by BuzzCall; payout after the appointment (or refund from admin Deposits).';
+// Deposits are direct charges on the shop's Stripe account (src/deposits.js). BuzzCall does not hold or transfer them.
+const refundNote = () => '. The customer paid your Stripe account directly. Refunds and disputes are handled in your Stripe Dashboard.';
 async function onPaid(id, payment = {}) {
   const { booking: b, changed, conflict } = booking.markPaid(id);
   if (!b || !changed) return b;
