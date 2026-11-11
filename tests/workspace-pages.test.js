@@ -38,6 +38,21 @@ function form(html, action) {
   return [...html.matchAll(/<form\b[^>]*>[\s\S]*?<\/form>/g)].map(match => match[0]).find(value => value.includes(`action="${action}"`));
 }
 
+test('deposit approval is an admin queue item and stays off the vendor page', () => {
+  const html = pages.platform({ shops: [{ ...shop, needsDepositApproval: true, stripeBusinessName: 'Own Stripe LLC', stripeBusinessUrl: 'https://own.example', stripeCountry: 'US', noshowCount: 2, disputeCount: 1 }], setups: [], storage: {}, mode: 'test', alerts: [{ kind: 'connect', body: 'Connect updated: charges off', at: '2026-11-11T00:00:00.000Z' }] });
+  assert.match(html, /Deposit account approvals/);
+  assert.match(html, /Own Stripe LLC/);
+  assert.match(html, /https:\/\/own\.example/);
+  assert.match(html, />US</);
+  assert.match(html, /No-shows 2/);
+  assert.match(html, /Disputes 1/);
+  assert.match(html, /Connect updated: charges off/);
+  assert.ok(form(html, '/admin/vendors/shop-own/connect/approve'), 'approve form');
+  const vendor = admin.renderVendor({ ...model(), connect: { mode: 'test', label: 'Pending', status: 'pending', accountId: 'acct_own', requirementsDue: [], needsPayoutApproval: true, payoutsApproved: false, accountModel: 'full' } });
+  assert.doesNotMatch(vendor, /action="\/admin\/connect\/approve"/);
+  assert.match(vendor, /charged on this shop's Stripe account/);
+});
+
 test('vendor dashboard reuses own customer and billing panes without platform data or controls', () => {
   const source = model(), before = structuredClone(source);
   const html = admin.renderVendor(source);

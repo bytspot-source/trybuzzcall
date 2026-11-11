@@ -110,10 +110,14 @@ function hold(lead, slot) {
   const c = cfg();
   const end = slot.end || new Date(Date.parse(slot.start) + c.slotMin * 60000).toISOString();
   if (isTaken(slot.start, end)) return null;
+  const prepay = require('./disputes').prepayFor(lead.phone, { email: lead.email });
+  const mustPay = !!prepay;
+  const amount = mustPay ? (c.amount > 0 ? c.amount : 1) : (c.deposit ? c.amount : 0);
   const b = { id: crypto.randomBytes(6).toString('hex'), leadId: lead.id, phone: lead.phone, name: lead.name, need: lead.need,
+    ...(lead.email ? { email: lead.email } : {}),
     ...(lead.service ? { service: lead.service, details: lead.details || null } : {}),
-    slotStart: slot.start, slotEnd: end, slotLabel: slot.label, status: c.deposit ? 'held' : 'confirmed', paid: false,
-    amount: c.deposit ? c.amount : 0, holdExpiresAt: new Date(Date.now() + c.holdMin * 60000).toISOString(),
+    slotStart: slot.start, slotEnd: end, slotLabel: slot.label, status: (c.deposit || mustPay) ? 'held' : 'confirmed', paid: false,
+    amount, requirePrepay: mustPay || undefined, holdExpiresAt: new Date(Date.now() + c.holdMin * 60000).toISOString(),
     createdAt: new Date().toISOString() };
   store.db.bookings.unshift(b); store.save(); return b;
 }
@@ -136,6 +140,7 @@ function connectParams(b, acct) {
 // Kept for callers that previously skipped deposits when Connect was missing. Platform charges no longer need Connect;
 // prefer leaving the hold + pay link. Still available for explicit skip paths.
 function skipDeposit(b, reason = 'stripe_not_connected') {
+  if (b && b.requirePrepay) return b;
   b.status = 'confirmed'; b.amount = 0; b.depositSkipped = reason; b.holdExpiresAt = null; store.save();
   return b;
 }
@@ -164,26 +169,70 @@ function leadFeeTotals() {
   return t;
 }
 
-// Returns the pay URL. Charges always run on the platform account (separate charges + delayed transfers).
-// A missing Connect account does NOT block the deposit: funds are held and payout stays pending until Connect is ready.
+const depositCapEnv = () => {
+  const sec = require('./security');
+  return sec.num(process.env.DEPOSIT_AMOUNT_MAX, 50);
+};
+const depositCap = () => {
+  const base = depositCapEnv();
+  const over = Number(store.getOverride().depositCapOverride);
+  return Number.isFinite(over) && over > base ? over : base;
+};
+const applicationFeeCents = () => {
+  const sec = require('./security');
+  return Math.max(0, Math.round(sec.num(process.env.DEPOSIT_APPLICATION_FEE_CENTS, 0)));
+};
+
+// Direct charge on the shop's connected account. BuzzCall does not hold the money.
+// Mock mode (no Stripe key) still returns a local pay page so demos work.
 async function depositLink(b, BASE) {
+  const blocked = require('./deposits').velocityBlock();
+  if (blocked) {
+    b.depositBlocked = blocked === 'count' ? 'daily_count' : 'daily_amount';
+    store.save();
+    throw Object.assign(new Error('This shop has reached its daily deposit limit. BuzzCall will review it.'), { status: 429 });
+  }
+  const cap = depositCap();
+  if (Number(b.amount) > cap) {
+    b.depositBlocked = 'over_cap';
+    store.save();
+    throw Object.assign(new Error(`Deposits are capped at $${cap} for this pilot.`), { status: 400 });
+  }
   await connect.ensureFresh();
-  const acct = connect.chargeAccount(); // optional payout destination; may be null
+  const shopId = require('./shopContext').shopId();
   if (env.STRIPE_SECRET_KEY) {
+    const reason = connect.checkoutBlock();
+    if (reason) {
+      b.depositBlocked = reason;
+      store.save();
+      throw Object.assign(new Error('This shop cannot take a deposit until Stripe charges are enabled and an admin approves the account.'), { status: 409, reason });
+    }
+    const acct = connect.checkoutAccount();
+    const amount = Math.round(Number(b.amount) * 100);
+    const fee = applicationFeeCents();
+    const paymentIntentData = { metadata: { bookingId: b.id, ...(shopId ? { shopId } : {}) } };
+    if (fee > 0 && fee < amount) paymentIntentData.application_fee_amount = fee;
     const s = await connect.stripe().checkout.sessions.create({
       mode: 'payment',
-      line_items: [{ quantity: 1, price_data: { currency: 'usd', unit_amount: Math.round(b.amount * 100),
+      line_items: [{ quantity: 1, price_data: { currency: 'usd', unit_amount: amount,
         product_data: { name: b.service ? `Deposit: ${b.service} with ${env.BUSINESS_NAME || `your ${trade().pro || 'pro'}`}, ${b.slotLabel}` : `Deposit: ${env.BUSINESS_NAME || 'service'} visit ${b.slotLabel}` } } }],
-      metadata: { bookingId: b.id, ...(require('./shopContext').current() ? { shopId: require('./shopContext').shopId() } : {}), ...(acct ? { connectAccount: acct } : {}) },
+      metadata: { bookingId: b.id, ...(shopId ? { shopId } : {}) },
       client_reference_id: b.id,
-      expires_at: Math.floor(Date.now() / 1000) + Math.max(cfg().holdMin, 30) * 60, // Stripe min 30 min
+      expires_at: Math.floor(Date.now() / 1000) + Math.max(cfg().holdMin, 30) * 60,
       success_url: `${BASE}/payment/return?status=success`, cancel_url: `${BASE}/payment/return?status=cancel`,
-      ...connectParams(b, acct),
-    }); // platform charge — no stripeAccount
-    b.stripeSessionId = s.id; b.payUrl = s.url;
+      payment_intent_data: paymentIntentData,
+    }, { stripeAccount: acct });
+    b.stripeSessionId = s.id;
+    b.payUrl = s.url;
+    b.connectAccount = acct;
+    b.chargeModel = 'direct';
+    b.applicationFeeCents = fee > 0 && fee < amount ? fee : 0;
   } else {
     b.payUrl = `${BASE}/pay/mock/${b.id}`;
-    connectParams(b, acct);
+    b.stripeSessionId = b.stripeSessionId || `cs_mock_${b.id}`;
+    b.chargeModel = 'direct_mock';
+    const acct = connect.checkoutAccount();
+    if (acct) b.connectAccount = acct;
   }
   store.save();
   if (require('./shopContext').current()) {
@@ -207,4 +256,22 @@ function markPaid(id) {
   return { booking: b, changed: true };
 }
 
-module.exports = { cfg, vertical, trade, parseServices, nextSlots, hold, depositLink, markPaid, expireHolds, leadFeeTotals, connectParams, skipDeposit };
+async function voidOpenSessions(accountId) {
+  let n = 0;
+  for (const b of store.db.bookings || []) {
+    if (!b || b.paid || !b.stripeSessionId || b.sessionVoided) continue;
+    if (accountId && b.connectAccount && b.connectAccount !== accountId) continue;
+    if (env.STRIPE_SECRET_KEY && connect.stripe().checkout?.sessions?.expire) {
+      try { await connect.stripe().checkout.sessions.expire(b.stripeSessionId, {}, accountId ? { stripeAccount: accountId } : undefined); }
+      catch (e) { console.error('[booking] void session failed:', e.message); }
+    }
+    b.sessionVoided = true;
+    b.payUrl = null;
+    b.depositPaused = 'disconnected';
+    n++;
+  }
+  if (n) store.save();
+  return n;
+}
+
+module.exports = { cfg, vertical, trade, parseServices, nextSlots, hold, depositLink, markPaid, expireHolds, leadFeeTotals, connectParams, skipDeposit, voidOpenSessions, depositCap, depositCapEnv, applicationFeeCents };

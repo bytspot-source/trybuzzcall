@@ -12,7 +12,7 @@
 const fs = require('fs');
 const path = require('path');
 const store = require('./store');
-const { maskPhone, isProduction, PLACEHOLDER_PHONE, limiter, num, on } = require('./security');
+const { maskPhone, isProduction, PLACEHOLDER_PHONE, num, on } = require('./security');
 const shopContext = require('./shopContext');
 const env = require('./config').env;
 const { shopName } = require('./consent');
@@ -25,6 +25,8 @@ const CAPS = {
   hour: { windowMs: 3600000, env: 'OUTBOUND_MAX_PER_HOUR', def: 200, lim: null, key: null, alerted: 0 },
   day: { windowMs: 86400000, env: 'OUTBOUND_MAX_PER_DAY', def: 500, lim: null, key: null, alerted: 0 },
 };
+// Global daily cap for onboarding OTP texts. 0 = off. Counts in addition to the platform caps.
+const OTP_CAP = { windowMs: 86400000, env: 'OTP_MAX_PER_DAY', def: 200, lim: null, key: null, alerted: 0 };
 // Per-shop caps (each vendor, and the legacy single shop, separately): OUTBOUND_SHOP_MAX_PER_HOUR (default 100) and
 // OUTBOUND_SHOP_MAX_PER_DAY (default 300); 0 = off. A platform administrator can set a per-vendor limit (shop.smsCaps).
 // The platform-wide CAPS above stay on top as the total, so one busy or abused line cannot use up every shop's texts.
@@ -32,35 +34,37 @@ const SHOP_CAPS = {
   hour: { windowMs: 3600000, env: 'OUTBOUND_SHOP_MAX_PER_HOUR', def: 100 },
   day: { windowMs: 86400000, env: 'OUTBOUND_SHOP_MAX_PER_DAY', def: 300 },
 };
-const shopLimits = new Map(); // `${shopId}|${per}` -> { lim, max, alerted }
 const capMax = (c) => num(process.env[c.env], c.def);
-const capLim = (c) => { const max = capMax(c); if (!c.lim || c.key !== max) { c.lim = limiter({ windowMs: c.windowMs, max }); c.key = max; } return c.lim; };
 function shopMax(per, shop) {
   const own = shop && shop.smsCaps ? shop.smsCaps[per] : undefined;
   return Number.isInteger(own) && own >= 0 ? own : num(process.env[SHOP_CAPS[per].env], SHOP_CAPS[per].def);
 }
-// Each shop/window keeps its own count; changing the shop's limit (admin override or env) keeps the sends already
-// counted in the current window, so lowering a limit takes effect immediately.
-function shopLimit(id, per, max) {
-  const key = `${id}|${per}`;
-  let e = shopLimits.get(key);
-  if (!e) { e = { n: 0, reset: 0, max, alerted: 0 }; shopLimits.set(key, e); }
-  e.max = max;
-  const now = Date.now();
-  if (e.reset <= now) { e.n = 0; e.reset = now + SHOP_CAPS[per].windowMs; }
-  e.lim = { blocked: () => e.n >= e.max, hit: () => { e.n++; } };
-  return e;
+// Counts live in the platform store (rateCaps) so a restart keeps the window. `alerted` stays in memory:
+// it only suppresses repeat warning texts, and it is not the cap itself.
+const shopAlerts = new Map();
+function capBucket(name) { return require('./security').rateBucket(name); }
+function capBlocked(name, key, windowMs, max) {
+  if (!(max > 0)) return 0;
+  return capBucket(name).blocked(key, windowMs, max);
 }
+function capHit(name, key, windowMs) { capBucket(name).hit(key, windowMs); }
 // Returns null after counting the send against every active cap, or the blocking cap { scope, per, max, entry }.
 function capCheck(shop) {
   const id = shop ? shop.id : 'legacy';
-  const own = ['hour', 'day'].map((per) => ({ per, max: shopMax(per, shop) })).filter((x) => x.max > 0)
-    .map((x) => ({ ...x, entry: shopLimit(id, x.per, x.max) }));
+  const own = ['hour', 'day'].map((per) => ({ per, max: shopMax(per, shop) })).filter((x) => x.max > 0);
   const platform = Object.entries(CAPS).filter(([, c]) => capMax(c) > 0);
-  for (const x of own) if (x.entry.lim.blocked(id)) return { scope: 'shop', per: x.per, max: x.max, entry: x.entry, windowMs: SHOP_CAPS[x.per].windowMs };
-  for (const [per, c] of platform) if (capLim(c).blocked('all')) return { scope: 'platform', per, max: capMax(c), entry: c, windowMs: c.windowMs };
-  for (const x of own) x.entry.lim.hit(id);
-  for (const [, c] of platform) capLim(c).hit('all');
+  for (const x of own) {
+    if (capBlocked(`sms-shop-${x.per}`, id, SHOP_CAPS[x.per].windowMs, x.max)) {
+      return { scope: 'shop', per: x.per, max: x.max, alertKey: `shop:${id}:${x.per}`, windowMs: SHOP_CAPS[x.per].windowMs };
+    }
+  }
+  for (const [per, c] of platform) {
+    if (capBlocked(`sms-platform-${per}`, 'all', c.windowMs, capMax(c))) {
+      return { scope: 'platform', per, max: capMax(c), alertKey: `platform:${per}`, windowMs: c.windowMs };
+    }
+  }
+  for (const x of own) capHit(`sms-shop-${x.per}`, id, SHOP_CAPS[x.per].windowMs);
+  for (const [per, c] of platform) capHit(`sms-platform-${per}`, 'all', c.windowMs);
   return null;
 }
 let onCap = async () => {};
@@ -84,6 +88,7 @@ function writeLog(logPath, to, body, kind, result) {
 }
 
 // opts.kind: 'caller' (default; counts toward the hourly/daily caps) | 'owner' (alerts to the shop owner)
+//   | 'otp' (onboarding codes: platform caps + OTP_MAX_PER_DAY, no shop-name or A2P hold)
 // opts.force: send even to an opted-out number (only for the one confirmation of a plain-language opt-out, and HELP).
 async function sendSms(to, body, opts = {}) {
   const kind = opts.kind || 'caller';
@@ -120,13 +125,29 @@ async function sendSms(to, body, opts = {}) {
         return { ok: false, skipped: 'a2p_held', held: true };
       }
     }
+    if (kind === 'otp') {
+      const otpMax = capMax(OTP_CAP);
+      if (otpMax > 0 && capBlocked('sms-otp', 'otp', OTP_CAP.windowMs, otpMax)) {
+        console.error(`[security] OTP daily cap reached (${otpMax}/day): not texting ${maskPhone(to)}`);
+        return { ok: false, skipped: 'otp_cap' };
+      }
+      const platform = Object.entries(CAPS).filter(([, c]) => capMax(c) > 0);
+      for (const [per, c] of platform) {
+        if (capBlocked(`sms-platform-${per}`, 'all', c.windowMs, capMax(c))) {
+          console.error(`[security] outbound SMS platform cap reached (${capMax(c)}/${per}): not texting OTP to ${maskPhone(to)}`);
+          return { ok: false, skipped: per === 'day' ? 'cap_day' : 'cap' };
+        }
+      }
+      for (const [per, c] of platform) capHit(`sms-platform-${per}`, 'all', c.windowMs);
+      if (otpMax > 0) capHit('sms-otp', 'otp', OTP_CAP.windowMs);
+    }
     if (kind === 'caller') {
       const blocked = capCheck(context ? context.shop : null);
       if (blocked) {
-        const { scope, per, max, entry } = blocked;
+        const { scope, per, max, alertKey } = blocked;
         console.error(`[security] outbound SMS ${scope} cap reached (${max}/${per}${context ? `, vendor ${context.id.slice(0, 8)}` : ''}): not texting ${maskPhone(to)}`);
-        if (Date.now() - entry.alerted > blocked.windowMs) {
-          entry.alerted = Date.now();
+        if (Date.now() - (shopAlerts.get(alertKey) || 0) > blocked.windowMs) {
+          shopAlerts.set(alertKey, Date.now());
           const info = { scope, per, max, shopId: context ? context.id : null, shopName: context ? context.shop.name : null };
           Promise.resolve().then(() => onCap(info)).catch((e) => console.error('cap alert failed:', e.message));
         }
@@ -151,5 +172,10 @@ async function sendSms(to, body, opts = {}) {
 }
 // Tests inject a fake Twilio client (never hits the network).
 const setClient = (c) => { client = c; injectedClient = !!c; };
-const resetCap = () => { for (const c of Object.values(CAPS)) { c.lim = null; c.key = null; c.alerted = 0; } shopLimits.clear(); noNameAlerted.clear(); };
+const resetCap = () => {
+  shopAlerts.clear(); noNameAlerted.clear();
+  for (const name of ['sms-platform-hour', 'sms-platform-day', 'sms-otp', 'sms-shop-hour', 'sms-shop-day']) {
+    try { require('./security').rateBucket(name).clear(); } catch { /* store not ready */ }
+  }
+};
 module.exports = { sendSms, live: !!client, setClient, setCapAlert, setNoNameAlert, resetCap, shopMax, OPTED_OUT_CODES };

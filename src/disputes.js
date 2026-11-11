@@ -13,12 +13,14 @@
 //    downloaded; portal photos are client-compressed and stored small, capped per deposit and per shop).
 // 4) Once the vendor checked in or sent proof, the customer gets one follow-up ("... Reply KEEP ...", quiet hours
 //    9pm-8am shop time and opt-outs respected). No KEEP within DISPUTE_AUTO_RELEASE_HOURS (default 48) => the payout
-//    is released automatically. KEEP keeps it for admin review. KEEP is only read while a follow-up is pending for
-//    that number. An opted-out customer is never texted; the dispute then waits for the admin (no auto-release).
-// 5) Repeat claims: NO claims are counted per customer across all shops in the platform store, keyed by a salted hash
-//    of the phone (no raw numbers in the index). NOSHOW_FLAG_THRESHOLD (default 2) claims within
-//    NOSHOW_FLAG_WINDOW_DAYS (default 90) flags the claim and the customer. Nothing is blocked automatically; the
-//    admin can store a "require full prepay" flag per flagged customer (shown in admin; not yet enforced in pricing).
+//    is released automatically only when the vendor checked in inside the window AND sent a photo that was not
+//    reused from another deposit. Text-only evidence waits in the admin review queue. KEEP keeps it for admin
+//    review. KEEP is only read while a follow-up is pending for that number. An opted-out customer is never
+//    texted; the dispute then waits for the admin (no auto-release).
+// 5) Repeat claims: NO claims are counted per customer across all shops in the platform store, keyed by a salted
+//    hash of the phone, and also by email and card fingerprint when we have them (no raw values in the index).
+//    NOSHOW_FLAG_THRESHOLD (default 2) claims within NOSHOW_FLAG_WINDOW_DAYS (default 90) flags the claim and the
+//    customer. The admin can store a "require full prepay" flag; booking.hold enforces it.
 const crypto = require('crypto');
 const store = require('./store');
 const shopContext = require('./shopContext');
@@ -125,11 +127,14 @@ function checkIn(b, { lat, lng, accuracy, ip, source = 'portal' } = {}) {
   const state = windowState(b);
   if (state !== 'open') return { ok: false, reason: state === 'early' ? 'too_early' : state === 'late' ? 'too_late' : 'no_time' };
   const c = { at: iso(), source: ['portal', 'link'].includes(source) ? source : 'portal', ip: String(ip || '').slice(0, 64) || null, geo: geo({ lat, lng, accuracy }) };
+  if (!c.geo) c.gpsFlag = 'no_gps';
+  else if (c.geo.accuracy == null || c.geo.accuracy > 200) c.gpsFlag = 'weak_gps';
   b.vendorCheckIn = c;
   const d = deposits().findByBooking(b.id);
   if (d) {
     d.vendorCheckIn = c;
-    timeline(d, 'checkin', `Vendor checked in${c.geo ? ` at ${c.geo.lat},${c.geo.lng} (±${c.geo.accuracy ?? '?'} m)` : ' (no location shared)'} via ${c.source}`, c.at);
+    const gpsNote = c.gpsFlag === 'no_gps' ? ' (no GPS)' : c.gpsFlag === 'weak_gps' ? ' (GPS accuracy over 200 m)' : '';
+    timeline(d, 'checkin', `Vendor checked in${c.geo ? ` at ${c.geo.lat},${c.geo.lng} (±${c.geo.accuracy ?? '?'} m)` : ' (no location shared)'}${gpsNote} via ${c.source}`, c.at);
     // A check-in that lands after a NO (still inside the window) counts as the vendor contesting the claim.
     if (d.dispute && !d.dispute.resolution) { d.dispute.vendorCheckedIn = true; queueFollowup(d); }
     d.updatedAt = iso();
@@ -143,38 +148,65 @@ function checkIn(b, { lat, lng, accuracy, ip, source = 'portal' } = {}) {
 function claimKey(phone) {
   try { return require('./outcomes').saltedHash('noshow-claim', phone); } catch { return null; }
 }
-function recordClaim(phone, depositId) {
-  const k = claimKey(phone);
-  if (!k) return { count: 0, threshold: cfg().flagThreshold, flagged: false };
+function identityKey(kind, value) {
+  if (!value) return null;
+  try { return require('./outcomes').saltedHash(`noshow-${kind}`, String(value).trim().toLowerCase()); } catch { return null; }
+}
+function identityKeys(phone, { email, fingerprint } = {}) {
+  return [...new Set([claimKey(phone), identityKey('email', email), identityKey('fp', fingerprint)].filter(Boolean))];
+}
+function recordClaim(phone, depositId, extra = {}) {
+  const keys = identityKeys(phone, extra);
+  if (!keys.length) return { count: 0, threshold: cfg().flagThreshold, flagged: false };
   const root = store.root, c = cfg(), at = Date.now();
   const idx = (root.db.noshowClaims ||= {});
   const shopId = shopContext.shopId() || 'legacy';
-  const list = (idx[k] || []).filter((x) => at - Date.parse(x.at) < c.flagWindowDays * DAY);
-  if (!list.some((x) => x.depositId === depositId && x.shopId === shopId)) list.push({ at: new Date(at).toISOString(), shopId, depositId });
-  idx[k] = list.slice(-50);
-  const flagged = list.length >= c.flagThreshold;
-  if (flagged) {
-    const flags = (root.db.flaggedCustomers ||= {});
-    const prev = flags[k] || {};
-    flags[k] = { flaggedAt: prev.flaggedAt || new Date(at).toISOString(), count: list.length, lastClaimAt: new Date(at).toISOString(),
-      phoneMasked: sec.maskPhone(phone), requirePrepay: !!prev.requirePrepay, requirePrepayAt: prev.requirePrepayAt || null };
+  let count = 0;
+  for (const k of keys) {
+    const list = (idx[k] || []).filter((x) => at - Date.parse(x.at) < c.flagWindowDays * DAY);
+    if (!list.some((x) => x.depositId === depositId && x.shopId === shopId)) list.push({ at: new Date(at).toISOString(), shopId, depositId });
+    idx[k] = list.slice(-50);
+    count = Math.max(count, list.length);
+  }
+  const flagged = count >= c.flagThreshold;
+  const flags = (root.db.flaggedCustomers ||= {});
+  const alreadyPrepay = keys.some((k) => flags[k] && flags[k].requirePrepay);
+  if (flagged || alreadyPrepay) {
+    for (const k of keys) {
+      const prev = flags[k] || {};
+      flags[k] = { flaggedAt: prev.flaggedAt || new Date(at).toISOString(), count, lastClaimAt: new Date(at).toISOString(),
+        phoneMasked: sec.maskPhone(phone), requirePrepay: !!(prev.requirePrepay || alreadyPrepay), requirePrepayAt: prev.requirePrepayAt || null };
+    }
   }
   root.save();
-  return { count: list.length, threshold: c.flagThreshold, flagged };
+  return { count, threshold: c.flagThreshold, flagged };
 }
-function flagFor(phone) {
-  const k = claimKey(phone);
-  const f = k && (store.root.db.flaggedCustomers || {})[k];
-  return f ? { ...f } : null;
+function flagFor(phone, extra = {}) {
+  const flags = store.root.db.flaggedCustomers || {};
+  let best = null;
+  for (const k of identityKeys(phone, extra)) {
+    const f = flags[k];
+    if (f && (!best || (f.count || 0) > (best.count || 0))) best = f;
+  }
+  return best ? { ...best } : null;
 }
-function setRequirePrepay(phone, on) {
-  const k = claimKey(phone);
+function prepayFor(phone, extra = {}) {
+  const f = flagFor(phone, extra);
+  return f && f.requirePrepay ? f : null;
+}
+function setRequirePrepay(phone, on, extra = {}) {
+  const keys = identityKeys(phone, extra);
   const flags = (store.root.db.flaggedCustomers ||= {});
-  if (!k || !flags[k]) return null;
-  flags[k].requirePrepay = !!on;
-  flags[k].requirePrepayAt = on ? new Date().toISOString() : null;
+  if (!keys.some((k) => flags[k])) return null;
+  let result = null;
+  for (const k of keys) {
+    if (!flags[k] && !on) continue;
+    const prev = flags[k] || { flaggedAt: new Date().toISOString(), count: 0, phoneMasked: sec.maskPhone(phone) };
+    flags[k] = { ...prev, requirePrepay: !!on, requirePrepayAt: on ? new Date().toISOString() : null };
+    result = flags[k];
+  }
   store.root.save();
-  return { ...flags[k] };
+  return result ? { ...result } : null;
 }
 
 // ---------- customer NO ----------
@@ -185,8 +217,13 @@ function openOnNo(d, { base = '' } = {}) {
   const checkInRec = d.vendorCheckIn || (b && b.vendorCheckIn) || null;
   if (checkInRec && !d.vendorCheckIn) d.vendorCheckIn = checkInRec;
   const at = iso();
-  if (checkInRec) {
-    // Vendor checked in: hold for admin review instead of a plain pause.
+  const direct = !!(dep.directModel && dep.directModel());
+  if (direct) {
+    d.noshowReply = 'no';
+    d.reputation = checkInRec ? 'checked_in_noshow' : 'noshow';
+    d.updatedAt = at;
+    outcome('noShowReported', d);
+  } else if (checkInRec) {
     if (!['refunded', 'released'].includes(d.status)) {
       d.status = 'disputed';
       d.payoutPaused = true;
@@ -199,7 +236,7 @@ function openOnNo(d, { base = '' } = {}) {
   } else {
     dep.pauseForNoshow(d);
   }
-  const repeat = recordClaim(d.phone, d.id);
+  const repeat = recordClaim(d.phone, d.id, { email: d.email, fingerprint: d.cardFingerprint });
   d.dispute = {
     openedAt: at, vendorCheckedIn: !!checkInRec, proofRequestedAt: at, evidence: [], photos: [],
     followupDueAt: null, followupSentAt: null, followupSkipped: null, autoReleaseAt: null,
@@ -207,34 +244,36 @@ function openOnNo(d, { base = '' } = {}) {
     repeatClaim: repeat.flagged ? { count: repeat.count, threshold: repeat.threshold } : null,
   };
   timeline(d, 'customer_no', `Customer replied NO (says the vendor did not show)${repeat.flagged ? `. Repeat claimer: ${repeat.count} claims in ${cfg().flagWindowDays} days` : ''}`, at);
-  if (checkInRec) queueFollowup(d);
+  if (checkInRec && !direct) queueFollowup(d);
   const name = (b && b.name) || 'A customer';
   const when = (b && b.slotLabel) || timeOf(b && b.slotStart);
   const link = proofLink(base, d);
-  const held = ['paused', 'disputed'].includes(d.status);
-  const suffix = !held ? ' BuzzCall will review it.' : checkInRec ? ` You checked in at ${timeOf(checkInRec.at)}, so your payout is on hold for review, not cancelled.` : ' Your payout is paused until this is reviewed.';
+  const held = !direct && ['paused', 'disputed'].includes(d.status);
+  const suffix = direct ? ' BuzzCall does not hold this deposit. Any refund is in your Stripe Dashboard.' : !held ? ' BuzzCall will review it.' : checkInRec ? ` You checked in at ${timeOf(checkInRec.at)}, so your payout is on hold for review, not cancelled.` : ' Your payout is paused until this is reviewed.';
   const vendorText = `BuzzCall: ${name} says you didn't show for ${when}. Reply with a photo or details, or open ${link} to respond.${suffix}`;
   timeline(d, 'vendor_notified', 'Vendor texted a reply-with-proof request', at);
   const shop = shopName(d);
   const sid = shopContext.shopId();
   const review = `${linkBase(base)}/admin/deposits${sid ? `?shop=${encodeURIComponent(sid)}` : ''}`;
   const adminAlert = `BUZZ ${shop}: NO-SHOW claim, booking ${d.bookingId} ($${dep.money(d.amountCents)}). `
-    + (checkInRec ? `VENDOR CHECKED IN ${timeOf(checkInRec.at)}${checkInRec.geo ? ' with location' : ''}: payout held as DISPUTED for your review. ` : 'Vendor did not check in: payout PAUSED. ')
+    + (direct ? 'Record only: the customer paid the shop directly. ' : '')
+    + (checkInRec ? `VENDOR CHECKED IN ${timeOf(checkInRec.at)}${checkInRec.geo ? ' with location' : ''}${direct ? '. ' : ': payout held as DISPUTED for your review. '}` : (direct ? 'Vendor did not check in. ' : 'Vendor did not check in: payout PAUSED. '))
     + (repeat.flagged ? `REPEAT CLAIMER: ${repeat.count} no-show claims in ${cfg().flagWindowDays} days. ` : '')
-    + `Customer: ${d.phone}. Review: ${review}`;
+    + `Customer: ${sec.maskPhone(d.phone)}. Review: ${review}`;
   d.updatedAt = at;
   store.save();
   return {
     deposit: d, answer: 'no',
-    reply: checkInRec ? "Thanks for letting us know. We're holding the payment while we review your claim and will follow up." : "Thanks, we've paused the payment and will follow up within 1 business day.",
+    reply: direct ? "Thanks for telling us. BuzzCall does not hold this deposit. Contact the shop if you want a refund." : checkInRec ? "Thanks for letting us know. We're holding the payment while we review your claim and will follow up." : "Thanks, we've paused the payment and will follow up within 1 business day.",
     vendorText, adminAlert, disputed: !!checkInRec, repeatClaim: d.dispute.repeatClaim,
   };
 }
 
 // ---------- vendor evidence ----------
-const isOpen = (d) => !!(d && d.dispute && !d.dispute.resolution && ['paused', 'disputed'].includes(d.status));
+const isOpen = (d) => !!(d && d.dispute && !d.dispute.resolution && (['paused', 'disputed', 'recorded', 'scheduled'].includes(d.status) || d.reputation === 'noshow' || d.reputation === 'checked_in_noshow'));
 function openDisputes() { return deposits().list().filter(isOpen); }
 function queueFollowup(d) {
+  if (deposits().directModel && deposits().directModel()) return;
   const x = d.dispute;
   if (!x || x.followupSentAt || x.followupDueAt || x.customerReply || x.resolution) return;
   x.followupDueAt = iso();
@@ -270,10 +309,26 @@ function photoBucket() {
   const p = store.db.disputePhotos;
   return p && typeof p === 'object' && !Array.isArray(p) ? p : (store.db.disputePhotos = {});
 }
+function photoHash(value) {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+// Returns true when this exact photo (bytes or MMS url) was already used on another deposit.
+function notePhotoHash(hash, depositId) {
+  if (!hash) return false;
+  const root = store.root;
+  const idx = (root.db.photoHashes ||= {});
+  const prev = idx[hash];
+  const shopId = shopContext.shopId() || 'legacy';
+  const reused = !!(prev && (prev.depositId !== depositId || prev.shopId !== shopId));
+  if (!prev) idx[hash] = { depositId, shopId, at: iso() };
+  root.save();
+  return reused;
+}
 function storePhoto(d, photo) {
   const bucket = photoBucket();
   const id = rid('ph');
-  bucket[id] = { depositId: d.id, type: photo.type, data: photo.data, bytes: photo.bytes, at: iso() };
+  const hash = photoHash(Buffer.from(photo.data, 'base64'));
+  bucket[id] = { depositId: d.id, type: photo.type, data: photo.data, bytes: photo.bytes, at: iso(), hash };
   const ids = Object.keys(bucket);
   if (ids.length > MAX_PHOTOS_PER_SHOP) {
     ids.sort((a, b) => String(bucket[a].at).localeCompare(String(bucket[b].at)));
@@ -293,15 +348,28 @@ function addEvidence(d, { source, text, media = [], photo = null } = {}) {
   if (x.evidence.length >= MAX_EVIDENCE) return { ok: false, reason: 'limit' };
   const note = cleanText(text);
   let photoId = null;
+  let photoReused = false;
   if (photo) {
     const own = (x.evidence || []).filter((e) => e.photoId).length;
     if (own >= MAX_PHOTOS_PER_DEPOSIT) return { ok: false, reason: 'photo_limit' };
     photoId = storePhoto(d, photo);
+    const stored = photoBucket()[photoId];
+    photoReused = !!(stored && notePhotoHash(stored.hash, d.id));
+  }
+  const mediaReuse = [];
+  for (const m of media) {
+    const reused = notePhotoHash(photoHash(m.url), d.id);
+    mediaReuse.push(reused);
+    if (reused) photoReused = true;
   }
   if (!note && !media.length && !photoId) return { ok: false, reason: 'empty' };
-  const e = { id: rid('ev'), at: iso(), source, text: note || null, media: media.slice(0, 10), photoId };
+  const e = { id: rid('ev'), at: iso(), source, text: note || null, media: media.slice(0, 10), photoId, photoReused: photoReused || undefined };
   x.evidence.push(e);
   const parts = [note ? `"${note.slice(0, 160)}"` : '', media.length ? `${media.length} MMS photo(s)` : '', photoId ? '1 uploaded photo' : ''].filter(Boolean).join(', ');
+  if (photoReused) {
+    d.photoReuse = true;
+    timeline(d, 'photo_reuse', 'Photo matches one already used on another deposit', e.at);
+  }
   timeline(d, 'vendor_proof', `Vendor sent proof via ${source}: ${parts}`, e.at);
   if (!x.disputedOutcome) { x.disputedOutcome = true; outcome('disputed', d); }
   queueFollowup(d);
@@ -400,8 +468,22 @@ async function tick({ sendSms } = {}) {
         continue;
       }
     }
-    // 2) Auto-release after no reply.
+    // 2) Auto-release after no reply. Direct charges have no payout to release: the note stays on the record.
+    if (dep.directModel && dep.directModel()) {
+      if (x.autoReleaseAt) { x.autoReleaseAt = null; x.adminReview = true; x.adminReviewReason = 'direct_model'; }
+      continue;
+    }
     if (x.followupSentAt && !x.customerReply && x.autoReleaseAt && Date.parse(x.autoReleaseAt) <= now()) {
+      const checkInRec = d.vendorCheckIn || (store.findBooking(d.bookingId) || {}).vendorCheckIn;
+      const freshPhoto = (x.evidence || []).some((e) => (e.photoId || (e.media || []).length) && !e.photoReused);
+      if (!checkInRec || !freshPhoto) {
+        x.adminReview = true;
+        x.adminReviewReason = !checkInRec ? 'no_checkin' : 'no_photo';
+        x.autoReleaseAt = null;
+        timeline(d, 'admin_review', !checkInRec ? 'No in-window check-in: held for admin review (not auto-released)' : 'No new photo: text-only evidence held for admin review');
+        d.updatedAt = iso();
+        continue;
+      }
       timeline(d, 'no_reply', `No KEEP reply within ${cfg().autoReleaseHours}h`);
       const r = await dep.releaseDeposit(d, { force: true, by: 'auto' });
       if (r.ok || r.reason === 'not_connected') released++;
@@ -471,7 +553,7 @@ function evidenceText(d, b, { shop = shopName(d), zone = shopTime.timeZone() } =
 
 module.exports = {
   cfg, sign, readToken, expired, checkinToken, checkinLink, proofToken, proofLink, windowFor, windowState, checkable, geo, checkIn,
-  claimKey, recordClaim, flagFor, setRequirePrepay, openOnNo, isOpen, openDisputes, mediaFrom, decodePhoto, getPhoto, addEvidence,
+  claimKey, recordClaim, flagFor, prepayFor, setRequirePrepay, openOnNo, isOpen, openDisputes, mediaFrom, decodePhoto, getPhoto, addEvidence,
   handleVendorMessage, pendingKeep, handleKeep, followupText, tick, markResolved, fullTimeline, evidenceText, timeline,
   MAX_PHOTO_BYTES, PROOF_LINK_DAYS,
 };

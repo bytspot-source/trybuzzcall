@@ -8,4 +8,4 @@
 - [ ] Owner approves text-back wording
 - [ ] Day 3 check-in: missed calls caught, owner callback speed
 - [ ] Day 14 review: leads recovered, jobs booked, $ value, paid leads + lead-fee total (admin page), convert to base plan (monthly, or annual with setup waived)
-- [ ] Deposits (Stripe Connect, test mode first): STRIPE_SECRET_KEY + STRIPE_WEBHOOK_SECRET + STRIPE_CONNECT_WEBHOOK_SECRET set; owner completed Stripe onboarding from /admin (status *Charges enabled*, `/health` connect=true); test deposit with 4242 4242 4242 4242 lands in the owner's connected account; owner refunds it from their Stripe Dashboard. Until then deposits stay off (bookings without deposit).
+- [ ] Deposits (direct charge on the shop's Stripe account, test mode first): STRIPE_SECRET_KEY + STRIPE_WEBHOOK_SECRET + STRIPE_CONNECT_WEBHOOK_SECRET set; shop completed Connect from the vendor portal; charges enabled, no disabled reason, and an admin approved the account (`/health` connect=true); test deposit with 4242 4242 4242 4242 lands in the shop's account; the shop refunds it from its own Stripe Dashboard. Until then deposit links are refused.

@@ -30,13 +30,14 @@ function reply(req, res, result, destination) {
 
 function register(app, { requireAdmin, sameOrigin }) {
   const vendor = () => app.locals.requireVendor;
-  app.post('/onboarding/verify', async (req, res) => {
+  const enabled = (req, res, next) => (onboarding.enabled() ? next() : res.status(404).type('text').send('Not found'));
+  app.post('/onboarding/verify', enabled, async (req, res) => {
     const result = await onboarding.verify({ setupId: String(req.body?.setupId || ''), code: req.body?.code, ip: sec.clientIp(req) });
     if (!result.ok) return json(req) ? res.status(result.status || 400).json({ ok: false, error: result.error }) : res.status(result.status || 400).type('text').send(result.error);
     setGrantCookie(res, result.grant);
     return json(req) ? res.json({ ok: true, next: '/onboarding/password' }) : res.redirect(303, '/onboarding/password');
   });
-  app.post('/onboarding/resend', async (req, res) => {
+  app.post('/onboarding/resend', enabled, async (req, res) => {
     const setup = require('./store').root.findSetup(String(req.body?.setupId || ''));
     if (!setup) return res.status(404).json({ ok: false, error: 'Setup not found' });
     const result = await onboarding.sendCode({ setupId: setup.id, phone: setup.values?.ownerPhone, ip: sec.clientIp(req), businessName: setup.values?.businessName });
@@ -71,6 +72,12 @@ function register(app, { requireAdmin, sameOrigin }) {
 
   app.get('/admin/onboarding', requireAdmin, (req, res) => {
     res.type('html').send(pages.queuePage(onboarding.queue()));
+  });
+  app.post('/admin/onboarding/:id/approve-spend', requireAdmin, async (req, res) => {
+    if (!/^(1|true|yes|on)$/i.test(String(req.body?.confirm || ''))) return res.status(409).type('text').send('Confirm before buying a number or submitting carrier registration.');
+    const result = await onboarding.approveSpend(req.params.id, process.env.PUBLIC_BASE_URL || '');
+    if (!result.ok) return res.status(result.status || 400).type('text').send(result.error);
+    return json(req) ? res.json(result) : res.redirect(303, '/admin/onboarding');
   });
   app.post('/admin/onboarding/:id/retry', requireAdmin, async (req, res) => {
     await onboarding.advance(req.params.id, process.env.PUBLIC_BASE_URL || '');

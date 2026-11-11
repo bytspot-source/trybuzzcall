@@ -296,6 +296,7 @@ test('checklist, trial, idempotent number purchase, cap, balance, and fallback',
   const session = JSON.parse(checkout.body).id;
   const paid = await req('POST', `/vendor/billing/mock/checkout/${session}/complete`, { cookie: shop.cookie, body: {} });
   assert.equal(paid.status, 200);
+  await approveSpend();
   const after = await req('GET', '/vendor', { cookie: shop.cookie, accept: 'text/html' });
   assert.equal(state.buys.length, 1);
   assert.equal(state.buys[0].voiceUrl, 'http://shop.example/twilio/voice');
@@ -350,12 +351,20 @@ test('checklist, trial, idempotent number purchase, cap, balance, and fallback',
   assert.equal(network, 0);
 });
 
+async function approveSpend() {
+  const ids = Object.keys(store.root.db.onboarding?.shops || {});
+  for (const id of ids) {
+    const res = await req('POST', `/admin/onboarding/${id}/approve-spend`, { admin: true, body: { confirm: '1' } });
+    assert.ok(res.status === 200 || res.status === 303, res.body.slice(0, 180));
+  }
+}
 async function startTrial(cookie) {
   const checkout = await req('POST', '/vendor/billing/checkout', { cookie, body: { plan: 'monthly' } });
   assert.equal(checkout.status, 200, checkout.body.slice(0, 180));
   const session = JSON.parse(checkout.body).id;
   const paid = await req('POST', `/vendor/billing/mock/checkout/${session}/complete`, { cookie, body: {} });
   assert.equal(paid.status, 200, paid.body.slice(0, 180));
+  await approveSpend();
 }
 
 test('A2P state machine holds customer texts until approval and never prints the EIN', async () => {

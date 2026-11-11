@@ -70,18 +70,11 @@ app.post('/stripe/webhook', express.raw({ type: '*/*' }), async (req, res) => {
     }
   }
   catch (e) { console.error('billing webhook error:', e.message); return res.status(500).send('billing handler error'); }
-  // Platform deposit checkouts (separate charges + transfers): mark paid on the platform webhook.
+  // Deposit Checkout Sessions are direct charges on the connected account. They are fulfilled
+  // on /stripe/connect/webhook, not here. This endpoint stays for shop subscriptions.
   if (['checkout.session.completed', 'checkout.session.async_payment_succeeded'].includes(event.type)) {
-    const s = event.data.object;
-    if (!s.mode || s.mode === 'payment') {
-      const id = s.metadata?.bookingId || s.client_reference_id;
-      if (id && s.payment_status !== 'unpaid') {
-        await onPaid(id, {
-          sessionId: s.id,
-          paymentIntentId: typeof s.payment_intent === 'string' ? s.payment_intent : s.payment_intent?.id,
-        });
-      }
-    }
+    const s = event.data?.object || {};
+    if (!s.mode || s.mode === 'payment') return res.json({ received: true, ignored: 'direct charge; use the connected-account webhook' });
   }
   try { await deposits.handleWebhookEvent(event); } catch (e) { console.error('deposits webhook error:', e.message); }
   res.json({ received: true });
@@ -89,8 +82,8 @@ app.post('/stripe/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   return destination.shop ? vendors.run(destination.shop.id, handle, { suspended: true }) : handle();
 });
 // Stripe Connect webhook (endpoint scope "Connected accounts", its own signing secret STRIPE_CONNECT_WEBHOOK_SECRET).
-// Deposit Checkout Sessions are now platform charges; this endpoint handles account.updated / deauthorized and any
-// legacy connected-account checkout events. Only events for THIS shop's connected account are acted on.
+// Direct-charge Checkout Sessions are fulfilled here. event.account must be this shop's account, and a paid
+// session must match the booking's stored session id, amount, and currency. Only this shop's account is acted on.
 app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   let event;
   try {
@@ -106,35 +99,88 @@ app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, re
   const acct = connect.accountId();
   if (!event || !event.account || !acct || event.account !== acct) return ignore('account mismatch');
   if (!connect.livemodeOk(event)) return ignore('livemode mismatch');
+  if (event.id && deposits.eventSeen(event.id)) return res.json({ received: true, duplicate: true });
   const o = event.data?.object || {};
   try {
     switch (event.type) {
       case 'checkout.session.completed': case 'checkout.session.async_payment_succeeded': {
         if (o.mode && o.mode !== 'payment') return ignore('not a deposit');
-        const id = o.metadata?.bookingId || o.client_reference_id;
+        if (o.payment_status === 'unpaid') return ignore('unpaid');
+        const id = o.metadata?.bookingId;
         const b = id && store.findBooking(id);
-        if (!b) return ignore('unknown booking');
+        const problem = deposits.sessionProblem(o, b);
+        if (problem) return ignore(problem);
         if (b.connectAccount && b.connectAccount !== event.account) return ignore('booking account mismatch');
-        if (o.payment_status === 'paid' || o.payment_status === 'no_payment_required') await onPaid(id);
+        let payment = deposits.chargeFromSession(o);
+        if (!payment.chargeId && payment.paymentIntentId && process.env.STRIPE_SECRET_KEY) {
+          try {
+            const stripe = connect.stripe();
+            if (stripe.paymentIntents?.retrieve) {
+              const pi = await stripe.paymentIntents.retrieve(payment.paymentIntentId, {}, { stripeAccount: event.account });
+              const latest = pi && pi.latest_charge;
+              payment.chargeId = typeof latest === 'string' ? latest : latest?.id || null;
+              payment.cardFingerprint = payment.cardFingerprint || latest?.payment_method_details?.card?.fingerprint || null;
+            }
+          } catch (e) { console.error('[deposits] payment intent retrieve failed:', e.message); }
+        }
+        await onPaid(id, { ...payment, sessionId: o.id, livemode: event.livemode, email: b.email || null });
         break;
       }
       case 'checkout.session.async_payment_failed': {
-        const b = store.findBooking(o.metadata?.bookingId || o.client_reference_id);
-        if (b && !b.paid) { b.paymentFailed = true; store.save(); }
+        const b = store.findBooking(o.metadata?.bookingId);
+        if (b && b.stripeSessionId === o.id && !b.paid) { b.paymentFailed = true; store.save(); }
+        break;
+      }
+      case 'charge.refunded': {
+        const d = deposits.findByPaymentIntent(typeof o.payment_intent === 'string' ? o.payment_intent : o.payment_intent?.id)
+          || deposits.list().find((x) => x.chargeId === o.id);
+        if (!d) return ignore('unknown charge');
+        deposits.mirrorRefund(d, o.amount_refunded != null ? o.amount_refunded : o.amount, { reason: 'charge.refunded' });
+        await platformAlert(`BUZZ ${shopContext.current()?.shop?.name || env.BUSINESS_NAME || 'Shop'}: vendor refund on booking ${d.bookingId} ($${((d.refundedCents || 0) / 100).toFixed(2)} of $${((d.amountCents || 0) / 100).toFixed(2)}). The shop refunded in Stripe. Customer ${sec.maskPhone(d.phone || '')}.`, 'BuzzCall: vendor refund');
+        break;
+      }
+      case 'charge.dispute.created':
+      case 'charge.dispute.updated':
+      case 'charge.dispute.closed': {
+        const chargeId = typeof o.charge === 'string' ? o.charge : o.charge?.id;
+        const pi = typeof o.payment_intent === 'string' ? o.payment_intent : o.payment_intent?.id;
+        const d = deposits.findByPaymentIntent(pi) || deposits.list().find((x) => x.chargeId === chargeId);
+        if (!d) return ignore('unknown charge');
+        deposits.mirrorDispute(d, o, { closed: event.type === 'charge.dispute.closed' });
+        const shopName = shopContext.current()?.shop?.name || env.BUSINESS_NAME || 'Shop';
+        const closed = event.type.endsWith('closed');
+        await owner(null, `BUZZ ${shopName}: card dispute ${o.id || ''} ${closed ? 'closed' : 'opened'} on booking ${d.bookingId}. The shop handles it in Stripe. Customer ${sec.maskPhone(d.phone || '')}.`);
+        await platformAlert(`BUZZ ${shopName}: card dispute ${o.id || ''} ${closed ? 'closed' : 'opened'} on booking ${d.bookingId}. The shop handles it in Stripe. Customer ${sec.maskPhone(d.phone || '')}.`, closed ? 'BuzzCall: dispute closed' : 'BuzzCall: card dispute');
+        break;
+      }
+      case 'radar.early_fraud_warning.created':
+      case 'radar.early_fraud_warning.updated': {
+        const chargeId = typeof o.charge === 'string' ? o.charge : o.charge?.id;
+        const pi = typeof o.payment_intent === 'string' ? o.payment_intent : o.payment_intent?.id;
+        const d = deposits.findByPaymentIntent(pi) || deposits.list().find((x) => x.chargeId === chargeId);
+        if (!d) return ignore('unknown charge');
+        d.fraudWarning = { id: o.id || null, fraudType: o.fraud_type || null, actionable: o.actionable !== false, at: new Date().toISOString() };
+        d.updatedAt = new Date().toISOString();
+        store.save();
+        await platformAlert(`BUZZ ${shopContext.current()?.shop?.name || env.BUSINESS_NAME || 'Shop'}: early fraud warning ${o.id || ''} on booking ${d.bookingId}. The shop handles it in Stripe. BuzzCall did not refund this direct charge. Customer ${sec.maskPhone(d.phone || '')}.`, 'BuzzCall: fraud warning');
         break;
       }
       case 'account.updated':
         connect.applyAccount(o);
-        try { await deposits.handleWebhookEvent(event); } catch (e) { console.error('deposits account.updated:', e.message); }
+        if (!o.charges_enabled || (o.requirements && o.requirements.disabled_reason)) connect.markDepositsPaused(o.requirements?.disabled_reason || 'charges_disabled');
+        else if (o.charges_enabled && !(o.requirements && o.requirements.disabled_reason)) connect.clearDepositsPause();
         break;
       case 'account.application.deauthorized':
         connect.deauthorize();
-        await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: Stripe was disconnected from BuzzCall. Vendor payouts are paused until you reconnect Stripe. Customer deposits still work on the platform.`);
+        connect.markDepositsPaused('deauthorized');
+        await booking.voidOpenSessions(event.account);
+        await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: Stripe was disconnected. Deposit links are stopped and open checkout sessions are voided. The shop keeps any payment already taken and refunds it in Stripe.`);
         break;
       default: return ignore('unhandled type');
     }
   } catch (e) { console.error('connect webhook error:', e.message); return res.status(500).send('connect handler error'); }
   if (shopContext.current()) await vendors.flush(shopContext.current().store);
+  if (event && event.id) deposits.rememberEvent(event.id);
   res.json({ received: true });
   };
   return destination.shop ? vendors.run(destination.shop.id, handle, { suspended: true }) : handle();
@@ -158,7 +204,7 @@ app.use((req, res, next) => {
   }
   next();
 });
-const ORIGIN_GUARDED = /^\/(admin|vendor|v|api\/billing|billing)(\/|$)/i;
+const ORIGIN_GUARDED = /^\/(admin|vendor|v|onboarding|api\/billing|billing)(\/|$)/i;
 app.use((req, res, next) => (['GET', 'HEAD', 'OPTIONS'].includes(req.method) || !ORIGIN_GUARDED.test(req.path) ? next() : sameOrigin(req, res, next)));
 // Never serve editor/backup leftovers (e.g. public/terms.html.bak-*) or dotfiles from public/.
 app.use((req, res, next) => (/\.(bak|orig|swp)\b|~$|\/\./i.test(req.path) ? res.status(404).send('Not found') : next()));
@@ -586,6 +632,7 @@ async function platformAlert(msg, subject) {
   await shopContext.run(null, () => owner(null, msg));
   mail.adminAlert(subject, msg);
 }
+deposits.setAlert((msg, subject) => platformAlert(msg, subject));
 sms.setCapAlert(async ({ scope, per = 'hour', max, shopId, shopName } = {}) => {
   if (scope === 'shop' && shopId) {
     const who = `${String(shopName || 'Vendor').slice(0, 80)} (vendor ${shopId.slice(0, 8)})`;
@@ -629,8 +676,8 @@ const checkinNote = (b) => ` Tap when you arrive: ${disputes.checkinLink(BASE, b
 const money = (n) => (Number.isInteger(n) ? String(n) : Number(n).toFixed(2));
 const feeNote = (b) => b.lead_fee_status === 'waived' ? 'lead fee waived (pilot)' : `lead fee $${money(b.lead_fee || 0)}${b.lead_fee_status === 'collected' ? ' (auto-deducted)' : ''}`;
 
-// Deposits are held on BuzzCall's platform and paid out after the appointment (src/deposits.js).
-const refundNote = (b) => '. Deposit held by BuzzCall; payout after the appointment (or refund from admin Deposits).';
+// Deposits are direct charges on the shop's Stripe account (src/deposits.js). BuzzCall does not hold or transfer them.
+const refundNote = () => '. The customer paid your Stripe account directly. Refunds and disputes are handled in your Stripe Dashboard.';
 async function onPaid(id, payment = {}) {
   const { booking: b, changed, conflict } = booking.markPaid(id);
   if (!b || !changed) return b;
@@ -787,6 +834,8 @@ const billingReply = (req, res, result) => wantsHtml(req) ? res.redirect(303, '/
 app.post('/setup', setupLimit, async (req, res) => {
   const body = req.body && typeof req.body === 'object' ? req.body : {};
   const json = wantsJson(req);
+  const captcha = await require('./captcha').check(body.captchaToken || body['cf-turnstile-response'] || body['g-recaptcha-response'], req);
+  if (!captcha.ok) return json ? res.status(400).json({ ok: false, error: captcha.error }) : res.status(400).type('html').send(setupPages.errorsHtml([{ message: captcha.error }]));
   const { values, issues, errors, warnings } = setupRules.validate(body);
   if (String(body.website || '').trim()) { // honeypot: bots fill hidden fields; pretend success, store nothing
     return json ? res.json({ ok: true, id: null }) : res.type('html').send(setupPages.thanksHtml({}));
@@ -921,6 +970,16 @@ const connectMockOnly = (req, res, next) => (connect.mode() !== 'mock' ? res.sta
 app.get('/admin/connect/mock', connectMockOnly, requireAdmin, (req, res) => {
   res.type('html').send(paymentPages.connectOnboarding({ connect: connect.summary(), businessName: env.BUSINESS_NAME || 'Your business' }));
 });
+app.post('/admin/connect/approve', requireAdmin, async (req, res) => {
+  if (!sec.on(req.body?.confirm)) return res.status(409).json({ error: 'Confirm payout approval' });
+  const s = connect.approvePayouts();
+  if (!s) return res.status(409).json({ error: 'No Connect account to approve' });
+  const attached = deposits.attachPayable();
+  logMoney(req, 'connect_approve', { accountId: s.accountId, attached });
+  await flushShop();
+  if (wantsJson(req)) return res.json({ ...connect.summary(), attached });
+  res.redirect(303, '/admin#connect');
+});
 app.post('/admin/connect/mock/complete', connectMockOnly, requireAdmin, (req, res) => {
   const s = connect.mockComplete();
   if (!s) return res.status(409).json({ error: 'start onboarding first' });
@@ -939,6 +998,14 @@ const depositShop = (req, res, next) => {
 const shopQs = () => (shopContext.shopId() ? `?shop=${encodeURIComponent(shopContext.shopId())}` : '');
 const backToDeposits = (res) => res.redirect(303, `/admin/deposits${shopQs()}`);
 const flushShop = async () => { if (shopContext.current()) await vendors.flush(shopContext.current().store); };
+app.post('/admin/deposits/archive-non-live', requireAdmin, depositShop, async (req, res) => {
+  if (!sec.on(req.body?.confirm)) return res.status(409).json({ error: 'Confirm archive of non-live deposits' });
+  const result = deposits.archiveNonLive();
+  logMoney(req, 'archive_non_live', result);
+  await flushShop();
+  if (wantsJson(req)) return res.json(result);
+  backToDeposits(res);
+});
 app.get('/admin/deposits', requireAdmin, depositShop, (req, res) => {
   if (wantsJson(req)) return res.json(deposits.summary());
   res.type('html').send(adminPages.depositsPage({
@@ -956,17 +1023,33 @@ app.post('/admin/deposits/:id/refund', requireAdmin, depositShop, async (req, re
   const d = deposits.find(req.params.id);
   if (!d) return res.status(404).json({ error: 'deposit not found' });
   try {
+    logMoney(req, 'refund', { depositId: d.id, bookingId: d.bookingId });
     const r = await deposits.refundDeposit(d, { reason: 'admin' });
     await flushShop();
     if (wantsJson(req)) return res.json(r);
     backToDeposits(res);
   } catch (e) { console.error('deposit refund failed:', e.message); return res.status(500).json({ error: 'refund failed' }); }
 });
+function moneyActor() {
+  return sec.adminActor();
+}
+function logMoney(req, action, extra = {}) {
+  const root = store.root;
+  const log = (root.db.moneyAudit ||= []);
+  log.unshift({ at: new Date().toISOString(), action, actor: moneyActor(req), ip: sec.clientIp(req), shopId: shopContext.shopId() || 'legacy', ...extra });
+  if (log.length > 500) log.length = 500;
+  root.save();
+}
 app.post('/admin/deposits/:id/release', requireAdmin, depositShop, async (req, res) => {
   const d = deposits.find(req.params.id);
   if (!d) return res.status(404).json({ error: 'deposit not found' });
+  const held = d.status === 'disputed' || d.status === 'paused' || d.payoutPaused || d.cardDispute;
+  if (held && !sec.on(req.body?.confirm_release)) {
+    return res.status(409).json({ error: 'Confirm force-release of this held deposit', needsConfirm: true });
+  }
   try {
-    const r = await deposits.releaseDeposit(d, { force: true });
+    logMoney(req, 'release', { depositId: d.id, bookingId: d.bookingId, held: !!held });
+    const r = await deposits.releaseDeposit(d, { force: true, by: moneyActor(req) });
     await flushShop();
     if (wantsJson(req)) return res.json(r);
     backToDeposits(res);
@@ -990,7 +1073,8 @@ app.get('/admin/deposits/:id/photo/:pid', requireAdmin, depositShop, (req, res) 
 app.post('/admin/deposits/:id/prepay', requireAdmin, depositShop, (req, res) => {
   const d = deposits.find(req.params.id);
   if (!d) return res.status(404).json({ error: 'deposit not found' });
-  const f = disputes.setRequirePrepay(d.phone, sec.on(req.body?.on));
+  logMoney(req, 'prepay', { depositId: d.id, on: sec.on(req.body?.on) });
+  const f = disputes.setRequirePrepay(d.phone, sec.on(req.body?.on), { email: d.email, fingerprint: d.cardFingerprint });
   if (!f) return res.status(409).json({ error: 'customer is not flagged' });
   if (wantsJson(req)) return res.json({ ok: true, flag: f });
   backToDeposits(res);
@@ -1105,17 +1189,22 @@ async function maintainShops() {
   }
 }
 setInterval(() => { booking.expireHolds(); maintainShops().catch(() => {}); }, 60000).unref();
-async function depositsTickAll() {
-  const run = async () => {
-    try {
-      await deposits.tick({ sendSms: (to, body) => sendSms(to, body) });
-    } catch (e) { console.error('[deposits] tick failed:', e.message); }
-  };
-  await run();
-  for (const shop of vendors.all().filter((s) => s.status !== 'provisioning')) {
-    try { await vendors.run(shop.id, run, { suspended: true }); }
-    catch (e) { console.error('[deposits] shop tick failed:', e.message); }
-  }
+let depositsTickFlight = null;
+function depositsTickAll() {
+  if (depositsTickFlight) return depositsTickFlight;
+  depositsTickFlight = (async () => {
+    const run = async () => {
+      try {
+        await deposits.tick({ sendSms: (to, body) => sendSms(to, body) });
+      } catch (e) { console.error('[deposits] tick failed:', e.message); }
+    };
+    await run();
+    for (const shop of vendors.all().filter((s) => s.status !== 'provisioning')) {
+      try { await vendors.run(shop.id, run, { suspended: true }); }
+      catch (e) { console.error('[deposits] shop tick failed:', e.message); }
+    }
+  })().finally(() => { depositsTickFlight = null; });
+  return depositsTickFlight;
 }
 setInterval(() => { depositsTickAll().catch(() => {}); }, 60000).unref();
 app.locals.maintainShops = maintainShops;
@@ -1187,12 +1276,21 @@ function placeholderPasswords() {
 function bootChecks() {
   const mode = sec.modeInfo(), problems = [];
   console.log(`[mode] ${mode.production ? `production (${mode.reasons.join(', ')})` : 'development'}; demo/mock routes ${sec.demoAllowed() ? 'ON' : 'OFF'}${mode.production && sec.demoAllowed() ? ' (DEMO_MODE=1)' : ''}; twilio ${live ? 'live' : 'log-only'}; stripe ${env.STRIPE_SECRET_KEY ? 'on' : 'mock'}`);
+  const stripeKey = process.env.STRIPE_SECRET_KEY || '';
+  if (mode.production && /^(sk|rk)_live_/.test(stripeKey) && sec.on(process.env.DEMO_MODE)) {
+    const msg = 'DEMO_MODE=1 is set together with a live Stripe key. Refusing to start.';
+    console.error(`[security] FATAL: ${msg}`);
+    problems.push(msg);
+  }
   if (!mode.production) return problems;
   const pw = env.ADMIN_PASSWORD || '';
   if (!pw) problems.push('ADMIN_PASSWORD is not set (admin disabled)');
   else if (pw.length < 16 || [...placeholderPasswords()].some((p) => sec.safeEqual(p, pw))) problems.push('ADMIN_PASSWORD is weak (shorter than 16 characters or the .env.example placeholder)');
   if (!env.OWNER_PHONE || env.OWNER_PHONE === sec.PLACEHOLDER_PHONE) console.error('[security] WARNING: OWNER_PHONE is not set: owner alerts are recorded on /admin but not texted.');
-  for (const p of problems) console.error(`[security] WARNING: ${p}. Set a long random ADMIN_PASSWORD (20+ chars).`);
+  for (const p of problems) {
+    if (/live Stripe key/.test(p)) continue;
+    console.error(`[security] WARNING: ${p}. Set a long random ADMIN_PASSWORD (20+ chars).`);
+  }
   return problems;
 }
 app.locals.bootChecks = bootChecks;
@@ -1260,6 +1358,7 @@ process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e 
 process.on('uncaughtException', (e) => { console.error('[uncaughtException]', e && e.stack ? e.stack : e); process.exit(1); });
 {
   const problems = bootChecks();
+  if (problems.some((p) => /live Stripe key/.test(p))) { console.error('[security] refusing to start: DEMO_MODE=1 with a live Stripe key.'); process.exit(1); }
   if (problems.length && sec.isProduction() && sec.on(process.env.ADMIN_PASSWORD_STRICT)) { console.error('[security] ADMIN_PASSWORD_STRICT=1: refusing to start.'); process.exit(1); }
 }
 const port = env.PORT || 3000;

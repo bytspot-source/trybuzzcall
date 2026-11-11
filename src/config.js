@@ -47,8 +47,16 @@ function applyTZ() {
 function apply(map, meta = {}) {
   const clean = {};
   for (const k of KEYS) if (map && map[k] !== undefined && map[k] !== null) clean[k] = String(map[k]);
-  const keep = store.getOverride().stripeConnect; // Stripe Connect state (src/connect.js) survives re-applying the setup
-  store.setOverride({ values: clean, ...meta, appliedAt: new Date().toISOString(), ...(keep ? { stripeConnect: keep } : {}) });
+  const prev = store.getOverride();
+  const keep = prev.stripeConnect; // Stripe Connect state (src/connect.js) survives re-applying the setup
+  const rest = { ...meta };
+  const cap = Object.prototype.hasOwnProperty.call(rest, 'depositCapOverride') ? rest.depositCapOverride : prev.depositCapOverride;
+  delete rest.depositCapOverride;
+  store.setOverride({
+    values: clean, ...rest, appliedAt: new Date().toISOString(),
+    ...(keep ? { stripeConnect: keep } : {}),
+    ...(cap != null && cap !== '' ? { depositCapOverride: cap } : {}),
+  });
   applyTZ();
   return clean;
 }

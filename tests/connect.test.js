@@ -98,56 +98,54 @@ test('LEAD_FEE_WAIVED defaults ON (pilot); only an explicit 0/false turns it off
 });
 
 // ---------- depositLink: platform charges (Connect optional for payout) ----------
-test('without connected account: platform Checkout still created (payout pending)', async (t) => {
+test('without a charges-enabled account: direct checkout is refused', async (t) => {
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY });
   const f = fakeStripe(); connect.setStripe(f);
   const b = fakeBooking();
-  const url = await booking.depositLink(b, 'https://shop.example');
-  assert.equal(url, 'https://checkout.stripe.com/c/pay/cs_test_1');
-  assert.equal(f.calls.sessions.length, 1);
-  assert.equal(f.calls.sessions[0].o, undefined);
-  assert.equal(b.connectAccount, undefined);
+  await assert.rejects(() => booking.depositLink(b, 'https://shop.example'), { status: 409 });
+  assert.equal(f.calls.sessions.length, 0);
+  assert.equal(b.paid, false);
 });
 
-test('env account pending: still charges on platform; status refreshed for payout readiness', async (t) => {
+test('env account pending: refreshed, and checkout stays closed until charges are enabled', async (t) => {
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY, STRIPE_CONNECT_ACCOUNT_ID: 'acct_env_1' });
   const f = fakeStripe(); connect.setStripe(f);
-  assert.ok(await booking.depositLink(fakeBooking(), 'https://shop.example'));
+  await assert.rejects(() => booking.depositLink(fakeBooking(), 'https://shop.example'), { status: 409 });
   assert.deepEqual(f.calls.retrieve, ['acct_env_1']);
-  assert.equal(f.calls.sessions.length, 1);
+  assert.equal(f.calls.sessions.length, 0);
   assert.equal(connect.status(), 'pending');
   assert.equal(store.getOverride().stripeConnect.accountId, 'acct_env_1');
 });
 
-test('platform charge: no stripeAccount, transfer_group set, fee waived by default (no application_fee)', async (t) => {
+test('direct charge: Checkout is created on the connected account, with no application fee by default', async (t) => {
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY, STRIPE_CONNECT_ACCOUNT_ID: 'acct_env_2' });
-  const f = fakeStripe({ charges_enabled: true, details_submitted: true }); connect.setStripe(f);
+  const f = fakeStripe({ charges_enabled: true, details_submitted: true, requirements: { currently_due: [], disabled_reason: null } }); connect.setStripe(f);
   const b = fakeBooking(49);
   const url = await booking.depositLink(b, 'https://shop.example');
   assert.equal(url, 'https://checkout.stripe.com/c/pay/cs_test_1');
   assert.equal(f.calls.sessions.length, 1);
   const { p, o } = f.calls.sessions[0];
-  assert.equal(o, undefined);
+  assert.deepEqual(o, { stripeAccount: 'acct_env_2' });
   assert.equal(p.mode, 'payment');
   assert.equal(p.metadata.bookingId, b.id); assert.equal(p.client_reference_id, b.id);
   assert.equal(p.payment_intent_data.transfer_data, undefined);
   assert.equal(p.payment_intent_data.application_fee_amount, undefined);
-  assert.equal(p.payment_intent_data.transfer_group, b.id);
   assert.equal(p.payment_intent_data.metadata.bookingId, b.id);
   assert.equal(p.line_items[0].price_data.unit_amount, 4900);
   assert.equal(b.connectAccount, 'acct_env_2'); assert.equal(b.stripeSessionId, 'cs_test_1');
+  assert.equal(b.chargeModel, 'direct');
 });
 
 test('lead fee enabled: recorded on booking bookkeeping, not as Checkout application_fee', async (t) => {
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY, STRIPE_CONNECT_ACCOUNT_ID: 'acct_env_3', LEAD_FEE_WAIVED: '0', LEAD_FEE: '12' });
-  const f = fakeStripe({ charges_enabled: true }); connect.setStripe(f);
+  const f = fakeStripe({ charges_enabled: true, requirements: { currently_due: [], disabled_reason: null } }); connect.setStripe(f);
   const b20 = fakeBooking(20);
   await booking.depositLink(b20, 'https://shop.example');
   assert.equal(f.calls.sessions[0].p.payment_intent_data.application_fee_amount, undefined);
-  assert.equal(b20.applicationFeeCents, 666);
+  assert.equal(b20.applicationFeeCents, 0);
   const b49 = fakeBooking(49);
   await booking.depositLink(b49, 'https://shop.example');
-  assert.equal(b49.applicationFeeCents, 1200);
+  assert.equal(b49.applicationFeeCents, 0);
 });
 
 test('mock mode (no key): /pay/mock link unchanged, no Stripe client used', async (t) => {
@@ -218,8 +216,12 @@ test('live/test onboarding: creates an Express account once, then an Account Lin
   assert.equal(r1.headers.get('location'), 'https://connect.stripe.com/setup/s/test_link');
   assert.equal(f.calls.create.length, 1);
   const p = f.calls.create[0];
-  assert.equal(p.type, 'express');
-  assert.ok(p.capabilities.transfers.requested);
+  assert.equal(p.type, undefined);
+  assert.equal(p.controller.stripe_dashboard.type, 'full');
+  assert.equal(p.controller.losses.payments, 'stripe');
+  assert.equal(p.controller.fees.payer, 'account');
+  assert.ok(p.capabilities.card_payments.requested);
+  assert.equal(p.capabilities.transfers, undefined);
   assert.equal(p.business_profile.name, 'Test Plumbing');
   assert.equal(p.business_profile.url, 'https://shop.example');
   assert.deepEqual(f.calls.links[0], { account: 'acct_test_shop1', type: 'account_onboarding',
@@ -269,10 +271,9 @@ test('text flow, Stripe on but not connected: deposit still held on platform (Ch
   const b = await textToBooking('+14703330001');
   assert.ok(b);
   assert.equal(b.status, 'held'); assert.equal(b.amount, 49);
-  assert.equal(f.calls.sessions.length, 1);
-  assert.equal(f.calls.sessions[0].o, undefined);
+  assert.equal(f.calls.sessions.length, 0);
   const lead = store.db.leads.find((l) => l.phone === '+14703330001');
-  assert.match(lead.messages.at(-1).body, /checkout\.stripe\.com|deposit/i);
+  assert.ok(lead.messages.at(-1).body);
 });
 
 test('text flow, connected + charges enabled: deposit link is a platform Checkout tagged with Connect account', async (t) => {
@@ -282,7 +283,7 @@ test('text flow, connected + charges enabled: deposit link is a platform Checkou
   store.setOverride({ stripeConnect: { accountId: 'acct_ready', mode: 'test', chargesEnabled: true } });
   const b = await textToBooking('+14703330002');
   assert.equal(b.status, 'held');
-  assert.equal(f.calls.sessions[0].o, undefined);
+  assert.deepEqual(f.calls.sessions[0].o, { stripeAccount: 'acct_ready' });
   assert.equal(b.connectAccount, 'acct_ready');
   const lead = store.db.leads.find((l) => l.phone === '+14703330002');
   assert.match(lead.messages.at(-1).body, /checkout\.stripe\.com/);
@@ -312,7 +313,7 @@ test('text flow, mock mode: deposit GET is read-only; same-origin POST marks pai
 // ---------- Connect webhook ----------
 const SECRET = 'whsec_' + 'testsecret'.repeat(3);
 const paidEvent = (account, bookingId, extra = {}) => ({ id: 'evt_' + Math.random().toString(36).slice(2), type: 'checkout.session.completed', account, livemode: false,
-  data: { object: { id: 'cs_test_1', mode: 'payment', payment_status: 'paid', metadata: { bookingId }, client_reference_id: bookingId } }, ...extra });
+  data: { object: { id: 'cs_test_1', mode: 'payment', payment_status: 'paid', amount_total: 4900, currency: 'usd', metadata: { bookingId }, client_reference_id: bookingId } }, ...extra });
 
 test('connect webhook: bad signature rejected (400)', async (t) => {
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY, STRIPE_CONNECT_WEBHOOK_SECRET: SECRET });
@@ -352,7 +353,7 @@ test('connect webhook: checkout.session.completed marks the deposit paid once (i
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY, STRIPE_CONNECT_WEBHOOK_SECRET: SECRET });
   quiet(t);
   store.setOverride({ stripeConnect: { accountId: 'acct_ready', mode: 'test', chargesEnabled: true } });
-  const b = fakeBooking(); b.connectAccount = 'acct_ready';
+  const b = fakeBooking(); b.connectAccount = 'acct_ready'; b.stripeSessionId = 'cs_test_1';
   for (let i = 0; i < 2; i++) {
     const r = await req('/stripe/connect/webhook', { method: 'POST', ...signed(paidEvent('acct_ready', b.id), SECRET) });
     assert.equal(r.status, 200); assert.equal((await r.json()).ignored, undefined);
@@ -361,13 +362,13 @@ test('connect webhook: checkout.session.completed marks the deposit paid once (i
   assert.equal(x.paid, true); assert.equal(x.status, 'confirmed'); assert.equal(x.lead_fee_status, 'waived');
   const paidAlerts = store.db.alerts.filter((a) => /BOOKED \+ PAID/.test(a.body));
   assert.equal(paidAlerts.length, 1);
-  assert.match(paidAlerts[0].body, /held by BuzzCall|payout after the appointment|admin Deposits/i);
+  assert.match(paidAlerts[0].body, /Stripe account directly|Stripe Dashboard/i);
 });
 
 test('connect webhook: unpaid (async) session does not mark paid; booking tied to another account is ignored', async (t) => {
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY, STRIPE_CONNECT_WEBHOOK_SECRET: SECRET });
   store.setOverride({ stripeConnect: { accountId: 'acct_ready', mode: 'test', chargesEnabled: true } });
-  const b = fakeBooking();
+  const b = fakeBooking(); b.stripeSessionId = 'cs_test_1';
   const ev = paidEvent('acct_ready', b.id); ev.data.object.payment_status = 'unpaid';
   await req('/stripe/connect/webhook', { method: 'POST', ...signed(ev, SECRET) });
   assert.equal(store.findBooking(b.id).paid, false);
@@ -398,10 +399,14 @@ test('platform webhook (/stripe/webhook) still works for deposits in mock/dev mo
   reset(t);
   quiet(t);
   const b = fakeBooking();
+  b.stripeSessionId = 'cs_evt_p';
   const r = await req('/stripe/webhook', { method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: 'evt_p', type: 'checkout.session.completed', data: { object: { mode: 'payment', payment_status: 'paid', metadata: { bookingId: b.id } } } }) });
+    body: JSON.stringify({ id: 'evt_p', type: 'checkout.session.completed', data: { object: {
+      id: 'cs_evt_p', mode: 'payment', payment_status: 'paid', amount_total: 4900, currency: 'usd',
+      metadata: { bookingId: b.id }, client_reference_id: b.id } } }) });
   assert.equal(r.status, 200);
-  assert.equal(store.findBooking(b.id).paid, true);
+  assert.match(await r.text(), /connected-account webhook/);
+  assert.equal(store.findBooking(b.id).paid, false);
 });
 
 test('/health reports connect readiness without exposing anything secret', async (t) => {

@@ -150,6 +150,20 @@ function onboardingWelcome({ email, businessName } = {}) {
   } catch { return null; }
 }
 
+// Shop-owner notice (new device, Connect changes). No send unless RESEND_API_KEY is set.
+function ownerNotice(email, subject, text) {
+  try {
+    const address = String(email || '').trim().toLowerCase();
+    if (!validEmail(address)) return null;
+    if (!process.env.RESEND_API_KEY) {
+      console.log(`[email] owner notice skipped (RESEND_API_KEY not set): ${maskEmail(address)}`);
+      return null;
+    }
+    if (!claim('owner-notice', address)) { console.log(`[email] owner notice to ${maskEmail(address)} skipped: already sent recently`); return null; }
+    return queue({ to: address, subject: oneLine(subject, 150), text: String(text || '').slice(0, 4000), kind: 'owner notice' });
+  } catch { return null; }
+}
+
 function adminAlert(subject, text) {
   try {
     if (!adminLimiter().hit('admin').ok) { console.log('[email] admin alert skipped: hourly limit reached'); return null; }
@@ -170,4 +184,4 @@ function outcomeVerify(to, link, shopName) {
 }
 const reset = () => { inFlight.clear(); adminHourly = null; if (store.root.db.emailThrottle) store.root.db.emailThrottle = {}; };
 
-module.exports = { signup, adminAlert, onboardingWelcome, outcomeVerify, maskEmail, setFetch, settle, reset, RESEND_URL, SETUP_URL, DEFAULT_FROM, DEFAULT_ADMIN };
+module.exports = { signup, adminAlert, ownerNotice, onboardingWelcome, outcomeVerify, maskEmail, setFetch, settle, reset, RESEND_URL, SETUP_URL, DEFAULT_FROM, DEFAULT_ADMIN };

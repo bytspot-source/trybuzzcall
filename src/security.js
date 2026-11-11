@@ -119,4 +119,47 @@ const PLACEHOLDER_PHONE = '+10000000000';
 const escapeRe = (x) => String(x).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-module.exports = { modeInfo, onRender, isNanp, nanpReason, PLACEHOLDER_PHONE, escapeRe, sleep, clientIp, on, num, isProduction, demoAllowed, safeEqual, limiter, rateLimit, maskPhone, securityHeaders };
+// Counts stored on the platform database so a restart does not reset SMS or onboarding caps.
+// `name` is the bucket (one window type). Each key is a phone, IP, or shop id.
+function rateBucket(name) {
+  const root = () => require('./store').root;
+  const map = () => {
+    const db = root().db;
+    const all = (db.rateCaps ||= {});
+    return (all[name] ||= {});
+  };
+  return {
+    blocked(key, windowMs, max) {
+      if (!(max > 0)) return 0;
+      const e = map()[String(key)];
+      const now = Date.now();
+      if (!e || e.reset <= now || e.n < max) return 0;
+      return Math.ceil((e.reset - now) / 1000);
+    },
+    hit(key, windowMs) {
+      const now = Date.now();
+      const m = map();
+      const id = String(key);
+      let e = m[id];
+      if (!e || e.reset <= now) e = m[id] = { n: 0, reset: now + windowMs };
+      e.n += 1;
+      const stale = Object.keys(m).filter((k) => m[k].reset <= now);
+      for (const k of stale) delete m[k];
+      root().save();
+      return e.n;
+    },
+    clear() {
+      const db = root().db;
+      if (db.rateCaps) delete db.rateCaps[name];
+      root().save();
+    },
+  };
+}
+// The Basic-auth username is free text when ADMIN_USERNAME is unset, so it is not an identity.
+// When ADMIN_USERNAME is set, that configured name is the admin who passed the check.
+function adminActor() {
+  const name = String(process.env.ADMIN_USERNAME || '').trim();
+  return name ? `admin:${name.slice(0, 80)}` : 'admin';
+}
+
+module.exports = { modeInfo, onRender, isNanp, nanpReason, PLACEHOLDER_PHONE, escapeRe, sleep, clientIp, on, num, isProduction, demoAllowed, safeEqual, limiter, rateLimit, maskPhone, securityHeaders, rateBucket, adminActor };

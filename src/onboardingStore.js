@@ -35,7 +35,54 @@ function data() {
 }
 function save() { require('./store').root.save(); }
 
-const digits = (v) => String(v || '').replace(/\D/g, '');
+const digitsOnly = (v) => String(v || '').replace(/\D/g, '');
+function einKey() {
+  const envKey = String(process.env.EIN_ENCRYPTION_KEY || '');
+  if (envKey.length >= 16) return require('crypto').createHash('sha256').update(envKey).digest();
+  const root = require('./store').root;
+  if (!root.db.einKey) { root.db.einKey = require('crypto').randomBytes(32).toString('hex'); root.save(); }
+  return require('crypto').createHash('sha256').update(root.db.einKey).digest();
+}
+function sealEin(plain) {
+  const crypto = require('crypto');
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', einKey(), iv);
+  const enc = Buffer.concat([cipher.update(String(plain), 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `enc1.${iv.toString('base64url')}.${tag.toString('base64url')}.${enc.toString('base64url')}`;
+}
+function openEin(value) {
+  const s = String(value || '');
+  if (!s.startsWith('enc1.')) return digitsOnly(s);
+  try {
+    const crypto = require('crypto');
+    const [, iv, tag, data] = s.split('.');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', einKey(), Buffer.from(iv, 'base64url'));
+    decipher.setAuthTag(Buffer.from(tag, 'base64url'));
+    return digitsOnly(Buffer.concat([decipher.update(Buffer.from(data, 'base64url')), decipher.final()]).toString('utf8'));
+  } catch { return ''; }
+}
+function digits(v) {
+  return String(v || '').startsWith('enc1.') ? openEin(v) : digitsOnly(v);
+}
+function protectEin(reg) {
+  if (!reg || !reg.ein || String(reg.ein).startsWith('enc1.')) return reg;
+  const d = digitsOnly(reg.ein);
+  if (d.length < 4) return reg;
+  return { ...reg, ein: sealEin(d), einLast4: d.slice(-4), einSavedAt: new Date().toISOString() };
+}
+function expireEin(reg) {
+  if (!reg || !reg.ein || !reg.einSavedAt) return reg;
+  const ttl = sec.num(process.env.EIN_TTL_HOURS, 72);
+  if (!(ttl > 0)) return reg;
+  if (Date.now() - Date.parse(reg.einSavedAt) > ttl * 3600000) delete reg.ein;
+  return reg;
+}
+const spendApprovalRequired = () => {
+  const v = process.env.AUTO_SPEND_APPROVAL;
+  if (v === undefined || String(v).trim() === '') return true;
+  return sec.on(v);
+};
 function maskEin(value) {
   const d = digits(value);
   return d.length >= 4 ? `••-•••${d.slice(-4)}` : '';
@@ -109,27 +156,39 @@ function regionOf(city) {
   return states.has(code) ? code : '';
 }
 
-let limits = null;
+const CODE_BUCKETS = ['onboard-phone', 'onboard-ip', 'onboard-verify-ip'];
+function counter(name, windowMs, max) {
+  const bucket = sec.rateBucket(name);
+  return {
+    blocked: (key) => bucket.blocked(key, windowMs, max),
+    hit: (key) => {
+      const n = bucket.hit(key, windowMs);
+      return { ok: !(max > 0) || n <= max };
+    },
+  };
+}
 function limiters() {
   const phoneMax = Math.max(1, sec.num(process.env.ONBOARD_CODE_MAX_PER_PHONE, 5));
   const ipMax = Math.max(1, sec.num(process.env.ONBOARD_CODE_MAX_PER_IP, 10));
   const verifyMax = Math.max(1, sec.num(process.env.ONBOARD_VERIFY_MAX_PER_IP, 30));
-  if (!limits || limits.phoneMax !== phoneMax || limits.ipMax !== ipMax || limits.verifyMax !== verifyMax) {
-    limits = {
-      phoneMax, ipMax, verifyMax,
-      phone: sec.limiter({ windowMs: 3600000, max: phoneMax }),
-      ip: sec.limiter({ windowMs: 600000, max: ipMax }),
-      verifyIp: sec.limiter({ windowMs: 600000, max: verifyMax }),
-    };
-  }
-  return limits;
+  return {
+    phoneMax, ipMax, verifyMax,
+    phone: counter('onboard-phone', 3600000, phoneMax),
+    ip: counter('onboard-ip', 600000, ipMax),
+    verifyIp: counter('onboard-verify-ip', 600000, verifyMax),
+  };
 }
-function resetLimits() { limits = null; }
+function resetLimits() {
+  for (const name of CODE_BUCKETS) {
+    try { sec.rateBucket(name).clear(); } catch { /* store not ready */ }
+  }
+}
 
 module.exports = {
   CODE_TTL_MS, MAX_ATTEMPTS, GRANT_MS, HELD_MAX,
   enabled, provisionEnabled, a2pEnabled, maxPerDay, balanceFloor,
-  peek, data, save, digits, maskEin, redact, publicRegistration, forgetEin,
+  peek, data, save, digits, maskEin, redact, publicRegistration, forgetEin, protectEin, expireEin, sealEin,
+  spendApprovalRequired,
   shopRecord, callerTextsHeld, queueHeld, takeHeld, namesMismatch, regionOf,
   limiters, resetLimits,
 };

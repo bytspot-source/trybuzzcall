@@ -491,12 +491,8 @@ test('Connect ignores legacy account fallback in tenant contexts, including conf
   await run(a, async () => {
     assert.equal(connect.accountId(), null);
     const b = deposit(a);
-    // Platform charges still work without a tenant Connect account; payout stays pending.
-    const url = await booking.depositLink(b, BASE);
-    assert.ok(url);
+    await assert.rejects(() => booking.depositLink(b, BASE), { status: 409 });
     assert.equal(b.paid, false);
-    assert.ok(b.payUrl);
-    assert.equal(b.connectAccount, undefined);
   });
 });
 
@@ -513,16 +509,27 @@ test('Connect account creation is single-flight per tenant with metadata, stable
   assert.equal(calls.accounts.length, 2);
   for (const shop of [a, b]) {
     const call = calls.accounts.find((c) => c.params.metadata.shopId === shop.id);
-    assert.equal(call.options.idempotencyKey, `connect-${shop.id}-test`);
+    assert.equal(call.options.idempotencyKey, `connect-${shop.id}-test-full-1`);
     const link = calls.links.find((p) => p.account === `acct_${shop.id}`);
     assert.equal(link.refresh_url, `${BASE}/vendor/connect/refresh`);
     assert.equal(link.return_url, `${BASE}/vendor/connect/return`);
     const disk = JSON.parse(fs.readFileSync(path.join(shop.store.dataDir(), 'config.json'), 'utf8'));
     assert.equal(disk.stripeConnect.accountId, `acct_${shop.id}`);
   }
-  await run(a, () => connect.onboard(BASE));
+  await assert.rejects(run(a, () => connect.onboard(BASE)), { status: 409 });
   assert.equal(calls.accounts.length, 2);
   assert.equal(store.root.getOverride().stripeConnect, undefined);
+});
+
+test('reconnect after deauthorize uses a new account-creation idempotency key', async () => {
+  live(); const { calls } = fakeStripe(); const a = tenant();
+  await run(a, () => connect.onboard(BASE));
+  assert.equal(calls.accounts[0].options.idempotencyKey, `connect-${a.id}-test-full-1`);
+  await run(a, () => connect.deauthorize());
+  await run(a, () => connect.onboard(BASE));
+  assert.equal(calls.accounts.length, 2);
+  assert.equal(calls.accounts[1].options.idempotencyKey, `connect-${a.id}-test-full-2`);
+  assert.notEqual(calls.accounts[0].options.idempotencyKey, calls.accounts[1].options.idempotencyKey);
 });
 
 test('Connect creation failures release single-flight and reuse the idempotency key on retry', async () => {
@@ -552,18 +559,22 @@ test('Connect mock vendor paths and legacy admin paths stay separate', async () 
 test('deposits charge on the platform, tag Connect account when ready, without changing timezone code', async () => {
   live(); const { calls } = fakeStripe(); const a = tenant({ LEAD_FEE_WAIVED: '0', LEAD_FEE: '12' }), b = tenant();
   await Promise.all([run(a, () => connect.onboard(BASE)), run(b, () => connect.onboard(BASE))]);
+  for (const shop of [a, b]) await run(shop, () => connect.approvePayouts());
   for (const shop of [a, b]) {
     const held = deposit(shop);
-    await run(shop, () => booking.depositLink(held, BASE));
+    await run(shop, async () => {
+      const acct = connect.state();
+      if (acct) acct.chargesEnabled = true;
+      store.setOverride({ ...store.getOverride(), stripeConnect: { ...store.getOverride().stripeConnect, chargesEnabled: true } });
+      await booking.depositLink(held, BASE);
+    });
     const call = calls.sessions.at(-1);
-    assert.equal(call.options, undefined); // platform charge — no stripeAccount
+    assert.equal(call.options.stripeAccount, `acct_${shop.id}`);
     assert.equal(call.params.metadata.bookingId, held.id);
     assert.equal(call.params.metadata.shopId, shop.id);
-    assert.equal(call.params.metadata.connectAccount, `acct_${shop.id}`);
-    assert.equal(call.params.payment_intent_data.transfer_group, held.id);
     assert.equal(call.params.payment_intent_data.application_fee_amount, undefined);
     assert.equal(call.params.payment_intent_data.transfer_data, undefined);
-    assert.equal(held.applicationFeeCents, shop === a ? 1200 : 0); // a: fee on; b: pilot waiver default
+    assert.equal(held.applicationFeeCents, 0);
     assert.equal(held.paid, false); assert.equal(held.status, 'held');
     assert.equal(held.connectAccount, `acct_${shop.id}`);
     const disk = JSON.parse(fs.readFileSync(path.join(shop.store.dataDir(), 'db.json'), 'utf8'));
@@ -571,9 +582,9 @@ test('deposits charge on the platform, tag Connect account when ready, without c
   }
   const legacy = { id: 'booking_root', amount: 49, slotLabel: 'Tomorrow' };
   await booking.depositLink(legacy, BASE);
-  assert.equal(calls.sessions.at(-1).options, undefined);
+  assert.equal(calls.sessions.at(-1).options.stripeAccount, 'acct_legacy');
   assert.equal(calls.sessions.at(-1).params.metadata.bookingId, 'booking_root');
-  assert.equal(calls.sessions.at(-1).params.metadata.connectAccount, 'acct_legacy');
+  assert.equal(calls.sessions.at(-1).params.payment_intent_data.application_fee_amount, undefined);
 });
 
 test('Connect and deposit persistence failures reject without marking a payment successful', async () => {
@@ -583,8 +594,16 @@ test('Connect and deposit persistence failures reject without marking a payment 
   await assert.rejects(run(a, () => connect.onboard(BASE)), { status: 503 });
   assert.equal(calls.links.length, 0);
   a.store.status = status;
+  await run(a, () => {
+    const s = store.getOverride().stripeConnect;
+    if (s) store.setOverride({ stripeConnect: { ...s, detailsSubmitted: false, chargesEnabled: false } });
+  });
   await run(a, () => connect.onboard(BASE));
   assert.equal(calls.accounts.length, 1);
+  await run(a, () => {
+    const s = store.getOverride().stripeConnect;
+    store.setOverride({ stripeConnect: { ...s, chargesEnabled: true, payoutsApproved: true, disabledReason: null } });
+  });
   const held = deposit(a);
   a.store.status = () => ({ degraded: true });
   await assert.rejects(run(a, () => booking.depositLink(held, BASE)), { status: 503 });
