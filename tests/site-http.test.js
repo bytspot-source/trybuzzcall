@@ -310,8 +310,12 @@ test('public site over real local HTTP', { timeout: 60000 }, async (t) => {
     assert.match(html, /\(470\) 482-8377/);
     assert.match(html, /8735 Dunwoody Place/);
     const home = await site.publicResource('/');
-    assert.match(home, /job trades like Home Services/);
-    assert.match(home, /appointment trades like braiding/);
+    assert.match(home, /charged on the shop's own Stripe account/);
+    assert.match(home, /sets and discloses its own cancellation and refund rules/);
+    assert.match(home, /Refunds come from the shop/);
+    assert.match(home, /does not hold the money or decide refunds/);
+    assert.match(home, /href="refunds\.html">Deposit refund policy/);
+    assert.doesNotMatch(home, /24 hours ahead|trip fee|payout timing|fully refunded/);
   });
 
   await t.test('expected local page links and assets resolve, including cross-page and SVG fragments', async () => {
