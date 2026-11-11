@@ -351,7 +351,15 @@ test('P15/P17/P19: force-release confirm, audit log, live+demo boot refusal, EIN
   const no = await postRaw(`/admin/deposits/${d.id}/release`, { body: '{}', headers: { ...auth, origin, accept: 'application/json' } });
   assert.equal(no.status, 200);
   assert.equal(JSON.parse(no.body).reason, 'direct_model');
-  assert.ok(store.root.db.moneyAudit.some((row) => row.action === 'release' && row.depositId === d.id && row.ip));
+  const releaseAudit = store.root.db.moneyAudit.find((row) => row.action === 'release' && row.depositId === d.id);
+  assert.ok(releaseAudit && releaseAudit.ip);
+  assert.equal(releaseAudit.actor, 'admin');
+  process.env.ADMIN_USERNAME = 'kojo';
+  const named = { authorization: 'Basic ' + Buffer.from('kojo:' + ADMIN).toString('base64') };
+  const namedRelease = await postRaw(`/admin/deposits/${d.id}/release`, { body: '{}', headers: { ...named, origin, accept: 'application/json' } });
+  assert.equal(namedRelease.status, 200);
+  assert.equal(store.root.db.moneyAudit[0].actor, 'admin:kojo');
+  delete process.env.ADMIN_USERNAME;
 
   const savedNode = process.env.NODE_ENV;
   const savedDemo = process.env.DEMO_MODE;
@@ -399,17 +407,33 @@ test('P8: onboarding routes, captcha, VoIP lookup, OTP cap, spend approval', asy
   delete process.env.AUTO_ONBOARDING;
 
   process.env.CAPTCHA_REQUIRED = '1';
+  captcha.setVerifier(null);
+  const unconfigured = await postRaw('/setup', { body: JSON.stringify({ businessName: 'X' }), headers: { origin: base, accept: 'application/json' } });
+  assert.notEqual(unconfigured.status, 400);
+  assert.doesNotMatch(unconfigured.body, /not configured/);
   captcha.setVerifier(async (token) => token === 'ok-token');
   const missing = await postRaw('/setup', { body: JSON.stringify({ businessName: 'X' }), headers: { origin: base, accept: 'application/json' } });
   assert.equal(missing.status, 400);
   delete process.env.CAPTCHA_REQUIRED;
 
   process.env.LOOKUP_REJECT_VOIP = '1';
-  lookup.setLookup(async () => ({ lineType: 'nonFixedVoip' }));
+  process.env.ONBOARD_CODE_MAX_PER_PHONE = '1';
+  onboardingStore.resetLimits();
+  let lookups = 0;
+  lookup.setLookup(async () => { lookups += 1; return { lineType: 'mobile' }; });
   const { sendCode } = require('../src/onboarding');
+  const firstCode = await sendCode({ setupId: 's-rate', phone: '+14045550801', ip: '203.0.113.50', businessName: 'Rate Shop' });
+  const secondCode = await sendCode({ setupId: 's-rate-2', phone: '+14045550801', ip: '203.0.113.51', businessName: 'Rate Shop' });
+  assert.equal(firstCode.ok, true);
+  assert.equal(secondCode.status, 429);
+  assert.equal(lookups, 1, 'a rate-limited code does not call the paid lookup');
+  lookup.setLookup(async () => ({ lineType: 'nonFixedVoip' }));
+  onboardingStore.resetLimits();
   const voip = await sendCode({ setupId: 's1', phone: '+14045550555', ip: '203.0.113.9', businessName: 'Voip Shop' });
   assert.equal(voip.ok, false);
   delete process.env.LOOKUP_REJECT_VOIP;
+  delete process.env.ONBOARD_CODE_MAX_PER_PHONE;
+  onboardingStore.resetLimits();
   lookup.setLookup(null);
 
   process.env.OTP_MAX_PER_DAY = '1';
@@ -418,6 +442,12 @@ test('P8: onboarding routes, captcha, VoIP lookup, OTP cap, spend approval', asy
   const second = await sms.sendSms('+14045550667', 'code 222222', { kind: 'otp' });
   assert.equal(first.ok, true);
   assert.equal(second.skipped, 'otp_cap');
+  const savedCaps = JSON.parse(JSON.stringify(store.root.db.rateCaps));
+  sms.resetCap();
+  store.root.db.rateCaps = savedCaps;
+  store.root.save();
+  const afterRestart = await sms.sendSms('+14045550668', 'code 333333', { kind: 'otp' });
+  assert.equal(afterRestart.skipped, 'otp_cap');
   delete process.env.OTP_MAX_PER_DAY;
   sms.resetCap();
 
@@ -452,6 +482,79 @@ test('P12: a new Connect account needs admin approval before deposits attach', a
     assert.equal(d.connectAccountId, connect.payableAccount());
     assert.equal(d.payoutPendingConnect, false);
   });
+});
+
+test('X5: a set-up vendor cannot mint another Account Link from refresh', async (t) => {
+  reset(t, { STRIPE_SECRET_KEY: TEST_KEY });
+  const created = await vendors.create({ name: 'Refresh Shop', email: 'refresh-shop@example.com', values: { BUSINESS_TYPE: 'plumbing', BUSINESS_NAME: 'Refresh Shop' } });
+  await vendors.activate(created.token, 'long-password-refresh-1', 'long-password-refresh-1');
+  const session = await vendors.login('refresh-shop@example.com', 'long-password-refresh-1', { ip: '203.0.113.20', ua: 'device-a' });
+  const cookie = `buzzcall_vendor=${session.token}`;
+  let links = 0;
+  connect.setStripe({
+    accounts: { create: async () => { throw new Error('should not create'); } },
+    accountLinks: { create: async () => { links += 1; return { url: 'https://connect.example/should-not' }; } },
+  });
+  await vendors.run(created.shop.id, () => {
+    store.setOverride({ stripeConnect: { accountId: 'acct_done', mode: 'test', chargesEnabled: true, detailsSubmitted: true, source: 'onboarding', payoutsApproved: true } });
+  });
+  const res = await new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port: server.address().port, method: 'GET', path: '/vendor/connect/refresh', headers: { host: 'shop.example', cookie } }, (r) => {
+      r.resume(); r.on('end', () => resolve({ status: r.statusCode, location: r.headers.location }));
+    });
+    req.on('error', reject); req.end();
+  });
+  assert.equal(res.status, 303);
+  assert.equal(res.location, '/vendor#payments');
+  assert.equal(links, 0);
+  assert.ok(store.root.db.alerts.some((a) => a.kind === 'connect' && /onboarding refresh blocked/.test(a.body)));
+});
+
+test('X6: an admin raise above the pilot cap is the cap checkout uses', async (t) => {
+  reset(t, { DEPOSIT_AMOUNT_MAX: '50' });
+  const created = await vendors.create({ name: 'Raise Shop', email: 'raise-shop@example.com', values: { BUSINESS_TYPE: 'plumbing', BUSINESS_NAME: 'Raise Shop', DEPOSIT_AMOUNT: '49' } });
+  const origin = 'http://shop.example';
+  const raised = await postRaw(`/admin/vendors/${created.shop.id}/deposit-amount`, { body: JSON.stringify({ amount: '80', confirm: '1', confirm_above_cap: '1' }), headers: { ...auth, origin, accept: 'application/json', 'content-type': 'application/json' } });
+  assert.equal(raised.status, 303, raised.body);
+  await vendors.run(created.shop.id, async () => {
+    const b = bookingRow(80);
+    const url = await booking.depositLink(b, 'http://shop.example');
+    assert.ok(url);
+    assert.equal(b.depositBlocked, undefined);
+  });
+});
+
+test('Connect webhook alerts the platform on refund, dispute, and early fraud', async (t) => {
+  reset(t, { STRIPE_SECRET_KEY: TEST_KEY, STRIPE_CONNECT_WEBHOOK_SECRET: SECRET });
+  const created = await vendors.create({ name: 'Alert Shop', email: 'alert-shop@example.com', values: { BUSINESS_TYPE: 'plumbing', BUSINESS_NAME: 'Alert Shop' } });
+  const shop = vendors.get(created.shop.id);
+  await vendors.run(shop.id, () => {
+    store.setOverride({ stripeConnect: { accountId: 'acct_alert', mode: 'test', chargesEnabled: true, source: 'onboarding', payoutsApproved: true } });
+    const b = bookingRow(49, { stripeSessionId: 'cs_alert', phone: '+14045550999', connectAccount: 'acct_alert', status: 'confirmed', paid: true, paidAt: new Date().toISOString() });
+    const d = deposits.onBookingPaid(b, { chargeId: 'ch_alert', paymentIntentId: 'pi_alert' });
+    d.phone = b.phone;
+    store.save();
+  });
+  store.root.db.alerts = [];
+  const post = (type, object) => {
+    const event = { id: `evt_${type}_${Math.random().toString(36).slice(2, 6)}`, type, livemode: false, account: 'acct_alert', data: { object } };
+    const signedEvent = signed(event);
+    return postRaw('/stripe/connect/webhook', { body: signedEvent.payload, headers: { 'stripe-signature': signedEvent.signature } });
+  };
+  const refund = await post('charge.refunded', { id: 'ch_alert', payment_intent: 'pi_alert', amount: 4900, amount_refunded: 4900, refunded: true });
+  assert.equal(refund.status, 200, refund.body);
+  const dispute = await post('charge.dispute.created', { id: 'dp_alert', charge: 'ch_alert', payment_intent: 'pi_alert', amount: 4900, currency: 'usd', reason: 'fraudulent', status: 'needs_response' });
+  assert.equal(dispute.status, 200, dispute.body);
+  const fraud = await post('radar.early_fraud_warning.created', { id: 'issfr_alert', charge: 'ch_alert', payment_intent: 'pi_alert', fraud_type: 'unauthorized_use_of_card', actionable: true });
+  assert.equal(fraud.status, 200, fraud.body);
+  const bodies = store.root.db.alerts.map((a) => a.body).join('\n');
+  assert.match(bodies, /vendor refund/);
+  assert.match(bodies, /card dispute/);
+  assert.match(bodies, /early fraud warning/);
+  const flagged = await vendors.run(shop.id, () => deposits.findByBooking(store.db.bookings[0].id));
+  assert.ok(flagged.cardDispute);
+  assert.ok(flagged.fraudWarning);
+  assert.equal(flagged.status, 'refunded');
 });
 
 test('P5: depositsTickAll is single-flight', async (t) => {

@@ -134,8 +134,9 @@ app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, re
       case 'charge.refunded': {
         const d = deposits.findByPaymentIntent(typeof o.payment_intent === 'string' ? o.payment_intent : o.payment_intent?.id)
           || deposits.list().find((x) => x.chargeId === o.id);
-        if (d) deposits.mirrorRefund(d, o.amount_refunded != null ? o.amount_refunded : o.amount, { reason: 'charge.refunded' });
-        else return ignore('unknown charge');
+        if (!d) return ignore('unknown charge');
+        deposits.mirrorRefund(d, o.amount_refunded != null ? o.amount_refunded : o.amount, { reason: 'charge.refunded' });
+        await platformAlert(`BUZZ ${shopContext.current()?.shop?.name || env.BUSINESS_NAME || 'Shop'}: vendor refund on booking ${d.bookingId} ($${((d.refundedCents || 0) / 100).toFixed(2)} of $${((d.amountCents || 0) / 100).toFixed(2)}). The shop refunded in Stripe. Customer ${sec.maskPhone(d.phone || '')}.`, 'BuzzCall: vendor refund');
         break;
       }
       case 'charge.dispute.created':
@@ -146,7 +147,22 @@ app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, re
         const d = deposits.findByPaymentIntent(pi) || deposits.list().find((x) => x.chargeId === chargeId);
         if (!d) return ignore('unknown charge');
         deposits.mirrorDispute(d, o, { closed: event.type === 'charge.dispute.closed' });
-        await owner(null, `BUZZ ${env.BUSINESS_NAME || 'Shop'}: card dispute ${o.id || ''} ${event.type.endsWith('closed') ? 'closed' : 'opened'} on booking ${d.bookingId}. The shop handles it in Stripe. Customer ${sec.maskPhone(d.phone || '')}.`);
+        const shopName = shopContext.current()?.shop?.name || env.BUSINESS_NAME || 'Shop';
+        const closed = event.type.endsWith('closed');
+        await owner(null, `BUZZ ${shopName}: card dispute ${o.id || ''} ${closed ? 'closed' : 'opened'} on booking ${d.bookingId}. The shop handles it in Stripe. Customer ${sec.maskPhone(d.phone || '')}.`);
+        await platformAlert(`BUZZ ${shopName}: card dispute ${o.id || ''} ${closed ? 'closed' : 'opened'} on booking ${d.bookingId}. The shop handles it in Stripe. Customer ${sec.maskPhone(d.phone || '')}.`, closed ? 'BuzzCall: dispute closed' : 'BuzzCall: card dispute');
+        break;
+      }
+      case 'radar.early_fraud_warning.created':
+      case 'radar.early_fraud_warning.updated': {
+        const chargeId = typeof o.charge === 'string' ? o.charge : o.charge?.id;
+        const pi = typeof o.payment_intent === 'string' ? o.payment_intent : o.payment_intent?.id;
+        const d = deposits.findByPaymentIntent(pi) || deposits.list().find((x) => x.chargeId === chargeId);
+        if (!d) return ignore('unknown charge');
+        d.fraudWarning = { id: o.id || null, fraudType: o.fraud_type || null, actionable: o.actionable !== false, at: new Date().toISOString() };
+        d.updatedAt = new Date().toISOString();
+        store.save();
+        await platformAlert(`BUZZ ${shopContext.current()?.shop?.name || env.BUSINESS_NAME || 'Shop'}: early fraud warning ${o.id || ''} on booking ${d.bookingId}. The shop handles it in Stripe. BuzzCall did not refund this direct charge. Customer ${sec.maskPhone(d.phone || '')}.`, 'BuzzCall: fraud warning');
         break;
       }
       case 'account.updated':
@@ -1014,10 +1030,8 @@ app.post('/admin/deposits/:id/refund', requireAdmin, depositShop, async (req, re
     backToDeposits(res);
   } catch (e) { console.error('deposit refund failed:', e.message); return res.status(500).json({ error: 'refund failed' }); }
 });
-function moneyActor(req) {
-  const creds = basicCreds(req);
-  const user = creds && creds.user ? String(creds.user).slice(0, 40) : 'admin';
-  return `admin:${user}`;
+function moneyActor() {
+  return sec.adminActor();
 }
 function logMoney(req, action, extra = {}) {
   const root = store.root;

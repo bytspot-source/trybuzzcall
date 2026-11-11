@@ -649,7 +649,8 @@ test('vendor isolation and verified provider routing over local HTTP', { timeout
       check(await f.vendors.run(shop.id, () => !!f.store.findBooking(own.id) && !f.store.findBooking(other.id)), 'Bookings stay in their own stores');
     }
     assert.equal(f.store.root.db.bookings.length, 0, 'Connect routing never creates root bookings');
-    assert.equal(f.store.root.db.alerts.length, 0, 'Concurrent payment alerts never escape into root');
+    assert.ok(f.store.root.db.alerts.every((a) => a.kind === 'connect'), 'Payment texts stay on the shop; only Connect admin alerts are on the platform record');
+    assert.ok(f.store.root.db.alerts.every((a) => !/BOOKED|tel:/.test(a.body)), 'A paid booking alert is not copied onto the platform record');
   });
 
   await t.test('reviewed onboarding creates a distinct vendor without assigning legacy data or automatic braider billing', async t => {

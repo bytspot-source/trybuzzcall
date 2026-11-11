@@ -169,9 +169,14 @@ function leadFeeTotals() {
   return t;
 }
 
-const depositCap = () => {
+const depositCapEnv = () => {
   const sec = require('./security');
   return sec.num(process.env.DEPOSIT_AMOUNT_MAX, 50);
+};
+const depositCap = () => {
+  const base = depositCapEnv();
+  const over = Number(store.getOverride().depositCapOverride);
+  return Number.isFinite(over) && over > base ? over : base;
 };
 const applicationFeeCents = () => {
   const sec = require('./security');
@@ -269,4 +274,4 @@ async function voidOpenSessions(accountId) {
   return n;
 }
 
-module.exports = { cfg, vertical, trade, parseServices, nextSlots, hold, depositLink, markPaid, expireHolds, leadFeeTotals, connectParams, skipDeposit, voidOpenSessions, depositCap, applicationFeeCents };
+module.exports = { cfg, vertical, trade, parseServices, nextSlots, hold, depositLink, markPaid, expireHolds, leadFeeTotals, connectParams, skipDeposit, voidOpenSessions, depositCap, depositCapEnv, applicationFeeCents };

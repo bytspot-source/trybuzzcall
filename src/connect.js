@@ -48,9 +48,11 @@ function status() { const s = state(); return !s ? 'not_connected' : s.chargesEn
 const statusLabel = (st = status()) => ({ not_connected: 'Not connected', pending: 'Pending (onboarding not finished or Stripe review)', charges_enabled: 'Charges enabled' }[st]);
 
 function fromAccount(a, source) {
+  const profile = a.business_profile || {};
   return { accountId: a.id, mode: mode(), source, chargesEnabled: !!a.charges_enabled, detailsSubmitted: !!a.details_submitted,
     payoutsEnabled: !!a.payouts_enabled, requirementsDue: [...(a.requirements?.currently_due || [])].slice(0, 20),
-    disabledReason: a.requirements?.disabled_reason || null, checkedAt: new Date().toISOString(), accountType: a.type || 'standard' };
+    disabledReason: a.requirements?.disabled_reason || null, checkedAt: new Date().toISOString(), accountType: a.type || 'standard',
+    businessName: profile.name || null, businessUrl: profile.url || null, country: a.country || null };
 }
 function keepApproval(next, prev) {
   if (!prev) return next;
@@ -61,6 +63,11 @@ function keepApproval(next, prev) {
   }
   if (prev.depositsPaused) next.depositsPaused = prev.depositsPaused;
   if (prev.accountModel) next.accountModel = prev.accountModel;
+  if (prev.createAttempt) next.createAttempt = prev.createAttempt;
+  if (!next.businessName && prev.businessName) next.businessName = prev.businessName;
+  if (!next.businessUrl && prev.businessUrl) next.businessUrl = prev.businessUrl;
+  if (!next.country && prev.country) next.country = prev.country;
+  if (prev.nameMismatch) next.nameMismatch = true;
   return next;
 }
 // full (default): v1 controller properties equivalent to Accounts v2 dashboard=full,
@@ -93,12 +100,16 @@ function accountCreateParams(prefill = {}) {
   return params;
 }
 function notifyConnect(kind, detail) {
+  const shop = shopContext.current()?.shop;
+  const who = shop?.name || 'Legacy line';
+  const text = `${who}: ${detail}`;
+  try {
+    store.root.addAlert({ leadId: null, to: 'platform-admin', kind: 'connect', body: `Connect ${kind}: ${text}` });
+  } catch (e) { console.error('[connect] in-app alert failed:', e.message); }
   try {
     const mail = require('./email');
-    const shop = shopContext.current()?.shop;
-    const who = shop?.name || 'Legacy line';
-    mail.adminAlert(`BuzzCall: Connect ${kind}`, `${who}: ${detail}`);
-    if (shop?.email) mail.ownerNotice(shop.email, `BuzzCall payout account ${kind}`, `${who}: ${detail}`);
+    mail.adminAlert(`BuzzCall: Connect ${kind}`, text);
+    if (shop?.email) mail.ownerNotice(shop.email, `BuzzCall payout account ${kind}`, text);
   } catch (e) { console.error('[connect] notify failed:', e.message); }
 }
 // Account object (from retrieve or an account.updated event) -> state. Ignores other accounts.
@@ -106,6 +117,8 @@ function applyAccount(a) {
   if (!a || !a.id || a.id !== accountId()) return false;
   const prev = state();
   const next = keepApproval(fromAccount(a, prev?.source || 'onboarding'), prev);
+  const shopName = shopContext.current()?.shop?.name || '';
+  if (next.businessName && shopName && next.businessName.trim().toLowerCase() !== shopName.trim().toLowerCase()) next.nameMismatch = true;
   save(next);
   if (prev && prev.accountId === next.accountId && (prev.chargesEnabled !== next.chargesEnabled || prev.payoutsEnabled !== next.payoutsEnabled || prev.disabledReason !== next.disabledReason)) {
     notifyConnect('updated', `charges ${next.chargesEnabled ? 'on' : 'off'}, payouts ${next.payoutsEnabled ? 'on' : 'off'}${next.disabledReason ? `, ${next.disabledReason}` : ''}.`);
@@ -233,16 +246,23 @@ async function onboardAccount(BASE, prefill = {}) {
   let id = accountId(), created = false;
   if (!id) {
     const params = accountCreateParams(prefill);
+    const prev = stored();
+    const attempt = prev && prev.deauthorized ? (Number(prev.createAttempt) || 1) + 1 : (Number(prev?.createAttempt) || 1);
     const a = await stripe().accounts.create(params, ...(shopContext.current()
-      ? [{ idempotencyKey: `connect-${shopContext.shopId()}-${mode()}-${dashboardChoice()}` }] : []));
+      ? [{ idempotencyKey: `connect-${shopContext.shopId()}-${mode()}-${dashboardChoice()}-${attempt}` }] : []));
     const taken = await accountUsedElsewhere(a.id);
     if (taken) throw Object.assign(new Error('That Stripe account is already linked to another shop.'), { status: 409 });
     id = a.id; created = true;
     const rec = fromAccount(a, 'onboarding');
     rec.accountModel = dashboardChoice();
     rec.accountType = dashboardChoice() === 'full' ? 'standard' : 'express';
+    rec.createAttempt = attempt;
     if (prefill.name && a.business_profile?.name && String(a.business_profile.name).toLowerCase() !== String(prefill.name).toLowerCase()) rec.nameMismatch = true;
     flagNewAccount(rec);
+  }
+  if (!created && shopContext.current() && setupComplete()) {
+    noteSetupRefresh();
+    throw Object.assign(new Error('This Stripe account is already set up. Bank details are changed in the Stripe Dashboard, not from BuzzCall.'), { status: 409 });
   }
   if (shopContext.current()) await persistAccount();
   const link = await stripe().accountLinks.create({ account: id, type: 'account_onboarding',
@@ -255,10 +275,17 @@ function mockComplete() {
   save({ ...s, chargesEnabled: true, detailsSubmitted: true, payoutsEnabled: true, requirementsDue: [], checkedAt: new Date().toISOString() });
   return stored();
 }
-function deauthorize() {
+function setupComplete() {
   const s = state();
-  if (!s) return;
-  save({ ...s, chargesEnabled: false, deauthorized: true });
+  return !!(s && s.accountId && s.detailsSubmitted && s.chargesEnabled && !s.deauthorized);
+}
+function noteSetupRefresh() {
+  notifyConnect('onboarding refresh blocked', 'A signed-in session asked for a new Stripe onboarding link after this account was already set up. No link was created.');
+}
+function deauthorize() {
+  const s = stored();
+  if (!s || !s.accountId) return;
+  save({ ...s, chargesEnabled: false, deauthorized: true, createAttempt: s.createAttempt || 1 });
   notifyConnect('disconnected', 'Stripe was disconnected. Deposit links for this shop are stopped. The shop refunds any payment already taken in its own Stripe Dashboard.');
 }
 
@@ -280,9 +307,12 @@ function summary() {
     depositsReady: !checkoutBlock(), payoutsReady: !!checkoutAccount(), accountType: s?.accountType || (dashboardChoice() === 'full' ? 'standard' : 'express'),
     accountModel: s?.accountModel || dashboardChoice(),
     needsPayoutApproval: !!s?.needsPayoutApproval, payoutsApproved: !!s?.payoutsApproved,
-    depositsPaused: !!s?.depositsPaused };
+    depositsPaused: !!s?.depositsPaused,
+    businessName: s?.businessName || null, businessUrl: s?.businessUrl || null, country: s?.country || null,
+    nameMismatch: !!s?.nameMismatch };
 }
 
 module.exports = { mode, state, accountId, status, statusLabel, summary, refresh, ensureFresh, chargeAccount, payableAccount,
   checkoutBlock, checkoutAccount, markDepositsPaused, clearDepositsPause, accountUsedElsewhere, dashboardChoice, accountCreateParams,
-  approvePayouts, depositsReady, payoutsReady, onboard, mockComplete, deauthorize, applyAccount, livemodeOk, applicationFeeCents, stripe, setStripe };
+  approvePayouts, depositsReady, payoutsReady, onboard, mockComplete, deauthorize, applyAccount, livemodeOk, applicationFeeCents, stripe, setStripe,
+  setupComplete, noteSetupRefresh };

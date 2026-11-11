@@ -2,7 +2,7 @@
 
 The shop is the merchant of record for a customer deposit. Checkout is created on that shop's connected account. BuzzCall does not hold the money, does not transfer it, and does not claw it back. Refunds and disputes are handled in the shop's Stripe Dashboard. BuzzCall records them.
 
-This is the cutover from Stripe **test** mode (`DEMO_MODE=1`) to live charges. It does not turn `DEMO_MODE` or any `AUTO_*` flag on or off, and it does not call Stripe for you. Dashboard steps at the bottom are owner-only.
+This is the cutover from Stripe **test** mode (`DEMO_MODE=1`) to live charges. It does not turn `DEMO_MODE` or any `AUTO_*` flag on or off, and it does not call Stripe for you. Dashboard steps at the bottom are owner-only. Before the first deploy of this model, follow `docs/CUTOVER_DIRECT_CHARGES.md` (expire open platform Checkout Sessions, and handle any old platform-held live deposits by hand).
 
 Do this in order. Do not turn `DEMO_MODE` off, and do not put a live key in the environment, until the archive step has run.
 
@@ -60,6 +60,8 @@ Connected-account endpoint `{PUBLIC_BASE_URL}/stripe/connect/webhook` (scope **C
 - `charge.dispute.created`
 - `charge.dispute.updated`
 - `charge.dispute.closed`
+- `radar.early_fraud_warning.created`
+- `radar.early_fraud_warning.updated`
 - `account.updated`
 - `account.application.deauthorized`
 

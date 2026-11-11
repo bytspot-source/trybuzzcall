@@ -156,22 +156,33 @@ function regionOf(city) {
   return states.has(code) ? code : '';
 }
 
-let limits = null;
+const CODE_BUCKETS = ['onboard-phone', 'onboard-ip', 'onboard-verify-ip'];
+function counter(name, windowMs, max) {
+  const bucket = sec.rateBucket(name);
+  return {
+    blocked: (key) => bucket.blocked(key, windowMs, max),
+    hit: (key) => {
+      const n = bucket.hit(key, windowMs);
+      return { ok: !(max > 0) || n <= max };
+    },
+  };
+}
 function limiters() {
   const phoneMax = Math.max(1, sec.num(process.env.ONBOARD_CODE_MAX_PER_PHONE, 5));
   const ipMax = Math.max(1, sec.num(process.env.ONBOARD_CODE_MAX_PER_IP, 10));
   const verifyMax = Math.max(1, sec.num(process.env.ONBOARD_VERIFY_MAX_PER_IP, 30));
-  if (!limits || limits.phoneMax !== phoneMax || limits.ipMax !== ipMax || limits.verifyMax !== verifyMax) {
-    limits = {
-      phoneMax, ipMax, verifyMax,
-      phone: sec.limiter({ windowMs: 3600000, max: phoneMax }),
-      ip: sec.limiter({ windowMs: 600000, max: ipMax }),
-      verifyIp: sec.limiter({ windowMs: 600000, max: verifyMax }),
-    };
-  }
-  return limits;
+  return {
+    phoneMax, ipMax, verifyMax,
+    phone: counter('onboard-phone', 3600000, phoneMax),
+    ip: counter('onboard-ip', 600000, ipMax),
+    verifyIp: counter('onboard-verify-ip', 600000, verifyMax),
+  };
 }
-function resetLimits() { limits = null; }
+function resetLimits() {
+  for (const name of CODE_BUCKETS) {
+    try { sec.rateBucket(name).clear(); } catch { /* store not ready */ }
+  }
+}
 
 module.exports = {
   CODE_TTL_MS, MAX_ATTEMPTS, GRANT_MS, HELD_MAX,

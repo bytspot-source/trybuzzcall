@@ -28,9 +28,9 @@ function sendAllowed(phone, ip) {
 }
 async function sendCode({ setupId, phone, ip, businessName }) {
   if (!sec.isNanp(phone)) return fail('Use a US or Canada mobile number.', 422);
+  if (!sendAllowed(phone, ip || 'unknown')) return fail('Too many codes were sent. Try again later.', 429);
   const line = await require('./lookup').lineType(phone);
   if (!line.ok) return fail(line.error || 'Use a mobile number.', 422);
-  if (!sendAllowed(phone, ip || 'unknown')) return fail('Too many codes were sent. Try again later.', 429);
   const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
   data().verifications[setupId] = {
     phone, codeHash: hash(code), expiresAt: Date.now() + CODE_TTL_MS, attempts: 0, sentAt: new Date().toISOString(),
