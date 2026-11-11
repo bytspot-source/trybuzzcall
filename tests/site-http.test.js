@@ -292,24 +292,30 @@ test('public site over real local HTTP', { timeout: 60000 }, async (t) => {
     }
   });
 
-  await t.test('refund policy is trade-agnostic: job trades and appointment trades, no plumbing/HVAC/braider-only wording', async () => {
+  await t.test('refund policy: the shop refunds a direct charge; BuzzCall does not', async () => {
     const html = await site.publicResource('/refunds');
-    const intro = html.slice(html.indexOf('<p>This policy covers'));
-    assert.match(intro, /appointment or a job/i);
-    assert.match(html, /<b>Job trades<\/b>/);
-    assert.match(html, /<b>Appointment trades<\/b>/);
-    assert.ok(html.includes('id="appointment-trades"'), 'appointment trades section anchor');
-    assert.ok(html.includes('href="#appointment-trades"'), 'intro links to appointment trades section');
-    assert.ok(!/a participating plumbing or HVAC business/i.test(html), 'scope must not be plumbing/HVAC-only');
-    assert.ok(!/\bstylist\b[^.]*\("the stylist"\)/i.test(html), 'defined term must not be "the stylist"');
-    // existing rules are unchanged
-    for (const rule of [/100% of your deposit back/, /cancel at least 24 hours before/, /within 30 days/, /within 15 minutes/, /original card/, /5\u201310 business days/]) assert.match(html, rule);
+    assert.match(html, /plumbing and HVAC shops, braiders/);
+    assert.match(html, /merchant of record/);
+    assert.match(html, /direct charge on the <b>shop's own Stripe account<\/b>/);
+    assert.match(html, /does not hold, escrow, or transfer/);
+    assert.match(html, /<b>Contact the shop\.<\/b>/);
+    assert.match(html, /Stripe Dashboard/);
+    assert.match(html, /id="shops"/);
+    assert.match(html, /href="terms\.html#deposits"/);
+    assert.match(html, /href="terms\.html#billing"/);
+    assert.doesNotMatch(html, /100% of your deposit back|cancel at least 24 hours before|within 30 days|within 15 minutes/);
+    assert.doesNotMatch(html, /BuzzCall collects|pause the shop's payout|issued by BuzzCall/i);
     assert.match(html, /no partial refunds/);
     assert.match(html, /hello@trybuzzcall\.com/);
     assert.match(html, /\(470\) 482-8377/);
+    assert.match(html, /8735 Dunwoody Place/);
     const home = await site.publicResource('/');
-    assert.match(home, /job trades like Home Services/);
-    assert.match(home, /appointment trades like braiding/);
+    assert.match(home, /charged on the shop's own Stripe account/);
+    assert.match(home, /sets and discloses its own cancellation and refund rules/);
+    assert.match(home, /Refunds come from the shop/);
+    assert.match(home, /does not hold the money or decide refunds/);
+    assert.match(home, /href="refunds\.html">Deposit refund policy/);
+    assert.doesNotMatch(home, /24 hours ahead|trip fee|payout timing|fully refunded/);
   });
 
   await t.test('expected local page links and assets resolve, including cross-page and SVG fragments', async () => {
