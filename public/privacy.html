@@ -6,10 +6,10 @@
 <nav><a href="privacy.html">Privacy</a><a href="terms.html">Terms</a><a href="refunds.html">Refunds</a><a href="sms-consent.html">SMS Consent</a></nav></div></header>
 <main class="doc"><div class="wrap">
 <h1>Privacy Policy</h1>
-<p class="meta">Last updated Nov 4, 2026</p>
+<p class="meta">Last updated Nov 11, 2026</p>
 
-<p>This Privacy Policy explains how <b>TryBuzzCall LLC</b> ("we," "us") collects, uses, shares, and protects information through <b>BuzzCall</b>, our missed-call text-back service, and through this website, trybuzzcall.com.</p>
-<p>BuzzCall is used by local service businesses such as hair braiders, beauty pros, plumbers, HVAC and other home-service companies ("Shops"). When you call a Shop that uses BuzzCall and the call is missed, BuzzCall texts you back on that Shop's behalf to collect your name and what you need, offer appointment times, take an optional booking deposit, and alert the Shop. In that role we process your information on behalf of the Shop you contacted.</p>
+<p>This Privacy Policy explains how <b>TryBuzzCall LLC</b>, a Georgia limited liability company owned by Bytspot Inc. ("we," "us"), collects, uses, shares, and protects information through <b>BuzzCall</b>, our missed-call text-back service, and through this website, trybuzzcall.com.</p>
+<p>BuzzCall is used by local shops, first plumbing and HVAC, and also braiders and similar appointment businesses ("Shops"). When you call a Shop that uses BuzzCall and the call is missed, BuzzCall texts you back on that Shop's behalf to collect your name and what you need, offer appointment times, send a link so you can pay that Shop a booking deposit, and alert the Shop. <b>The Shop is the sender of those texts.</b> We process your information on behalf of the Shop you contacted. A deposit is charged on the Shop's own Stripe account. BuzzCall does not hold, escrow, or transfer that money, and BuzzCall does not decide a refund of it.</p>
 
 <p class="highlight">No mobile information will be shared with third parties or affiliates for marketing or promotional purposes. Mobile numbers and SMS opt-in data and consent are not shared with or sold to third parties or affiliates for marketing purposes. Text messaging originator opt-in data and consent will not be shared with any third parties, except the service providers that help us deliver the messaging service (such as our SMS carrier provider).</p>
 
@@ -23,12 +23,13 @@
 <li><b>Name and job details</b> you give us by text, such as your name, the problem you need help with (for example "water heater leak" or "AC out"), your address if you share it, whether the job is urgent, and your preferred appointment time or callback window.</li>
 <li><b>Message content:</b> the text messages you send to and receive from the Shop's BuzzCall number.</li>
 <li><b>Booking and deposit records:</b> the time slot you picked, booking status, deposit amount, and whether the deposit was paid or refunded.</li>
-<li><b>Payment information:</b> deposits are paid on a secure checkout page hosted by <b>Stripe</b>. Your card number and other card details go directly to Stripe. <b>We do not receive or store your full card number or card security code.</b> We receive limited information from Stripe, such as payment status, amount, and a transaction reference.</li>
+<li><b>Payment information:</b> a deposit is paid on a secure checkout page hosted by <b>Stripe</b>, and the charge is on the Shop's own Stripe account. Your card number and other card details go directly to Stripe. <b>We do not receive or store your full card number or card security code.</b> We receive limited information from Stripe, such as payment status, amount, and a transaction reference. The Shop refunds that charge in its own Stripe Dashboard. We keep a record of that status.</li>
 </ul>
 <h3>From Shops (our business customers)</h3>
 <ul>
 <li>Business name, owner or contact name, business phone numbers, email address, business hours and service details, and information needed for carrier (A2P 10DLC) texting registration.</li>
-<li>Subscription billing details, handled by Stripe (we do not store full card numbers).</li>
+<li>Subscription billing details for the Shop's BuzzCall plan, handled by Stripe on BuzzCall's account (we do not store full card numbers).</li>
+<li>If the Shop uses arrival check-in, the time, the IP address, and location only if the browser allows it. That record is kept for the Shop. It is not a decision to move a customer's money.</li>
 <li>Emails you submit to our waitlist on this website.</li>
 </ul>
 <h3>From this website</h3>
@@ -42,7 +43,7 @@
 <li>To text you back after a missed call, collect your name and job details, and continue the conversation you started.</li>
 <li>To offer appointment times, hold a slot, send a deposit link, and send booking confirmations and related service updates.</li>
 <li>To alert the Shop you called with your name, phone number, job details, and booking status so they can call you back or do the job.</li>
-<li>To process deposits and refunds through Stripe.</li>
+<li>To send a deposit link that charges the Shop's own Stripe account, and to record whether that payment was paid or later refunded by the Shop. BuzzCall does not hold that money and does not decide the refund.</li>
 <li>To honor opt-out (STOP) and help (HELP) requests.</li>
 <li>To provide, maintain, secure, and improve BuzzCall, including preventing fraud, abuse, and spam.</li>
 <li>Call and text details may be used, with personal details (such as your phone number, email, and name) removed, to improve BuzzCall's service, including AI features. They are never sold or shared for marketing. If you reply STOP, your details are left out of this use.</li>
@@ -58,7 +59,7 @@
 <li><b>With service providers</b> that process information on our behalf, under contracts or terms that limit how they may use it:
  <ul>
  <li><b>Twilio</b>, to send and receive text messages and route calls.</li>
- <li><b>Stripe</b>, to process deposits, refunds, and Shop subscription payments.</li>
+ <li><b>Stripe</b>, to charge a customer deposit on the Shop's own Stripe account, and to bill the Shop for its BuzzCall subscription. The Shop refunds a customer deposit in its own Stripe Dashboard.</li>
  <li><b>OpenAI</b> (optional, only for Shops that turn it on), to help write natural replies in the text conversation. When enabled, message text and job details from the conversation may be sent to OpenAI to generate a reply.</li>
  <li>Our website and server hosting provider.</li>
  </ul></li>
@@ -68,7 +69,7 @@
 <p>As stated above, mobile numbers and SMS opt-in data and consent are never shared with or sold to third parties or affiliates for their marketing or promotional purposes.</p>
 
 <h2 id="sms">4. Text messages and opt-out</h2>
-<p>BuzzCall texts are conversational replies to a call you placed to a Shop. See <a href="sms-consent.html">How text consent works</a> and our <a href="terms.html#sms">SMS Terms</a>. Message frequency varies. Message and data rates may apply. Reply <b>STOP</b> at any time to stop messages from that Shop's number, or <b>HELP</b> for help. After you reply STOP you will receive one confirmation message and no further texts unless you opt back in (for example by replying START).</p>
+<p>BuzzCall texts are conversational replies, sent on behalf of the Shop you called. The Shop is the sender. See <a href="sms-consent.html">How text consent works</a> and our <a href="terms.html#sms">SMS Terms</a>. Message frequency varies. Message and data rates may apply. Reply <b>STOP</b> at any time to stop messages from that Shop's number, or <b>HELP</b> for help. After you reply STOP you will receive one confirmation message and no further texts unless you opt back in (for example by replying START).</p>
 
 <h2 id="retention">5. How long we keep information</h2>
 <ul>
@@ -85,7 +86,7 @@
 <h2 id="rights">7. Your choices and rights</h2>
 <ul>
 <li><b>Stop texts:</b> reply STOP to any BuzzCall message.</li>
-<li><b>Access, correct, or delete:</b> you can ask us for a copy of the information we hold about you, or ask us to correct or delete it. Because we process caller information on behalf of Shops, we may work with the Shop you contacted to respond. We may keep information where we must by law, to complete a booking or refund, or to honor an opt-out.</li>
+<li><b>Access, correct, or delete:</b> you can ask us for a copy of the information we hold about you, or ask us to correct or delete it. Because we process caller information on behalf of Shops, we may work with the Shop you contacted to respond. We may keep information where we must by law, to complete a booking, to keep a payment record for the Shop, or to honor an opt-out. A refund of a deposit is requested from the Shop.</li>
 <li><b>State privacy rights:</b> depending on where you live, you may have additional rights under state law, such as to know, access, correct, or delete personal information, and to not be discriminated against for exercising these rights. We do not sell personal information or share it for targeted advertising.</li>
 </ul>
 <p>To make a request, contact us using the details below. We will verify your request, for example by asking you to confirm from the phone number involved, and respond within 45 days.</p>

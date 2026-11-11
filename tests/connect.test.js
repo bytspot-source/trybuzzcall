@@ -417,14 +417,36 @@ test('/health reports connect readiness without exposing anything secret', async
   assert.ok(!JSON.stringify(h).includes(TEST_KEY));
 });
 
-test('legal pages: deposits collected by BuzzCall, Stripe Connected Account Agreement linked; no draft banners', () => {
+test('legal pages: shop is merchant of record on a direct charge; no hold, escrow, or BuzzCall refund', () => {
   const terms = fs.readFileSync(path.join(__dirname, '../public/terms.html'), 'utf8');
   const refunds = fs.readFileSync(path.join(__dirname, '../public/refunds.html'), 'utf8');
-  assert.match(terms, /Deposits are collected by BuzzCall|collected by BuzzCall/);
-  assert.match(terms, /paid out after the appointment|Payout after the appointment/);
-  assert.match(terms, /processed by Stripe|Payments are processed by Stripe/);
+  const privacy = fs.readFileSync(path.join(__dirname, '../public/privacy.html'), 'utf8');
+  for (const html of [terms, refunds, privacy]) {
+    assert.match(html, /does not hold, escrow, or transfer/);
+    assert.match(html, /Last updated Nov 11, 2026/);
+    assert.doesNotMatch(html, /TODO\(legal\)/);
+    assert.doesNotMatch(html, /pending review by legal counsel/);
+    assert.doesNotMatch(html, /collected by BuzzCall|BuzzCall collects (it|the deposit|deposits)|BuzzCall holds the deposit/i);
+    assert.doesNotMatch(html, /Payout after the appointment|24 hours after the appointment|24-hour release/i);
+    assert.doesNotMatch(html, /pause your payout|pause the shop's payout|payout stays pending/i);
+    assert.doesNotMatch(html, /vendor debt|vendor balance owed/i);
+    assert.doesNotMatch(html, /BuzzCall may refund|Refunds are issued by BuzzCall|we will refund/i);
+  }
+  assert.match(terms, /merchant of record/);
+  assert.match(terms, /direct charge on your own Stripe account/);
   assert.match(terms, /href="https:\/\/stripe\.com\/connect-account\/legal"/);
-  assert.doesNotMatch(terms, /TODO\(legal\)/); assert.doesNotMatch(terms, /pending review by legal counsel/);
-  assert.doesNotMatch(refunds, /TODO\(legal\)/); assert.doesNotMatch(refunds, /pending review by legal counsel/);
-  assert.match(refunds, /BuzzCall collects|reply <b>NO<\/b>|\(470\) 482-8377/);
+  assert.match(terms, /The shop is the sender/);
+  assert.match(terms, /Message frequency varies/);
+  assert.match(terms, /Message and data rates may apply/);
+  assert.match(terms, /Reply STOP to opt out, HELP for help/);
+  assert.match(terms, /Fulton County, Georgia/);
+  assert.match(terms, /one free month of account credit/);
+  assert.match(terms, /no cash value/);
+  assert.match(refunds, /Contact the shop/);
+  assert.match(refunds, /Stripe Dashboard/);
+  assert.match(refunds, /\(470\) 482-8377/);
+  assert.match(refunds, /hello@trybuzzcall\.com/);
+  assert.doesNotMatch(refunds, /100% of your deposit back|cancel at least 24 hours before|within 15 minutes|within 30 days/);
+  assert.match(privacy, /The Shop is the sender/);
+  assert.match(privacy, /Shop's own Stripe account/);
 });
