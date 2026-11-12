@@ -29,6 +29,7 @@ Live rows (`stripeMode` `live` and `livemode` true) are left alone.
 | `STRIPE_WEBHOOK_SECRET` | Signing secret of the **platform** endpoint (Your account). Subscriptions only. |
 | `STRIPE_CONNECT_WEBHOOK_SECRET` | Signing secret of the **Connected accounts** endpoint. This is the deposit endpoint. |
 | `CONNECT_DASHBOARD` | `full` (default). Creates an Accounts v2 account (`POST /v2/core/accounts`) with `dashboard=full`, the shop paying Stripe's fees (`fees_collector=stripe`), and Stripe as the losses collector (`losses_collector=stripe`). The merchant `card_payments` capability is requested. `express` opts into the v2 form of a legacy Express account (`dashboard=express`, `fees_collector=application`, `losses_collector=application`, plus recipient `stripe_transfers`) and is not the pilot default. The choice is fixed when the account is created. |
+| `CONNECT_ACCOUNT_COUNTRY` | Two-letter country for `identity.country` on that create. Default `US` when unset. Stripe requires it in the same request as `configuration.merchant`. |
 | `DEPOSIT_MODEL` | `direct` (default). `platform_hold` keeps the old transfer code inert for tests. Product checkout does not use it. |
 | `DEPOSIT_AMOUNT_MAX` | Pilot cap, default `50` dollars. A vendor cannot set a higher deposit. An admin can, with a second confirmation. |
 | `DEPOSIT_APPLICATION_FEE_CENTS` | Default `0`. No application fee on the pilot deposit. |

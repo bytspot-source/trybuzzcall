@@ -228,6 +228,7 @@ test('live/test onboarding: creates a full-dashboard Accounts v2 account once, t
   assert.equal(p.defaults.responsibilities.losses_collector, 'stripe');
   assert.equal(p.configuration.merchant.capabilities.card_payments.requested, true);
   assert.equal(p.configuration.recipient, undefined);
+  assert.equal(p.identity.country, 'us');
   assert.equal(p.display_name, 'Test Plumbing');
   assert.equal(p.defaults.profile.doing_business_as, 'Test Plumbing');
   assert.equal(p.defaults.profile.business_url, 'https://shop.example');
@@ -410,6 +411,23 @@ test('connect webhook: account.updated sets status; deauthorized turns deposits 
   assert.equal(connect.status(), 'not_connected'); assert.equal(connect.chargeAccount(), null);
 });
 
+test('identity.country defaults to us and CONNECT_ACCOUNT_COUNTRY overrides it', (t) => {
+  const prev = process.env.CONNECT_ACCOUNT_COUNTRY;
+  delete process.env.CONNECT_ACCOUNT_COUNTRY;
+  t.after(() => {
+    if (prev === undefined) delete process.env.CONNECT_ACCOUNT_COUNTRY;
+    else process.env.CONNECT_ACCOUNT_COUNTRY = prev;
+  });
+  assert.equal(connect.accountCountry(), 'us');
+  assert.equal(connect.accountCreateParams({ name: 'Test Plumbing' }).identity.country, 'us');
+  process.env.CONNECT_ACCOUNT_COUNTRY = ' CA ';
+  assert.equal(connect.accountCreateParams({}).identity.country, 'ca');
+  process.env.CONNECT_ACCOUNT_COUNTRY = 'usa';
+  assert.throws(() => connect.accountCreateParams({}), { status: 400, message: /two-letter ISO country code/ });
+  if (prev === undefined) delete process.env.CONNECT_ACCOUNT_COUNTRY;
+  else process.env.CONNECT_ACCOUNT_COUNTRY = prev;
+});
+
 test('express opt-in requests card payments and recipient stripe_transfers', async (t) => {
   const prev = process.env.CONNECT_DASHBOARD;
   process.env.CONNECT_DASHBOARD = 'express';
@@ -424,6 +442,7 @@ test('express opt-in requests card payments and recipient stripe_transfers', asy
   assert.equal(p.defaults.responsibilities.losses_collector, 'application');
   assert.equal(p.configuration.merchant.capabilities.card_payments.requested, true);
   assert.equal(p.configuration.recipient.capabilities.stripe_balance.stripe_transfers.requested, true);
+  assert.equal(p.identity.country, 'us');
   assert.equal(store.getOverride().stripeConnect.accountModel, 'express');
   assert.equal(store.getOverride().stripeConnect.accountsApi, 'v2');
 });
