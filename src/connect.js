@@ -76,37 +76,72 @@ function state() {
 }
 const accountId = () => state()?.accountId || null;
 // 'not_connected' | 'pending' | 'charges_enabled' (payouts ready when charges_enabled for Express)
-function status() { const s = state(); return !s ? 'not_connected' : s.chargesEnabled ? 'charges_enabled' : 'pending'; }
-const statusLabel = (st = status()) => ({ not_connected: 'Not connected', pending: 'Pending (onboarding not finished or Stripe review)', charges_enabled: 'Charges enabled' }[st]);
-
 function capActive(cap) { return !!(cap && cap.status === 'active'); }
 function isV2Account(a) {
   return !!(a && a.object === 'v2.core.account');
 }
-function v2OpenEntries(a) {
-  const entries = Array.isArray(a.requirements?.entries) ? a.requirements.entries : [];
-  return entries.filter((e) => e && e.awaiting_action_from !== 'stripe'
-    && (e.minimum_deadline?.status === 'currently_due' || e.minimum_deadline?.status === 'past_due'));
+const VERIFYING_CODES = new Set(['determining_status', 'requirements_pending_verification', 'requirements.pending_verification', 'pending_verification']);
+const PAST_DUE_CODES = new Set(['requirements_past_due', 'requirements.past_due']);
+function requirementEntries(a) {
+  return Array.isArray(a.requirements?.entries) ? a.requirements.entries : [];
 }
-// v2 has no details_submitted field. Treat the form as submitted once card payments are active, or once
-// Stripe is not waiting on the user for a currently_due or past_due requirement.
+function entryDeadline(e) { return e && e.minimum_deadline && e.minimum_deadline.status; }
+function isUserAction(e) { return !!(e && e.awaiting_action_from !== 'stripe'); }
+// Requirements the shop still has to complete (not items Stripe is checking).
+function v2OpenEntries(a) {
+  return requirementEntries(a).filter((e) => isUserAction(e) && (entryDeadline(e) === 'currently_due' || entryDeadline(e) === 'past_due'));
+}
+function v2PendingEntries(a) {
+  return requirementEntries(a).filter((e) => {
+    if (!e) return false;
+    if (e.awaiting_action_from === 'stripe') return true;
+    const st = entryDeadline(e);
+    return st === 'pending_verification' || st === 'under_review';
+  });
+}
+function v2UserPastDue(a) {
+  return requirementEntries(a).some((e) => isUserAction(e) && (entryDeadline(e) === 'past_due'
+    || (e.impact?.restricts_capabilities || []).some((c) => c && (c.capability === 'card_payments' || c.configuration === 'merchant') && c.deadline?.status === 'past_due')));
+}
+// v2 has no details_submitted field. The form is submitted once card payments are active, or once
+// Stripe is not waiting on the shop for a currently_due or past_due item (verification can still be pending).
 function v2DetailsSubmitted(a, chargesEnabled) {
   if (chargesEnabled) return true;
   if (!a.requirements) return false;
-  const summary = a.requirements.summary?.minimum_deadline?.status;
-  if (summary === 'currently_due' || summary === 'past_due') return false;
   return v2OpenEntries(a).length === 0;
 }
 function v2DisabledReason(a, card) {
-  if (!card || card.status === 'active') return null;
-  const code = card.status_details?.[0]?.code || null;
-  // determining_status and requirements_pending_verification are review, not a disabled account.
-  if (code && code !== 'determining_status' && code !== 'requirements_pending_verification') return code;
-  const entries = Array.isArray(a.requirements?.entries) ? a.requirements.entries : [];
-  const pastDue = entries.some((e) => e && (e.minimum_deadline?.status === 'past_due'
-    || (e.impact?.restricts_capabilities || []).some((c) => c && (c.capability === 'card_payments' || c.configuration === 'merchant') && c.deadline?.status === 'past_due')));
-  return pastDue ? 'requirements.past_due' : null;
+  if (card && card.status === 'active') return null;
+  if (v2UserPastDue(a)) return 'requirements.past_due';
+  const code = card?.status_details?.[0]?.code || a.requirements?.summary?.minimum_deadline?.status || null;
+  // A capability code of requirements_past_due is common while Stripe is only verifying.
+  // Trust the requirement entries: if the shop has nothing past due, this is review, not a disable.
+  if (v2PendingEntries(a).length || VERIFYING_CODES.has(code)) return 'requirements.pending_verification';
+  if (PAST_DUE_CODES.has(code) && v2OpenEntries(a).length) return 'requirements.past_due';
+  if (code && !VERIFYING_CODES.has(code) && !PAST_DUE_CODES.has(code)) return code;
+  return null;
 }
+function isHardDisabled(reason) {
+  return !!(reason && reason !== 'requirements.pending_verification');
+}
+function isVerifying(s) {
+  if (!s || s.chargesEnabled || s.deauthorized) return false;
+  if (s.disabledReason === 'requirements.pending_verification') return true;
+  return !!s.detailsSubmitted && Array.isArray(s.pendingVerification) && s.pendingVerification.length > 0;
+}
+function status() {
+  const s = state();
+  if (!s) return 'not_connected';
+  if (s.chargesEnabled) return 'charges_enabled';
+  if (isVerifying(s)) return 'verifying';
+  return 'pending';
+}
+const statusLabel = (st = status()) => ({
+  not_connected: 'Not connected',
+  pending: 'Pending (onboarding not finished or Stripe review)',
+  verifying: 'Stripe is verifying',
+  charges_enabled: 'Charges enabled',
+}[st] || st);
 function fromV2(a, source) {
   const card = a.configuration?.merchant?.capabilities?.card_payments;
   const payouts = a.configuration?.merchant?.capabilities?.stripe_balance?.payouts;
@@ -119,6 +154,7 @@ function fromV2(a, source) {
     chargesEnabled, detailsSubmitted: v2DetailsSubmitted(a, chargesEnabled),
     payoutsEnabled: capActive(payouts),
     requirementsDue: v2OpenEntries(a).map((e) => e.description).filter(Boolean).slice(0, 20),
+    pendingVerification: v2PendingEntries(a).map((e) => e.description).filter(Boolean).slice(0, 20),
     disabledReason: v2DisabledReason(a, card),
     checkedAt: new Date().toISOString(),
     accountType: a.dashboard === 'express' ? 'express' : 'standard',
@@ -129,9 +165,11 @@ function fromV2(a, source) {
 }
 function fromV1(a, source) {
   const profile = a.business_profile || {};
+  const reason = a.requirements?.disabled_reason || null;
   return { accountId: a.id, mode: mode(), source, chargesEnabled: !!a.charges_enabled, detailsSubmitted: !!a.details_submitted,
     payoutsEnabled: !!a.payouts_enabled, requirementsDue: [...(a.requirements?.currently_due || [])].slice(0, 20),
-    disabledReason: a.requirements?.disabled_reason || null, checkedAt: new Date().toISOString(), accountType: a.type || 'standard',
+    pendingVerification: [...(a.requirements?.pending_verification || [])].slice(0, 20),
+    disabledReason: reason, checkedAt: new Date().toISOString(), accountType: a.type || 'standard',
     businessName: profile.name || null, businessUrl: profile.url || null, country: a.country || null };
 }
 function fromAccount(a, source) {
@@ -262,11 +300,12 @@ function applyAccount(a) {
   }
   return true;
 }
-// Same pause rule as a v1 account.updated: charges off or a disabled reason stops new deposits.
+// Same pause rule as a v1 account.updated: charges off or a hard disable stops new deposits.
+// Pending verification is not a disable; those shops stay paused only while charges are off.
 function syncDepositPause(a) {
   if (!a) return stored();
   const row = fromAccount(a, 'webhook');
-  if (!row.chargesEnabled || row.disabledReason) return markDepositsPaused(row.disabledReason || 'charges_disabled');
+  if (!row.chargesEnabled || isHardDisabled(row.disabledReason)) return markDepositsPaused(row.disabledReason || 'charges_disabled');
   return clearDepositsPause();
 }
 async function retrieveAccount(id) {
@@ -287,7 +326,9 @@ async function retrieveAccount(id) {
 async function refresh() {
   const id = accountId();
   if (!id || mode() === 'mock') return state();
-  applyAccount(await retrieveAccount(id));
+  const account = await retrieveAccount(id);
+  applyAccount(account);
+  syncDepositPause(account);
   return state();
 }
 // Before reading payout readiness: re-check Stripe if the account isn't known to be ready, at most every 5 min.
@@ -315,7 +356,7 @@ function payableAccount() {
 function checkoutBlock() {
   const s = state();
   if (!s || !s.accountId || s.deauthorized || s.unverified) return 'not_connected';
-  if (s.disabledReason) return 'disabled';
+  if (isHardDisabled(s.disabledReason)) return 'disabled';
   if (s.depositsPaused) return 'deposits_paused';
   if (!s.chargesEnabled) return 'charges_disabled';
   if (s.needsPayoutApproval && !s.payoutsApproved) return 'needs_approval';
@@ -523,7 +564,8 @@ function summary() {
   const s = state();
   return { mode: mode(), status: status(), label: statusLabel(), accountId: s?.accountId || null, source: s?.source || null,
     chargesEnabled: !!s?.chargesEnabled, detailsSubmitted: !!s?.detailsSubmitted, payoutsEnabled: !!s?.payoutsEnabled,
-    requirementsDue: s?.requirementsDue || [], disabledReason: s?.disabledReason || null, checkedAt: s?.checkedAt || null,
+    requirementsDue: s?.requirementsDue || [], pendingVerification: s?.pendingVerification || [],
+    disabledReason: s?.disabledReason || null, checkedAt: s?.checkedAt || null,
     depositsReady: !checkoutBlock(), payoutsReady: !!checkoutAccount(), accountType: s?.accountType || (dashboardChoice() === 'full' ? 'standard' : 'express'),
     accountModel: s?.accountModel || dashboardChoice(),
     needsPayoutApproval: !!s?.needsPayoutApproval, payoutsApproved: !!s?.payoutsApproved,
