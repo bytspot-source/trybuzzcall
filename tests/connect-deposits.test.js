@@ -117,6 +117,7 @@ test('onboarding link creation (mocked Stripe): full-dashboard v2 account + acco
   assert.equal(f.calls.create[0].defaults.responsibilities.losses_collector, 'stripe');
   assert.equal(f.calls.create[0].configuration.merchant.capabilities.card_payments.requested, true);
   assert.equal(f.calls.create[0].configuration.recipient, undefined);
+  assert.equal(f.calls.create[0].identity.country, 'us');
   assert.deepEqual(f.calls.links[0], {
     account: 'acct_express_1',
     use_case: {

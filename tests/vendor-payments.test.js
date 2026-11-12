@@ -514,7 +514,7 @@ test('Connect account creation is single-flight per tenant with metadata, stable
   assert.equal(calls.accounts.length, 2);
   for (const shop of [a, b]) {
     const call = calls.accounts.find((c) => c.params.metadata.shopId === shop.id);
-    assert.equal(call.options.idempotencyKey, `connect-${shop.id}-test-full-1`);
+    assert.equal(call.options.idempotencyKey, `connect-${shop.id}-test-full-us-1`);
     const link = calls.links.find((p) => p.account === `acct_${shop.id}`);
     assert.equal(link.use_case.account_onboarding.refresh_url, `${BASE}/vendor/connect/refresh`);
     assert.equal(link.use_case.account_onboarding.return_url, `${BASE}/vendor/connect/return`);
@@ -529,11 +529,11 @@ test('Connect account creation is single-flight per tenant with metadata, stable
 test('reconnect after deauthorize uses a new account-creation idempotency key', async () => {
   live(); const { calls } = fakeStripe(); const a = tenant();
   await run(a, () => connect.onboard(BASE));
-  assert.equal(calls.accounts[0].options.idempotencyKey, `connect-${a.id}-test-full-1`);
+  assert.equal(calls.accounts[0].options.idempotencyKey, `connect-${a.id}-test-full-us-1`);
   await run(a, () => connect.deauthorize());
   await run(a, () => connect.onboard(BASE));
   assert.equal(calls.accounts.length, 2);
-  assert.equal(calls.accounts[1].options.idempotencyKey, `connect-${a.id}-test-full-2`);
+  assert.equal(calls.accounts[1].options.idempotencyKey, `connect-${a.id}-test-full-us-2`);
   assert.notEqual(calls.accounts[0].options.idempotencyKey, calls.accounts[1].options.idempotencyKey);
 });
 

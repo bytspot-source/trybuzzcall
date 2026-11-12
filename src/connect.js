@@ -162,6 +162,17 @@ function keepApproval(next, prev) {
 function dashboardChoice() {
   return String(process.env.CONNECT_DASHBOARD || 'full').trim().toLowerCase() === 'express' ? 'express' : 'full';
 }
+// identity.country is required before configuration.merchant (error identity_country_required).
+// The Accounts v2 create sample sends it in the same POST as configuration.merchant, as a lowercase
+// ISO 3166-1 alpha-2 code (https://docs.stripe.com/api/v2/core/accounts/create). Unset defaults to US.
+function accountCountry() {
+  const raw = String(process.env.CONNECT_ACCOUNT_COUNTRY ?? '').trim().toLowerCase();
+  if (!raw) return 'us';
+  if (!/^[a-z]{2}$/.test(raw)) {
+    throw Object.assign(new Error('CONNECT_ACCOUNT_COUNTRY must be a two-letter ISO country code. Leave it unset to use US.'), { status: 400, expose: true });
+  }
+  return raw;
+}
 function accountCreateParams(prefill = {}) {
   const shopId = shopContext.shopId();
   const express = dashboardChoice() === 'express';
@@ -185,6 +196,9 @@ function accountCreateParams(prefill = {}) {
     configuration: {
       merchant: { capabilities: { card_payments: { requested: true } } },
     },
+    // Same request as merchant. v2 does not require stripe_transfers for card_payments
+    // (https://docs.stripe.com/connect/account-capabilities?accounts-namespace=v2).
+    identity: { country: accountCountry() },
     include: ['configuration.merchant', 'defaults', 'identity', 'requirements'],
   };
   if (express) {
@@ -411,7 +425,7 @@ async function onboardAccount(BASE, prefill = {}) {
     let a;
     try {
       a = await stripe().v2.core.accounts.create(params, v2Options(shopContext.current()
-        ? { idempotencyKey: `connect-${shopContext.shopId()}-${mode()}-${dashboardChoice()}-${attempt}` } : {}));
+        ? { idempotencyKey: `connect-${shopContext.shopId()}-${mode()}-${dashboardChoice()}-${accountCountry()}-${attempt}` } : {}));
     } catch (e) { throw stripeOnboardError(e); }
     const taken = await accountUsedElsewhere(a.id);
     if (taken) throw Object.assign(new Error('That Stripe account is already linked to another shop.'), { status: 409 });
@@ -519,7 +533,7 @@ function summary() {
 }
 
 module.exports = { mode, state, accountId, status, statusLabel, summary, refresh, ensureFresh, chargeAccount, payableAccount,
-  checkoutBlock, checkoutAccount, markDepositsPaused, clearDepositsPause, accountUsedElsewhere, dashboardChoice, accountCreateParams,
+  checkoutBlock, checkoutAccount, markDepositsPaused, clearDepositsPause, accountUsedElsewhere, dashboardChoice, accountCountry, accountCreateParams,
   approvePayouts, depositsReady, payoutsReady, onboard, mockComplete, deauthorize, applyAccount, livemodeOk, applicationFeeCents, stripe, setStripe,
   setupComplete, noteSetupRefresh, syncDepositPause, constructEvent, isV2AccountEvent, eventAccountId, handleAccountNotification,
   V2_ACCOUNT_EVENTS, ACCOUNTS_API_VERSION };
