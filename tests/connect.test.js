@@ -491,7 +491,7 @@ test('v2 card_payments status drives charges_enabled, and a thin event refreshes
   store.setOverride({ stripeConnect: { accountId: 'acct_v2', mode: 'test', chargesEnabled: false, accountsApi: 'v2', source: 'onboarding' } });
   connect.applyAccount(v2account);
   assert.equal(connect.status(), 'pending');
-  assert.equal(connect.summary().disabledReason, 'requirements_past_due');
+  assert.equal(connect.summary().disabledReason, 'requirements.past_due');
   assert.equal(connect.checkoutBlock(), 'disabled');
   v2account.configuration.merchant.capabilities.card_payments = { status: 'active', status_details: [] };
   v2account.configuration.merchant.capabilities.stripe_balance.payouts = { status: 'active', status_details: [] };
@@ -504,6 +504,82 @@ test('v2 card_payments status drives charges_enabled, and a thin event refreshes
   assert.equal(connect.status(), 'charges_enabled');
   assert.equal(connect.summary().disabledReason, null);
   assert.equal(connect.summary().payoutsEnabled, true);
+});
+
+test('v2 sync treats Stripe-only review as verifying, not past due', async (t) => {
+  reset(t, { STRIPE_SECRET_KEY: TEST_KEY });
+  const verifying = {
+    id: 'acct_v2_review', object: 'v2.core.account', dashboard: 'full', display_name: 'Test Plumbing',
+    configuration: { merchant: { capabilities: {
+      card_payments: { status: 'restricted', status_details: [{ code: 'requirements_past_due' }] },
+      stripe_balance: { payouts: { status: 'pending', status_details: [] } },
+    } } },
+    requirements: {
+      entries: [
+        { description: 'individual.address.city', awaiting_action_from: 'stripe', minimum_deadline: { status: 'currently_due' } },
+        { description: 'individual.id_number', awaiting_action_from: 'stripe', minimum_deadline: { status: 'past_due' } },
+      ],
+      summary: { minimum_deadline: { status: 'past_due' } },
+    },
+  };
+  store.setOverride({ stripeConnect: { accountId: 'acct_v2_review', mode: 'test', chargesEnabled: false, detailsSubmitted: false,
+    accountsApi: 'v2', source: 'onboarding' } });
+  connect.applyAccount(verifying);
+  const s = connect.summary();
+  assert.equal(s.chargesEnabled, false);
+  assert.equal(s.payoutsEnabled, false);
+  assert.equal(s.detailsSubmitted, true);
+  assert.equal(s.status, 'verifying');
+  assert.equal(s.label, 'Stripe is verifying');
+  assert.equal(s.disabledReason, 'requirements.pending_verification');
+  assert.deepEqual(s.requirementsDue, []);
+  assert.deepEqual(s.pendingVerification, ['individual.address.city', 'individual.id_number']);
+  assert.equal(connect.checkoutBlock(), 'charges_disabled');
+});
+
+test('v1 pending verification maps to Stripe is verifying', async (t) => {
+  reset(t, { STRIPE_SECRET_KEY: TEST_KEY });
+  store.setOverride({ stripeConnect: { accountId: 'acct_v1_review', mode: 'test', chargesEnabled: false, source: 'onboarding' } });
+  connect.applyAccount({
+    id: 'acct_v1_review', object: 'account', type: 'standard',
+    charges_enabled: false, payouts_enabled: false, details_submitted: true, country: 'US',
+    business_profile: { name: 'Test Plumbing' },
+    requirements: {
+      currently_due: [], past_due: [], eventually_due: [],
+      pending_verification: ['individual.address.city', 'individual.id_number'],
+      disabled_reason: 'requirements.pending_verification',
+    },
+  });
+  const s = connect.summary();
+  assert.equal(s.detailsSubmitted, true);
+  assert.equal(s.status, 'verifying');
+  assert.equal(s.label, 'Stripe is verifying');
+  assert.equal(s.disabledReason, 'requirements.pending_verification');
+  assert.deepEqual(s.requirementsDue, []);
+  assert.deepEqual(s.pendingVerification, ['individual.address.city', 'individual.id_number']);
+  assert.equal(connect.checkoutBlock(), 'charges_disabled');
+});
+
+test('refresh clears a stale deposits pause once Stripe only has pending verification or charges on', async (t) => {
+  reset(t, { STRIPE_SECRET_KEY: TEST_KEY });
+  const account = {
+    id: 'acct_v2_refresh', object: 'v2.core.account', dashboard: 'full',
+    configuration: { merchant: { capabilities: {
+      card_payments: { status: 'active', status_details: [] },
+      stripe_balance: { payouts: { status: 'active', status_details: [] } },
+    } } },
+    requirements: { entries: [], summary: { minimum_deadline: { status: 'eventually_due' } } },
+  };
+  connect.setStripe({ v2: { core: { accounts: { retrieve: async () => account } } } });
+  store.setOverride({ stripeConnect: { accountId: 'acct_v2_refresh', mode: 'test', chargesEnabled: false, detailsSubmitted: false,
+    accountsApi: 'v2', source: 'onboarding', depositsPaused: true, depositsPausedReason: 'requirements_past_due', needsPayoutApproval: true, payoutsApproved: false } });
+  const row = await connect.refresh();
+  assert.equal(row.chargesEnabled, true);
+  assert.equal(row.detailsSubmitted, true);
+  assert.equal(row.payoutsEnabled, true);
+  assert.equal(row.depositsPaused, false);
+  assert.equal(connect.status(), 'charges_enabled');
+  assert.equal(connect.checkoutBlock(), 'needs_approval');
 });
 
 test('platform webhook (/stripe/webhook) still works for deposits in mock/dev mode', async (t) => {
