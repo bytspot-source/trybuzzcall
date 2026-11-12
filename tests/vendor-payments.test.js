@@ -33,13 +33,18 @@ function fakeStripe() {
   const sessions = new Map(), setupItems = new Map();
   const client = {
     accounts: {
-      create: async (params, options) => {
-        calls.accounts.push({ params, options });
-        return { id: `acct_${params.metadata.shopId || 'root'}`, charges_enabled: true, details_submitted: true };
-      },
       retrieve: async (id) => { calls.retrieves.push(id); return { id, charges_enabled: true }; },
     },
-    accountLinks: { create: async (params) => { calls.links.push(params); return { url: 'https://connect.example/onboard' }; } },
+    v2: { core: {
+      accounts: {
+        create: async (params, options) => {
+          calls.accounts.push({ params, options });
+          return { id: `acct_${params.metadata.shopId || 'root'}`, charges_enabled: true, details_submitted: true };
+        },
+        retrieve: async (id) => { calls.retrieves.push(id); return { id, charges_enabled: true }; },
+      },
+      accountLinks: { create: async (params) => { calls.links.push(params); return { url: 'https://connect.example/onboard' }; } },
+    } },
     checkout: { sessions: { create: async (params, options) => {
       calls.sessions.push({ params, options });
       const key = options?.idempotencyKey;
@@ -499,8 +504,8 @@ test('Connect ignores legacy account fallback in tenant contexts, including conf
 test('Connect account creation is single-flight per tenant with metadata, stable idempotency and vendor URLs', async () => {
   live(); const { client, calls } = fakeStripe(); const a = tenant(), b = tenant();
   let release; const gate = new Promise((resolve) => { release = resolve; });
-  const create = client.accounts.create;
-  client.accounts.create = async (params, options) => { if (params.metadata.shopId === a.id) await gate; return create(params, options); };
+  const create = client.v2.core.accounts.create;
+  client.v2.core.accounts.create = async (params, options) => { if (params.metadata.shopId === a.id) await gate; return create(params, options); };
   const first = run(a, () => connect.onboard(BASE));
   const second = run(a, () => connect.onboard(BASE));
   await run(b, () => connect.onboard(BASE));
@@ -511,8 +516,8 @@ test('Connect account creation is single-flight per tenant with metadata, stable
     const call = calls.accounts.find((c) => c.params.metadata.shopId === shop.id);
     assert.equal(call.options.idempotencyKey, `connect-${shop.id}-test-full-1`);
     const link = calls.links.find((p) => p.account === `acct_${shop.id}`);
-    assert.equal(link.refresh_url, `${BASE}/vendor/connect/refresh`);
-    assert.equal(link.return_url, `${BASE}/vendor/connect/return`);
+    assert.equal(link.use_case.account_onboarding.refresh_url, `${BASE}/vendor/connect/refresh`);
+    assert.equal(link.use_case.account_onboarding.return_url, `${BASE}/vendor/connect/return`);
     const disk = JSON.parse(fs.readFileSync(path.join(shop.store.dataDir(), 'config.json'), 'utf8'));
     assert.equal(disk.stripeConnect.accountId, `acct_${shop.id}`);
   }
@@ -534,8 +539,8 @@ test('reconnect after deauthorize uses a new account-creation idempotency key', 
 
 test('Connect creation failures release single-flight and reuse the idempotency key on retry', async () => {
   live(); const { client, calls } = fakeStripe(); const a = tenant(); const keys = [];
-  const create = client.accounts.create;
-  client.accounts.create = async (params, options) => {
+  const create = client.v2.core.accounts.create;
+  client.v2.core.accounts.create = async (params, options) => {
     keys.push(options.idempotencyKey);
     if (keys.length === 1) throw new Error('provider unavailable');
     return create(params, options);

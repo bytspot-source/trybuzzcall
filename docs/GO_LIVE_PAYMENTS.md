@@ -28,7 +28,7 @@ Live rows (`stripeMode` `live` and `livemode` true) are left alone.
 | `STRIPE_SECRET_KEY` | Live restricted key (`rk_live_…`). Needs Checkout Sessions and PaymentIntents on connected accounts, Charges read, Accounts, and Account Links. Transfers are not used for deposits. Prefer a restricted key over `sk_live_`. |
 | `STRIPE_WEBHOOK_SECRET` | Signing secret of the **platform** endpoint (Your account). Subscriptions only. |
 | `STRIPE_CONNECT_WEBHOOK_SECRET` | Signing secret of the **Connected accounts** endpoint. This is the deposit endpoint. |
-| `CONNECT_DASHBOARD` | `full` (default). Creates a v1 account with a full dashboard, the shop paying Stripe's fees, and Stripe as the losses collector. `express` is the legacy Express account and is not the pilot default. The choice is fixed when the account is created. |
+| `CONNECT_DASHBOARD` | `full` (default). Creates an Accounts v2 account (`POST /v2/core/accounts`) with `dashboard=full`, the shop paying Stripe's fees (`fees_collector=stripe`), and Stripe as the losses collector (`losses_collector=stripe`). The merchant `card_payments` capability is requested. `express` opts into the v2 form of a legacy Express account (`dashboard=express`, `fees_collector=application`, `losses_collector=application`, plus recipient `stripe_transfers`) and is not the pilot default. The choice is fixed when the account is created. |
 | `DEPOSIT_MODEL` | `direct` (default). `platform_hold` keeps the old transfer code inert for tests. Product checkout does not use it. |
 | `DEPOSIT_AMOUNT_MAX` | Pilot cap, default `50` dollars. A vendor cannot set a higher deposit. An admin can, with a second confirmation. |
 | `DEPOSIT_APPLICATION_FEE_CENTS` | Default `0`. No application fee on the pilot deposit. |
@@ -51,6 +51,16 @@ Platform endpoint `{PUBLIC_BASE_URL}/stripe/webhook` (scope **Your account**). D
 - `invoice.paid`
 - `invoice.payment_failed`
 
+Accounts v2 also sends **thin** events. Stripe delivers those on **Your account**, not on Connected accounts, even when the same v2 account also sends a v1 `account.updated` on Connected accounts. Add these to the platform endpoint above (`{PUBLIC_BASE_URL}/stripe/webhook`). The payload does not include the account; BuzzCall loads it with `GET /v2/core/accounts/:id`. The Stripe CLI cannot forward thin events (`stripe listen` is snapshot-only).
+
+- `v2.core.account[requirements].updated`
+- `v2.core.account[configuration.merchant].capability_status_updated`
+- `v2.core.account[configuration.merchant].updated`
+- `v2.core.account.updated`
+- `v2.core.account[identity].updated`
+- `v2.core.account[defaults].updated`
+- `v2.core.account.closed`
+
 Connected-account endpoint `{PUBLIC_BASE_URL}/stripe/connect/webhook` (scope **Connected accounts**):
 
 - `checkout.session.completed`
@@ -72,7 +82,7 @@ A paid session is applied only when `event.account` is that shop's stored accoun
 ## 5. Before the first live deposit
 
 - Linking starts from a signed-in vendor session (`POST /vendor/connect/onboard`) or the legacy admin. One Stripe account cannot be linked to two shops.
-- New accounts need admin approval before a deposit link is created: the platform admin queue, `POST /admin/vendors/:id/connect/approve`, or `POST /admin/connect/approve` on the legacy line. Checkout also requires `charges_enabled` and no `disabled_reason`.
+- New accounts need admin approval before a deposit link is created: the platform admin queue, `POST /admin/vendors/:id/connect/approve`, or `POST /admin/connect/approve` on the legacy line. Checkout also requires charges to be on and no disabled reason. For a v2 account, charges are on when `configuration.merchant.capabilities.card_payments.status` is `active`, and a disabling `status_details` code or a past-due requirement is stored as `disabledReason`. A v1 `account.updated` snapshot still uses `charges_enabled` and `requirements.disabled_reason`. Both shapes are stored as `chargesEnabled` and `disabledReason`.
 - A later account change or disconnect emails the admin (and the shop owner, when Resend is set).
 - YES/NO after the appointment is a reputation flag. "No problem" is not NO. BuzzCall does not pause or release money on that reply.
 
@@ -82,7 +92,7 @@ These are not set by this app.
 
 1. Finish the Connect platform profile and branding (name, icon, color) before the first Account Link.
 2. Create the two webhook endpoints above and subscribe the event lists in section 4. Copy each signing secret into the environment. Do not subscribe the platform endpoint to connected-account charge events and expect BuzzCall to fulfill them.
-3. Leave `CONNECT_DASHBOARD=full` unless you explicitly accept Express liability. Stripe does not let you change `stripe_dashboard.type` after the account exists.
+3. Leave `CONNECT_DASHBOARD=full` unless you explicitly accept Express liability (platform pays Stripe fees and is responsible for negative balances). Stripe does not let you change `dashboard` after the account exists. Onboarding is an Accounts v2 Account Link (`POST /v2/core/account_links`, `use_case.type=account_onboarding`). An account created before this change still uses a v1 Account Link.
 4. Radar for a full-dashboard account is the shop's Radar, not the platform's. Stripe's Radar for Connect table says the platform Connect page cannot configure Radar for accounts with the full Stripe Dashboard, and direct charges use the collecting account's rules. Platform Radar still covers BuzzCall's own subscription charges. Confirm in the Dashboard whether any "platform controls for direct charges" toggle applies to these accounts; the Radar settings page says that toggle is for accounts controlled solely by the platform.
 5. Payout timing is the shop's. Stripe's default is a daily payout. For a full-dashboard account the shop manages its own bank account. The platform can schedule that account's payouts only after turning on Platform controls. This app does not set a payout delay. Confirm the delay you want in the shop's Dashboard (or in Platform controls, if you enable them) before the pilot takes a real card.
 6. The shop refunds and responds to disputes in its own Dashboard. BuzzCall has no refund button that moves this money.

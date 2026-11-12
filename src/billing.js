@@ -1,4 +1,5 @@
-// Shop subscription billing (the shop pays BuzzCall). Live = Stripe Billing (stripe npm 16.12.0, API 2024-06-20);
+// Shop subscription billing (the shop pays BuzzCall). Live = Stripe Billing. The client pins API 2024-06-20
+// so current_period_end stays on the subscription. Accounts v2 calls override that per request.
 // no STRIPE_SECRET_KEY = mock mode: same state machine and webhook handler, driven by /billing/mock/* routes
 // and a mock clock so the whole lifecycle (trial -> active -> past_due -> plan change -> cancel) can be simulated.
 //

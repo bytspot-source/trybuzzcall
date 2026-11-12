@@ -510,6 +510,38 @@ test('X5: a set-up vendor cannot mint another Account Link from refresh', async 
   assert.ok(store.root.db.alerts.some((a) => a.kind === 'connect' && /onboarding refresh blocked/.test(a.body)));
 });
 
+test('vendor onboard returns Stripe\'s error instead of a generic 500', async (t) => {
+  reset(t, { STRIPE_SECRET_KEY: TEST_KEY });
+  const logs = [];
+  const orig = console.error;
+  console.error = (...args) => { logs.push(args.map(String).join(' ')); };
+  t.after(() => { console.error = orig; });
+  const created = await vendors.create({ name: 'Onboard Error', email: 'onboard-error@example.com', values: { BUSINESS_TYPE: 'plumbing', BUSINESS_NAME: 'Onboard Error' } });
+  await vendors.activate(created.token, 'long-password-onboard-1', 'long-password-onboard-1');
+  const session = await vendors.login('onboard-error@example.com', 'long-password-onboard-1', { ip: '203.0.113.44', ua: 'device-a' });
+  const secret = 'sk_test_' + 'vendorsecret';
+  connect.setStripe({
+    v2: { core: { accounts: { create: async () => {
+      const err = new Error(`Accounts do not currently support card_payments without transfers (${secret})`);
+      err.statusCode = 400;
+      err.code = 'account_invalid';
+      err.requestId = 'req_vendor_card';
+      throw err;
+    } } } },
+  });
+  const res = await postRaw('/vendor/connect/onboard', {
+    body: '{}',
+    headers: { cookie: `buzzcall_vendor=${session.token}`, origin: 'http://shop.example', accept: 'application/json' },
+  });
+  assert.equal(res.status, 400, res.body);
+  assert.match(res.body, /card_payments without transfers/);
+  assert.equal(res.body.includes('vendorsecret'), false);
+  const logged = logs.join('\n');
+  assert.match(logged, /card_payments without transfers/);
+  assert.match(logged, /req_vendor_card/);
+  assert.equal(logged.includes('vendorsecret'), false);
+});
+
 test('X6: an admin raise above the pilot cap is the cap checkout uses', async (t) => {
   reset(t, { DEPOSIT_AMOUNT_MAX: '50' });
   const created = await vendors.create({ name: 'Raise Shop', email: 'raise-shop@example.com', values: { BUSINESS_TYPE: 'plumbing', BUSINESS_NAME: 'Raise Shop', DEPOSIT_AMOUNT: '49' } });

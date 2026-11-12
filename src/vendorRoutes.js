@@ -105,7 +105,7 @@ function register(app, { requireAdmin, BASE, sameOrigin }) {
     try { await fn(req,res,next); }
     catch (e) {
       const status = e.status >= 400 && e.status <= 599 ? e.status : 500;
-      const message = status >= 500 ? 'The workspace is temporarily unavailable. Please try again later.' : e.message;
+      const message = status >= 500 && !e.expose ? 'The workspace is temporarily unavailable. Please try again later.' : e.message;
       if (res.headersSent) return next(e);
       return json(req) ? res.status(status).json({ error: message }) : res.status(status).type('html').send(pages.message({ title: 'Unable to complete this request', message, status }));
     }

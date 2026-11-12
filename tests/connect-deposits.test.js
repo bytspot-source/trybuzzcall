@@ -39,10 +39,15 @@ function fakeStripe(acct = {}) {
   const client = {
     calls, account,
     accounts: {
-      create: async (p) => { calls.create.push(p); return { ...account, id: account.id }; },
       retrieve: async (id) => { calls.retrieve.push(id); return { ...account, id }; },
     },
-    accountLinks: { create: async (p) => { calls.links.push(p); return { url: 'https://connect.stripe.com/setup/e/test' }; } },
+    v2: { core: {
+      accounts: {
+        create: async (p) => { calls.create.push(p); return { ...account, id: account.id }; },
+        retrieve: async (id) => { calls.retrieve.push(id); return { ...account, id }; },
+      },
+      accountLinks: { create: async (p) => { calls.links.push(p); return { url: 'https://connect.stripe.com/setup/e/test' }; } },
+    } },
     checkout: {
       sessions: {
         create: async (p, o) => {
@@ -101,20 +106,26 @@ function withConsent(phone) {
   store.db.voiceConsents.unshift({ from: phone, consented: true, digits: '1', at: new Date().toISOString() });
 }
 
-test('onboarding link creation (mocked Stripe): Express account + account link with return/refresh URLs', async (t) => {
+test('onboarding link creation (mocked Stripe): full-dashboard v2 account + account link with return/refresh URLs', async (t) => {
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY });
   const f = fakeStripe();
   connect.setStripe(f);
   const r = await connect.onboard('https://shop.example', { name: 'Test Plumbing', url: 'https://shop.example' });
   assert.equal(r.url, 'https://connect.stripe.com/setup/e/test');
   assert.equal(f.calls.create.length, 1);
-  assert.equal(f.calls.create[0].type, undefined);
-  assert.equal(f.calls.create[0].controller.losses.payments, 'stripe');
-  assert.ok(f.calls.create[0].capabilities.card_payments.requested);
+  assert.equal(f.calls.create[0].dashboard, 'full');
+  assert.equal(f.calls.create[0].defaults.responsibilities.losses_collector, 'stripe');
+  assert.equal(f.calls.create[0].configuration.merchant.capabilities.card_payments.requested, true);
+  assert.equal(f.calls.create[0].configuration.recipient, undefined);
   assert.deepEqual(f.calls.links[0], {
-    account: 'acct_express_1', type: 'account_onboarding',
-    refresh_url: 'https://shop.example/admin/connect/refresh',
-    return_url: 'https://shop.example/admin/connect/return',
+    account: 'acct_express_1',
+    use_case: {
+      type: 'account_onboarding',
+      account_onboarding: {
+        refresh_url: 'https://shop.example/admin/connect/refresh',
+        return_url: 'https://shop.example/admin/connect/return',
+      },
+    },
   });
   assert.equal(store.getOverride().stripeConnect.accountId, 'acct_express_1');
   // Reuse existing account on second call

@@ -276,6 +276,15 @@ async function stripeShop(event, connected = false) {
     return { legacy: true };
   }
   const list = await candidates();
+  const connect = require('./connect');
+  const storedConnectId = (c) => c.store.getOverride().stripeConnect?.accountId || (c.id === 'legacy' ? process.env.STRIPE_CONNECT_ACCOUNT_ID : null);
+  // Thin v2 account events carry the account on related_object, not event.account, and arrive on Your account.
+  if (connect.isV2AccountEvent(event?.type)) {
+    const acct = connect.eventAccountId(event);
+    const hits = list.filter((c) => storedConnectId(c) === acct && !!acct);
+    if (hits.length !== 1) return null;
+    return hits[0].shop ? { shop: hits[0].shop } : { legacy: true };
+  }
   if (!connected && ['checkout.session.completed','checkout.session.async_payment_succeeded'].includes(event.type) && object.mode === 'payment') {
     if (object.metadata?.bookingId && object.client_reference_id && object.metadata.bookingId !== object.client_reference_id) return null;
     if (tagged) {
@@ -289,7 +298,8 @@ async function stripeShop(event, connected = false) {
   }
   let matches;
   if (connected) {
-    matches = list.filter(c => (c.store.getOverride().stripeConnect?.accountId || (c.id === 'legacy' ? process.env.STRIPE_CONNECT_ACCOUNT_ID : null)) === event.account && !!event.account);
+    const acct = event.account || connect.eventAccountId(event);
+    matches = list.filter(c => storedConnectId(c) === acct && !!acct);
   } else {
     const subscription = typeof object.subscription === 'string' ? object.subscription : object.subscription?.id;
     const customer = typeof object.customer === 'string' ? object.customer : object.customer?.id;
