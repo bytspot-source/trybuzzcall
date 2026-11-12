@@ -35,10 +35,15 @@ function fakeStripe(acct = {}) {
   const client = {
     calls, account,
     accounts: {
-      create: async (p) => { calls.create.push(p); return { ...account }; },
       retrieve: async (id) => { calls.retrieve.push(id); return { ...account, id }; },
     },
-    accountLinks: { create: async (p) => { calls.links.push(p); return { url: 'https://connect.stripe.com/setup/s/test_link' }; } },
+    v2: { core: {
+      accounts: {
+        create: async (p) => { calls.create.push(p); return { ...account }; },
+        retrieve: async (id) => { calls.retrieve.push(id); return { ...account, id }; },
+      },
+      accountLinks: { create: async (p) => { calls.links.push(p); return { url: 'https://connect.stripe.com/setup/s/test_link' }; } },
+    } },
     checkout: { sessions: { create: async (p, o) => { calls.sessions.push({ p, o }); return { id: 'cs_test_1', url: 'https://checkout.stripe.com/c/pay/cs_test_1' }; } } },
   };
   return client;
@@ -46,7 +51,7 @@ function fakeStripe(acct = {}) {
 // Fresh state per test: no Stripe key, no connect state, no bookings.
 function reset(t, envOver = {}) {
   const saved = {};
-  for (const k of ['STRIPE_SECRET_KEY', 'STRIPE_CONNECT_ACCOUNT_ID', 'STRIPE_CONNECT_WEBHOOK_SECRET', 'LEAD_FEE', 'LEAD_FEE_WAIVED', 'DEPOSIT_AMOUNT']) saved[k] = process.env[k];
+  for (const k of ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'STRIPE_CONNECT_ACCOUNT_ID', 'STRIPE_CONNECT_WEBHOOK_SECRET', 'LEAD_FEE', 'LEAD_FEE_WAIVED', 'DEPOSIT_AMOUNT']) saved[k] = process.env[k];
   Object.assign(process.env, envOver);
   store.setOverride({});
   store.db.bookings.length = 0; store.db.leads.length = 0; store.db.alerts.length = 0;
@@ -208,7 +213,7 @@ test('onboarding routes require admin auth and same origin', async (t) => {
   assert.equal((await post('/admin/connect/onboard', {}, { origin: 'https://evil.example' })).status, 403);
 });
 
-test('live/test onboarding: creates an Express account once, then an Account Link', async (t) => {
+test('live/test onboarding: creates a full-dashboard Accounts v2 account once, then an Account Link', async (t) => {
   reset(t, { STRIPE_SECRET_KEY: TEST_KEY });
   const f = fakeStripe(); connect.setStripe(f);
   const r1 = await req('/admin/connect/onboard', { method: 'POST', headers: { ...auth, origin: BASE } });
@@ -217,15 +222,25 @@ test('live/test onboarding: creates an Express account once, then an Account Lin
   assert.equal(f.calls.create.length, 1);
   const p = f.calls.create[0];
   assert.equal(p.type, undefined);
-  assert.equal(p.controller.stripe_dashboard.type, 'full');
-  assert.equal(p.controller.losses.payments, 'stripe');
-  assert.equal(p.controller.fees.payer, 'account');
-  assert.ok(p.capabilities.card_payments.requested);
-  assert.equal(p.capabilities.transfers, undefined);
-  assert.equal(p.business_profile.name, 'Test Plumbing');
-  assert.equal(p.business_profile.url, 'https://shop.example');
-  assert.deepEqual(f.calls.links[0], { account: 'acct_test_shop1', type: 'account_onboarding',
-    refresh_url: 'https://shop.example/admin/connect/refresh', return_url: 'https://shop.example/admin/connect/return' });
+  assert.equal(p.controller, undefined);
+  assert.equal(p.dashboard, 'full');
+  assert.equal(p.defaults.responsibilities.fees_collector, 'stripe');
+  assert.equal(p.defaults.responsibilities.losses_collector, 'stripe');
+  assert.equal(p.configuration.merchant.capabilities.card_payments.requested, true);
+  assert.equal(p.configuration.recipient, undefined);
+  assert.equal(p.display_name, 'Test Plumbing');
+  assert.equal(p.defaults.profile.doing_business_as, 'Test Plumbing');
+  assert.equal(p.defaults.profile.business_url, 'https://shop.example');
+  assert.deepEqual(f.calls.links[0], {
+    account: 'acct_test_shop1',
+    use_case: {
+      type: 'account_onboarding',
+      account_onboarding: {
+        refresh_url: 'https://shop.example/admin/connect/refresh',
+        return_url: 'https://shop.example/admin/connect/return',
+      },
+    },
+  });
   assert.equal(store.getOverride().stripeConnect.accountId, 'acct_test_shop1');
   assert.equal(store.getOverride().stripeConnect.mode, 'test');
   const r2 = await req('/admin/connect/refresh', { headers: auth });
@@ -393,6 +408,83 @@ test('connect webhook: account.updated sets status; deauthorized turns deposits 
   const de = { id: 'evt_d', type: 'account.application.deauthorized', account: 'acct_ready', livemode: false, data: { object: { id: 'ca_x' } } };
   await req('/stripe/connect/webhook', { method: 'POST', ...signed(de, SECRET) });
   assert.equal(connect.status(), 'not_connected'); assert.equal(connect.chargeAccount(), null);
+});
+
+test('express opt-in requests card payments and recipient stripe_transfers', async (t) => {
+  const prev = process.env.CONNECT_DASHBOARD;
+  process.env.CONNECT_DASHBOARD = 'express';
+  t.after(() => { if (prev === undefined) delete process.env.CONNECT_DASHBOARD; else process.env.CONNECT_DASHBOARD = prev; });
+  reset(t, { STRIPE_SECRET_KEY: TEST_KEY });
+  const f = fakeStripe(); connect.setStripe(f);
+  const r = await req('/admin/connect/onboard', { method: 'POST', headers: { ...auth, origin: BASE } });
+  assert.equal(r.status, 303);
+  const p = f.calls.create[0];
+  assert.equal(p.dashboard, 'express');
+  assert.equal(p.defaults.responsibilities.fees_collector, 'application');
+  assert.equal(p.defaults.responsibilities.losses_collector, 'application');
+  assert.equal(p.configuration.merchant.capabilities.card_payments.requested, true);
+  assert.equal(p.configuration.recipient.capabilities.stripe_balance.stripe_transfers.requested, true);
+  assert.equal(store.getOverride().stripeConnect.accountModel, 'express');
+  assert.equal(store.getOverride().stripeConnect.accountsApi, 'v2');
+});
+
+test('Stripe onboard failure returns Stripe\'s message and does not log the secret', async (t) => {
+  reset(t, { STRIPE_SECRET_KEY: TEST_KEY });
+  const logs = [];
+  const orig = console.error;
+  console.error = (...args) => { logs.push(args.map(String).join(' ')); };
+  t.after(() => { console.error = orig; });
+  const secret = 'sk_test_' + 'supersecretkey';
+  connect.setStripe({
+    v2: { core: { accounts: { create: async () => {
+      const err = new Error(`Accounts do not currently support card_payments without transfers (${secret})`);
+      err.statusCode = 400;
+      err.type = 'invalid_request_error';
+      err.code = 'invalid_request_error';
+      err.requestId = 'req_test_card';
+      throw err;
+    } } } },
+  });
+  const r = await post('/admin/connect/onboard', {});
+  const body = await r.json();
+  assert.equal(r.status, 400);
+  assert.match(body.error, /card_payments without transfers/);
+  assert.equal(JSON.stringify(body).includes('supersecretkey'), false);
+  const logged = logs.join('\n');
+  assert.match(logged, /card_payments without transfers/);
+  assert.match(logged, /req_test_card/);
+  assert.equal(logged.includes('supersecretkey'), false);
+});
+
+test('v2 card_payments status drives charges_enabled, and a thin event refreshes it', async (t) => {
+  reset(t, { STRIPE_SECRET_KEY: TEST_KEY, STRIPE_WEBHOOK_SECRET: SECRET });
+  quiet(t);
+  const v2account = {
+    id: 'acct_v2', object: 'v2.core.account', dashboard: 'full', display_name: 'Test Plumbing',
+    configuration: { merchant: { capabilities: {
+      card_payments: { status: 'restricted', status_details: [{ code: 'requirements_past_due' }] },
+      stripe_balance: { payouts: { status: 'pending', status_details: [] } },
+    } } },
+    requirements: { entries: [{ description: 'individual.id_number', awaiting_action_from: 'user', minimum_deadline: { status: 'past_due' } }],
+      summary: { minimum_deadline: { status: 'past_due' } } },
+  };
+  connect.setStripe({ v2: { core: { accounts: { retrieve: async () => v2account } } } });
+  store.setOverride({ stripeConnect: { accountId: 'acct_v2', mode: 'test', chargesEnabled: false, accountsApi: 'v2', source: 'onboarding' } });
+  connect.applyAccount(v2account);
+  assert.equal(connect.status(), 'pending');
+  assert.equal(connect.summary().disabledReason, 'requirements_past_due');
+  assert.equal(connect.checkoutBlock(), 'disabled');
+  v2account.configuration.merchant.capabilities.card_payments = { status: 'active', status_details: [] };
+  v2account.configuration.merchant.capabilities.stripe_balance.payouts = { status: 'active', status_details: [] };
+  v2account.requirements = { entries: [], summary: { minimum_deadline: { status: 'eventually_due' } } };
+  const event = { id: 'evt_thin_card', object: 'v2.core.event', livemode: false,
+    type: 'v2.core.account[configuration.merchant].capability_status_updated',
+    related_object: { id: 'acct_v2', type: 'v2.core.account', url: '/v2/core/accounts/acct_v2?include=configuration.merchant' } };
+  const r = await req('/stripe/webhook', { method: 'POST', ...signed(event, SECRET) });
+  assert.equal(r.status, 200);
+  assert.equal(connect.status(), 'charges_enabled');
+  assert.equal(connect.summary().disabledReason, null);
+  assert.equal(connect.summary().payoutsEnabled, true);
 });
 
 test('platform webhook (/stripe/webhook) still works for deposits in mock/dev mode', async (t) => {

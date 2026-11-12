@@ -1,12 +1,19 @@
 // Stripe Connect for direct charges. The customer pays the shop's connected account (Stripe-Account header).
 // BuzzCall does not hold, transfer, or claw back that money. The account shape is isolated in accountCreateParams():
-// CONNECT_DASHBOARD=full (default) sets v1 controller properties equivalent to a Standard account
-// (full dashboard, the shop pays Stripe fees, Stripe collects losses). CONNECT_DASHBOARD=express opts into
-// legacy Express, where Stripe's account-type table makes the platform liable for disputes. The owner picks.
+// new accounts are created with Accounts v2 (POST /v2/core/accounts).
+// CONNECT_DASHBOARD=full (default) is the Standard-style direct-charge account: dashboard=full, the shop pays
+// Stripe fees (fees_collector=stripe), Stripe collects losses (losses_collector=stripe), and the merchant
+// card_payments capability is requested. Accounts v2 can request card_payments without stripe_transfers.
+// CONNECT_DASHBOARD=express maps the legacy Express account: dashboard=express, fees_collector=application,
+// losses_collector=application (the platform is liable), merchant card_payments, and recipient stripe_transfers.
+// The owner picks. The dashboard cannot be changed after creation.
+//
+// Checkout, Billing, and the other v1 calls stay on API version 2024-06-20 (current_period_end is on the
+// subscription). Accounts v2 create, retrieve, and Account Links send Stripe-Version 2026-10-28.endive.
 //
 // State lives in the config override (store.getOverride().stripeConnect, persisted to Postgres/config.json):
 //   { accountId, mode: 'live'|'test'|'mock', source: 'onboarding'|'env', chargesEnabled, detailsSubmitted,
-//     payoutsEnabled, requirementsDue[], disabledReason, deauthorized, checkedAt, updatedAt }
+//     payoutsEnabled, requirementsDue[], disabledReason, deauthorized, checkedAt, updatedAt, accountsApi }
 // STRIPE_CONNECT_ACCOUNT_ID (env) is only a backward-compatible fallback for the account id.
 // Mock mode (no STRIPE_SECRET_KEY): no Stripe calls; onboarding is simulated (/admin/connect/mock or /vendor/connect/mock).
 const crypto = require('crypto');
@@ -18,14 +25,39 @@ const key = () => process.env.STRIPE_SECRET_KEY || '';
 const mode = () => (!key() ? 'mock' : /^(sk|rk)_test_/.test(key()) ? 'test' : 'live');
 const envId = () => shopContext.current() ? null : (process.env.STRIPE_CONNECT_ACCOUNT_ID || '').trim() || null;
 
+// Billing reads subscription.current_period_end, which later API versions moved onto the subscription item.
+// Keep those calls on the version this app was written against. Accounts v2 uses the current stable version
+// from https://docs.stripe.com/api/versioning (checked 2026-11-12: 2026-10-28.endive).
+const PLATFORM_API_VERSION = '2024-06-20';
+const ACCOUNTS_API_VERSION = '2026-10-28.endive';
+const ACCOUNT_INCLUDE = ['configuration.merchant', 'configuration.recipient', 'defaults', 'identity', 'requirements'];
+
+// Thin events for v2 accounts. Stripe delivers these on the "Your account" scope. Snapshot account.updated
+// still arrives on the Connected accounts endpoint, including for v2 accounts.
+// https://docs.stripe.com/connect/webhooks?accounts-namespace=v2
+const V2_ACCOUNT_EVENTS = new Set([
+  'v2.core.account.updated',
+  'v2.core.account.closed',
+  'v2.core.account[requirements].updated',
+  'v2.core.account[configuration.merchant].updated',
+  'v2.core.account[configuration.merchant].capability_status_updated',
+  'v2.core.account[identity].updated',
+  'v2.core.account[defaults].updated',
+]);
+
 let factory = null; // tests inject a fake client; never hits the network then
 let client = null, clientKey = null;
 function stripe() {
   if (factory) return factory();
-  if (!client || clientKey !== key()) { client = require('stripe')(key()); clientKey = key(); }
+  if (!client || clientKey !== key()) {
+    const Stripe = require('stripe');
+    client = new Stripe(key(), { apiVersion: PLATFORM_API_VERSION });
+    clientKey = key();
+  }
   return client;
 }
 const setStripe = (fn) => { factory = fn ? (typeof fn === 'function' ? fn : () => fn) : null; };
+const v2Options = (extra) => ({ apiVersion: ACCOUNTS_API_VERSION, ...(extra || {}) });
 
 const stored = () => store.getOverride().stripeConnect || null;
 function save(next) {
@@ -47,12 +79,63 @@ const accountId = () => state()?.accountId || null;
 function status() { const s = state(); return !s ? 'not_connected' : s.chargesEnabled ? 'charges_enabled' : 'pending'; }
 const statusLabel = (st = status()) => ({ not_connected: 'Not connected', pending: 'Pending (onboarding not finished or Stripe review)', charges_enabled: 'Charges enabled' }[st]);
 
-function fromAccount(a, source) {
+function capActive(cap) { return !!(cap && cap.status === 'active'); }
+function isV2Account(a) {
+  return !!(a && a.object === 'v2.core.account');
+}
+function v2OpenEntries(a) {
+  const entries = Array.isArray(a.requirements?.entries) ? a.requirements.entries : [];
+  return entries.filter((e) => e && e.awaiting_action_from !== 'stripe'
+    && (e.minimum_deadline?.status === 'currently_due' || e.minimum_deadline?.status === 'past_due'));
+}
+// v2 has no details_submitted field. Treat the form as submitted once card payments are active, or once
+// Stripe is not waiting on the user for a currently_due or past_due requirement.
+function v2DetailsSubmitted(a, chargesEnabled) {
+  if (chargesEnabled) return true;
+  if (!a.requirements) return false;
+  const summary = a.requirements.summary?.minimum_deadline?.status;
+  if (summary === 'currently_due' || summary === 'past_due') return false;
+  return v2OpenEntries(a).length === 0;
+}
+function v2DisabledReason(a, card) {
+  if (!card || card.status === 'active') return null;
+  const code = card.status_details?.[0]?.code || null;
+  // determining_status and requirements_pending_verification are review, not a disabled account.
+  if (code && code !== 'determining_status' && code !== 'requirements_pending_verification') return code;
+  const entries = Array.isArray(a.requirements?.entries) ? a.requirements.entries : [];
+  const pastDue = entries.some((e) => e && (e.minimum_deadline?.status === 'past_due'
+    || (e.impact?.restricts_capabilities || []).some((c) => c && (c.capability === 'card_payments' || c.configuration === 'merchant') && c.deadline?.status === 'past_due')));
+  return pastDue ? 'requirements.past_due' : null;
+}
+function fromV2(a, source) {
+  const card = a.configuration?.merchant?.capabilities?.card_payments;
+  const payouts = a.configuration?.merchant?.capabilities?.stripe_balance?.payouts;
+  const chargesEnabled = capActive(card);
+  const profile = a.defaults?.profile || {};
+  const identity = a.identity || {};
+  const business = identity.business_details || {};
+  return {
+    accountId: a.id, mode: mode(), source, accountsApi: 'v2',
+    chargesEnabled, detailsSubmitted: v2DetailsSubmitted(a, chargesEnabled),
+    payoutsEnabled: capActive(payouts),
+    requirementsDue: v2OpenEntries(a).map((e) => e.description).filter(Boolean).slice(0, 20),
+    disabledReason: v2DisabledReason(a, card),
+    checkedAt: new Date().toISOString(),
+    accountType: a.dashboard === 'express' ? 'express' : 'standard',
+    businessName: a.display_name || profile.doing_business_as || business.registered_name || null,
+    businessUrl: profile.business_url || null,
+    country: identity.country || null,
+  };
+}
+function fromV1(a, source) {
   const profile = a.business_profile || {};
   return { accountId: a.id, mode: mode(), source, chargesEnabled: !!a.charges_enabled, detailsSubmitted: !!a.details_submitted,
     payoutsEnabled: !!a.payouts_enabled, requirementsDue: [...(a.requirements?.currently_due || [])].slice(0, 20),
     disabledReason: a.requirements?.disabled_reason || null, checkedAt: new Date().toISOString(), accountType: a.type || 'standard',
     businessName: profile.name || null, businessUrl: profile.url || null, country: a.country || null };
+}
+function fromAccount(a, source) {
+  return isV2Account(a) ? fromV2(a, source) : fromV1(a, source);
 }
 function keepApproval(next, prev) {
   if (!prev) return next;
@@ -63,6 +146,7 @@ function keepApproval(next, prev) {
   }
   if (prev.depositsPaused) next.depositsPaused = prev.depositsPaused;
   if (prev.accountModel) next.accountModel = prev.accountModel;
+  if (prev.accountsApi && !next.accountsApi) next.accountsApi = prev.accountsApi;
   if (prev.createAttempt) next.createAttempt = prev.createAttempt;
   if (!next.businessName && prev.businessName) next.businessName = prev.businessName;
   if (!next.businessUrl && prev.businessUrl) next.businessUrl = prev.businessUrl;
@@ -70,34 +154,73 @@ function keepApproval(next, prev) {
   if (prev.nameMismatch) next.nameMismatch = true;
   return next;
 }
-// full (default): v1 controller properties equivalent to Accounts v2 dashboard=full,
-// fees_collector=stripe, losses_collector=stripe. stripe@16 cannot call /v2/core/accounts.
-// express: legacy Express. Stripe's account-type table says the platform is liable for those disputes.
-// CONNECT_DASHBOARD=express only if the owner accepts that. It is not the pilot default.
+// full (default): Accounts v2 dashboard=full, fees_collector=stripe, losses_collector=stripe.
+// That is the v2 form of the v1 controller properties stripe_dashboard.type=full, fees.payer=account,
+// losses.payments=stripe, requirement_collection=stripe. requirements_collector is calculated by Stripe.
+// express: v2 form of legacy Express (losses.payments=application, fees.payer=application, dashboard express).
+// CONNECT_DASHBOARD=express only if the owner accepts platform loss liability. It is not the pilot default.
 function dashboardChoice() {
   return String(process.env.CONNECT_DASHBOARD || 'full').trim().toLowerCase() === 'express' ? 'express' : 'full';
 }
 function accountCreateParams(prefill = {}) {
   const shopId = shopContext.shopId();
-  const params = { metadata: { platform: 'buzzcall', chargeModel: 'direct', ...(shopId ? { shopId } : {}) } };
-  const bp = {};
-  if (prefill.name) bp.name = String(prefill.name).slice(0, 100);
-  if (prefill.url && /^https:\/\//.test(prefill.url)) bp.url = prefill.url;
-  if (Object.keys(bp).length) params.business_profile = bp;
-  if (prefill.email) params.email = prefill.email;
-  if (dashboardChoice() === 'express') {
-    params.type = 'express';
-    params.capabilities = { card_payments: { requested: true }, transfers: { requested: true } };
-  } else {
-    params.controller = {
-      stripe_dashboard: { type: 'full' },
-      fees: { payer: 'account' },
-      losses: { payments: 'stripe' },
-      requirement_collection: 'stripe',
+  const express = dashboardChoice() === 'express';
+  // Full dashboard: request merchant card_payments only.
+  // v1 required transfers alongside card_payments (https://docs.stripe.com/connect/account-capabilities?accounts-namespace=v1
+  // "For an Account to have the card_payments capability, you must request both card_payments and transfers.").
+  // A live v1 create on this platform returned that error. Accounts v2 removed the pairing
+  // (https://docs.stripe.com/connect/account-capabilities?accounts-namespace=v2 "you can request card_payments and
+  // stripe_transfers independently"). The SaaS create sample for this responsibility set requests only card_payments:
+  // https://docs.stripe.com/connect/saas/tasks/create
+  // Express keeps both, matching the previous type=express request. stripe_transfers is the v2 recipient capability
+  // (https://docs.stripe.com/api/v2/core/accounts/create). Checkout stays a direct charge either way.
+  const params = {
+    dashboard: express ? 'express' : 'full',
+    metadata: { platform: 'buzzcall', chargeModel: 'direct', ...(shopId ? { shopId } : {}) },
+    defaults: {
+      responsibilities: express
+        ? { fees_collector: 'application', losses_collector: 'application' }
+        : { fees_collector: 'stripe', losses_collector: 'stripe' },
+    },
+    configuration: {
+      merchant: { capabilities: { card_payments: { requested: true } } },
+    },
+    include: ['configuration.merchant', 'defaults', 'identity', 'requirements'],
+  };
+  if (express) {
+    params.configuration.recipient = {
+      capabilities: { stripe_balance: { stripe_transfers: { requested: true } } },
     };
-    params.capabilities = { card_payments: { requested: true } };
+    params.include = params.include.concat(['configuration.recipient']);
   }
+  const profile = {};
+  if (prefill.name) {
+    const name = String(prefill.name).slice(0, 100);
+    params.display_name = name;
+    profile.doing_business_as = name;
+  }
+  if (prefill.url && /^https:\/\//.test(prefill.url)) profile.business_url = prefill.url;
+  if (Object.keys(profile).length) params.defaults.profile = profile;
+  if (prefill.email) params.contact_email = prefill.email;
   return params;
+}
+function redactSecrets(text) {
+  return String(text || '')
+    .replace(/\b(?:sk|rk|pk)_(?:test|live)_[A-Za-z0-9]+/g, '[redacted-key]')
+    .replace(/\bwhsec_[A-Za-z0-9]+/g, '[redacted-secret]');
+}
+// Vendor routes hide unmarked 5xx behind a generic message. Stripe 4xx keeps its status so the message is shown.
+function stripeOnboardError(e) {
+  const statusCode = Number(e && (e.statusCode || e.status)) || 0;
+  const code = (e && (e.code || (e.raw && e.raw.code))) || '';
+  const requestId = (e && (e.requestId || (e.raw && e.raw.requestId))) || '';
+  const detail = redactSecrets((e && e.message) || 'Stripe rejected the request');
+  console.error('[connect] onboarding failed:', detail, JSON.stringify({
+    type: (e && e.type) || null, code: code || null, statusCode: statusCode || null, requestId: requestId || null,
+  }));
+  const status = statusCode >= 400 && statusCode < 500 ? statusCode : 502;
+  const message = `Stripe could not start payout onboarding${code ? ` (${code})` : ''}. ${detail}`;
+  return Object.assign(new Error(message), { status, expose: true });
 }
 function notifyConnect(kind, detail) {
   const shop = shopContext.current()?.shop;
@@ -125,10 +248,32 @@ function applyAccount(a) {
   }
   return true;
 }
+// Same pause rule as a v1 account.updated: charges off or a disabled reason stops new deposits.
+function syncDepositPause(a) {
+  if (!a) return stored();
+  const row = fromAccount(a, 'webhook');
+  if (!row.chargesEnabled || row.disabledReason) return markDepositsPaused(row.disabledReason || 'charges_disabled');
+  return clearDepositsPause();
+}
+async function retrieveAccount(id) {
+  const client = stripe();
+  const v2 = client.v2?.core?.accounts?.retrieve;
+  const preferV2 = state()?.accountsApi === 'v2' || !client.accounts?.retrieve;
+  if (v2 && preferV2) {
+    try {
+      return await client.v2.core.accounts.retrieve(id, { include: ACCOUNT_INCLUDE }, v2Options());
+    } catch (e) {
+      const statusCode = Number(e && (e.statusCode || e.status)) || 0;
+      if (statusCode === 404 && client.accounts?.retrieve) return client.accounts.retrieve(id);
+      throw e;
+    }
+  }
+  return client.accounts.retrieve(id);
+}
 async function refresh() {
   const id = accountId();
   if (!id || mode() === 'mock') return state();
-  applyAccount(await stripe().accounts.retrieve(id));
+  applyAccount(await retrieveAccount(id));
   return state();
 }
 // Before reading payout readiness: re-check Stripe if the account isn't known to be ready, at most every 5 min.
@@ -136,7 +281,7 @@ async function ensureFresh(maxAgeMs = 5 * 60000) {
   const s = state();
   if (!s || mode() === 'mock' || s.chargesEnabled) return s;
   if (s.checkedAt && Date.now() - Date.parse(s.checkedAt) < maxAgeMs) return s;
-  try { return await refresh(); } catch (e) { console.error('[connect] account refresh failed:', e.message); return state(); }
+  try { return await refresh(); } catch (e) { console.error('[connect] account refresh failed:', redactSecrets(e && e.message)); return state(); }
 }
 // Connected Express account with charges enabled, or null. This is NOT enough to pay a
 // brand-new account: payableAccount() also requires admin approval (P12).
@@ -227,6 +372,21 @@ async function onboard(BASE, prefill = {}) {
   onboarding.set(id, pending);
   try { return await pending; } finally { onboarding.delete(id); }
 }
+async function createOnboardingLink(id, refreshUrl, returnUrl) {
+  const client = stripe();
+  // Accounts created here are v2 and use POST /v2/core/account_links. An older v1 account still uses
+  // the v1 Account Link so a shop that connected before this change can finish onboarding.
+  if (state()?.accountsApi === 'v2' || !client.accountLinks?.create) {
+    return client.v2.core.accountLinks.create({
+      account: id,
+      use_case: {
+        type: 'account_onboarding',
+        account_onboarding: { refresh_url: refreshUrl, return_url: returnUrl },
+      },
+    }, v2Options());
+  }
+  return client.accountLinks.create({ account: id, type: 'account_onboarding', refresh_url: refreshUrl, return_url: returnUrl });
+}
 async function onboardAccount(BASE, prefill = {}) {
   const prefix = shopContext.current() ? '/vendor/connect' : '/admin/connect';
   if (mode() === 'mock') {
@@ -248,16 +408,21 @@ async function onboardAccount(BASE, prefill = {}) {
     const params = accountCreateParams(prefill);
     const prev = stored();
     const attempt = prev && prev.deauthorized ? (Number(prev.createAttempt) || 1) + 1 : (Number(prev?.createAttempt) || 1);
-    const a = await stripe().accounts.create(params, ...(shopContext.current()
-      ? [{ idempotencyKey: `connect-${shopContext.shopId()}-${mode()}-${dashboardChoice()}-${attempt}` }] : []));
+    let a;
+    try {
+      a = await stripe().v2.core.accounts.create(params, v2Options(shopContext.current()
+        ? { idempotencyKey: `connect-${shopContext.shopId()}-${mode()}-${dashboardChoice()}-${attempt}` } : {}));
+    } catch (e) { throw stripeOnboardError(e); }
     const taken = await accountUsedElsewhere(a.id);
     if (taken) throw Object.assign(new Error('That Stripe account is already linked to another shop.'), { status: 409 });
     id = a.id; created = true;
     const rec = fromAccount(a, 'onboarding');
+    rec.accountsApi = 'v2';
     rec.accountModel = dashboardChoice();
     rec.accountType = dashboardChoice() === 'full' ? 'standard' : 'express';
     rec.createAttempt = attempt;
-    if (prefill.name && a.business_profile?.name && String(a.business_profile.name).toLowerCase() !== String(prefill.name).toLowerCase()) rec.nameMismatch = true;
+    const echoed = a.display_name || a.defaults?.profile?.doing_business_as || a.business_profile?.name;
+    if (prefill.name && echoed && String(echoed).toLowerCase() !== String(prefill.name).toLowerCase()) rec.nameMismatch = true;
     flagNewAccount(rec);
   }
   if (!created && shopContext.current() && setupComplete()) {
@@ -265,8 +430,10 @@ async function onboardAccount(BASE, prefill = {}) {
     throw Object.assign(new Error('This Stripe account is already set up. Bank details are changed in the Stripe Dashboard, not from BuzzCall.'), { status: 409 });
   }
   if (shopContext.current()) await persistAccount();
-  const link = await stripe().accountLinks.create({ account: id, type: 'account_onboarding',
-    refresh_url: `${BASE}${prefix}/refresh`, return_url: `${BASE}${prefix}/return` });
+  let link;
+  try {
+    link = await createOnboardingLink(id, `${BASE}${prefix}/refresh`, `${BASE}${prefix}/return`);
+  } catch (e) { throw stripeOnboardError(e); }
   return { url: link.url, accountId: id, created };
 }
 function mockComplete() {
@@ -292,6 +459,45 @@ function deauthorize() {
 // Livemode guard for Connect webhook events: test keys only accept test events, live keys only live events.
 const livemodeOk = (event) => mode() === 'mock' || event.livemode === undefined || !!event.livemode === (mode() === 'live');
 
+const isV2AccountEvent = (type) => V2_ACCOUNT_EVENTS.has(type);
+function eventAccountId(event) {
+  if (!event || typeof event !== 'object') return null;
+  if (event.account) return event.account;
+  const rel = event.related_object;
+  if (rel && rel.id && (rel.type === 'v2.core.account' || String(rel.id).startsWith('acct_'))) return rel.id;
+  const object = event.data && event.data.object;
+  if (object && object.id && (object.object === 'v2.core.account' || object.object === 'account')) return object.id;
+  return null;
+}
+// Snapshot events use constructEvent. Thin v2 notifications use parseEventNotification;
+// Stripe's constructEvent rejects object "v2.core.event".
+function constructEvent(rawBody, signature, secret) {
+  const Stripe = require('stripe');
+  const payload = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(String(rawBody || ''));
+  let parsed = null;
+  try { parsed = JSON.parse(payload.toString('utf8')); } catch { parsed = null; }
+  if (parsed && parsed.object === 'v2.core.event') {
+    const verifier = new Stripe(key() || 'sk_unused', { apiVersion: PLATFORM_API_VERSION });
+    return verifier.parseEventNotification(payload, signature || '', secret);
+  }
+  return Stripe.webhooks.constructEvent(payload, signature || '', secret);
+}
+// Thin v2 account notifications do not include the account. Load it and apply the same charges gate.
+async function handleAccountNotification(event) {
+  const id = eventAccountId(event);
+  if (!id || id !== accountId()) return { ignored: 'account mismatch' };
+  if (!livemodeOk(event)) return { ignored: 'livemode mismatch' };
+  if (event.type === 'v2.core.account.closed') {
+    deauthorize();
+    markDepositsPaused('deauthorized');
+    return { closed: true, accountId: id };
+  }
+  const account = await stripe().v2.core.accounts.retrieve(id, { include: ACCOUNT_INCLUDE }, v2Options());
+  applyAccount(account);
+  syncDepositPause(account);
+  return { ok: true, accountId: id };
+}
+
 // Legacy lead-fee helper (still used when recording application-style fees against deposit amount).
 function applicationFeeCents(amountCents, leadFee, waived) {
   if (waived) return 0;
@@ -315,4 +521,5 @@ function summary() {
 module.exports = { mode, state, accountId, status, statusLabel, summary, refresh, ensureFresh, chargeAccount, payableAccount,
   checkoutBlock, checkoutAccount, markDepositsPaused, clearDepositsPause, accountUsedElsewhere, dashboardChoice, accountCreateParams,
   approvePayouts, depositsReady, payoutsReady, onboard, mockComplete, deauthorize, applyAccount, livemodeOk, applicationFeeCents, stripe, setStripe,
-  setupComplete, noteSetupRefresh };
+  setupComplete, noteSetupRefresh, syncDepositPause, constructEvent, isV2AccountEvent, eventAccountId, handleAccountNotification,
+  V2_ACCOUNT_EVENTS, ACCOUNTS_API_VERSION };

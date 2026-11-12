@@ -52,8 +52,7 @@ app.post('/stripe/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   let event;
   try {
     if (process.env.STRIPE_WEBHOOK_SECRET) {
-      const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY || 'sk_unused');
-      event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'] || '', process.env.STRIPE_WEBHOOK_SECRET);
+      event = connect.constructEvent(req.body, req.headers['stripe-signature'] || '', process.env.STRIPE_WEBHOOK_SECRET);
     } else if (unsignedStripeOk()) event = JSON.parse(req.body.toString('utf8')); // dev/mock only
     else return res.status(503).send('Webhook not configured');
   } catch (e) { console.error('stripe webhook rejected:', e.message); return res.status(400).send('Webhook error'); }
@@ -62,6 +61,19 @@ app.post('/stripe/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   if (!destination) return res.json({ received: true, ignored: 'unassigned or conflicting shop' });
   if (destination.retry) return res.status(503).send('Shop ownership pending; retry this event.');
   const handle = async () => {
+  // v2 account notifications are thin events on the Your account scope. They do not carry the account body.
+  if (connect.isV2AccountEvent(event.type)) {
+    if (!connect.livemodeOk(event)) return res.json({ received: true, ignored: 'livemode mismatch' });
+    if (event.id && deposits.eventSeen(event.id)) return res.json({ received: true, duplicate: true });
+    try {
+      const result = await connect.handleAccountNotification(event);
+      if (result && result.ignored) return res.json({ received: true, ignored: result.ignored });
+      if (result && result.closed) await booking.voidOpenSessions(result.accountId);
+    } catch (e) { console.error('v2 account webhook error:', e.message); return res.status(500).send('connect handler error'); }
+    if (shopContext.current()) await vendors.flush(shopContext.current().store);
+    if (event.id) deposits.rememberEvent(event.id);
+    return res.json({ received: true });
+  }
   // Shop subscription events (and subscription-mode checkout) -> billing.js. Deposit checkouts fall through.
   try {
     if (await billing.handleEvent(event)) {
@@ -88,7 +100,7 @@ app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, re
   let event;
   try {
     const secret = process.env.STRIPE_CONNECT_WEBHOOK_SECRET;
-    if (secret) event = require('stripe').webhooks.constructEvent(req.body, req.headers['stripe-signature'] || '', secret);
+    if (secret) event = connect.constructEvent(req.body, req.headers['stripe-signature'] || '', secret);
     else if (connect.mode() === 'mock' && sec.demoAllowed()) event = JSON.parse(req.body.toString('utf8')); // dev/mock only
     else return res.status(503).send('Connect webhook not configured');
   } catch (e) { console.error('connect webhook rejected:', e.message); return res.status(400).send('Webhook error'); }
@@ -97,7 +109,8 @@ app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, re
   if (!destination) return ignore('unassigned or conflicting shop');
   const handle = async () => {
   const acct = connect.accountId();
-  if (!event || !event.account || !acct || event.account !== acct) return ignore('account mismatch');
+  const eventAcct = connect.eventAccountId(event);
+  if (!event || !eventAcct || !acct || eventAcct !== acct) return ignore('account mismatch');
   if (!connect.livemodeOk(event)) return ignore('livemode mismatch');
   if (event.id && deposits.eventSeen(event.id)) return res.json({ received: true, duplicate: true });
   const o = event.data?.object || {};
@@ -167,8 +180,7 @@ app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, re
       }
       case 'account.updated':
         connect.applyAccount(o);
-        if (!o.charges_enabled || (o.requirements && o.requirements.disabled_reason)) connect.markDepositsPaused(o.requirements?.disabled_reason || 'charges_disabled');
-        else if (o.charges_enabled && !(o.requirements && o.requirements.disabled_reason)) connect.clearDepositsPause();
+        connect.syncDepositPause(o);
         break;
       case 'account.application.deauthorized':
         connect.deauthorize();
@@ -176,7 +188,17 @@ app.post('/stripe/connect/webhook', express.raw({ type: '*/*' }), async (req, re
         await booking.voidOpenSessions(event.account);
         await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: Stripe was disconnected. Deposit links are stopped and open checkout sessions are voided. The shop keeps any payment already taken and refunds it in Stripe.`);
         break;
-      default: return ignore('unhandled type');
+      default:
+        if (connect.isV2AccountEvent(event.type)) {
+          const result = await connect.handleAccountNotification(event);
+          if (result && result.ignored) return ignore(result.ignored);
+          if (result && result.closed) {
+            await booking.voidOpenSessions(result.accountId);
+            await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: Stripe was disconnected. Deposit links are stopped and open checkout sessions are voided. The shop keeps any payment already taken and refunds it in Stripe.`);
+          }
+          break;
+        }
+        return ignore('unhandled type');
     }
   } catch (e) { console.error('connect webhook error:', e.message); return res.status(500).send('connect handler error'); }
   if (shopContext.current()) await vendors.flush(shopContext.current().store);
@@ -944,7 +966,15 @@ async function startOnboarding(req, res) {
     const r = await connect.onboard(BASE, connectPrefill());
     if (wantsJson(req)) return res.json({ ok: true, url: r.url, accountId: r.accountId, created: r.created });
     res.redirect(303, r.url);
-  } catch (e) { console.error('connect onboarding failed:', e.message); res.status(502).type('text').send('Could not start Stripe onboarding. Check the server logs and try again.'); }
+  } catch (e) {
+    const status = Number(e.status || e.statusCode) || 500;
+    const safeStatus = status >= 400 && status < 600 ? status : 500;
+    const show = !!(e.expose || (safeStatus >= 400 && safeStatus < 500));
+    const message = show && e.message ? e.message : 'Could not start Stripe onboarding. Check the server logs and try again.';
+    console.error('connect onboarding failed:', message);
+    if (wantsJson(req)) return res.status(safeStatus).json({ error: message });
+    res.status(safeStatus).type('text').send(message);
+  }
 }
 app.post('/admin/connect/onboard', requireAdmin, startOnboarding);
 // Stripe sends the owner here when an onboarding link expired. GET must not create anything: with an existing account
