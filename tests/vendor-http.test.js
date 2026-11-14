@@ -808,9 +808,13 @@ test('vendor isolation and verified provider routing over local HTTP', { timeout
     assert.equal(lead.name, null, 'A request sentence is not a name');
     assert.equal(lead.intro, 'Hi I want knotless braids');
     const second = f.messages.filter(m => m.from === number && m.to === CALLER).at(-1);
-    assert.match(second.body, /Which style are you looking for\?/);
-    assert.match(second.body, /Knotless braids/);
+    assert.match(second.body, /What name should I put on your request\?/);
+    assert.match(second.body, /first name.*skip/i);
+    assert.equal(lead.service, 'Knotless braids', 'Keep the supplied style while clarifying the name');
     assert.doesNotMatch(second.body, /Hi I want|leak|clog/i);
+    status(await f.signed('/twilio/sms', { From: CALLER, To: number, Body: 'skip' }), 200);
+    assert.equal(lead.name, null);
+    assert.notEqual(lead.step, 'need', 'Do not ask for the known style again');
     const other = '+14705550124';
     await missedCall(f, number, other);
     status(await f.signed('/twilio/sms', { From: other, To: number, Body: "Hi I want knotless braids, I'm Keisha" }), 200);

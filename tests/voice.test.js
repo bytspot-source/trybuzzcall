@@ -18,12 +18,27 @@ const says = (x) => x.match(/<Say[^>]*>/g) || [];
 test('defaults: warm neural female voices on every Say (English and Spanish)', () => {
   assert.equal(voice.voiceName(), 'Polly.Joanna-Neural');
   assert.equal(voice.voiceNameEs(), 'Polly.Mia-Neural');
+  assert.match(consent.gatherTwiml('https://shop.example'), /action="https:\/\/shop\.example\/twilio\/voice\/consent"/);
   for (const x of [consent.gatherTwiml('https://shop.example'), consent.goodbyeTwiml(''), consent.goodbyeTwiml('2')]) {
     const tags = says(x);
     assert.ok(tags.length >= 2);
     for (const tag of tags) assert.match(tag, /^<Say( language="es-MX" voice="Polly\.Mia-Neural"| voice="Polly\.Joanna-Neural")>$/, tag);
   }
   assert.equal(voice.say("we'll <call>"), '<Say voice="Polly.Joanna-Neural">we&apos;ll &lt;call&gt;</Say>');
+});
+
+test('replayed Gather uses the saved full bilingual scripts, escaping text and keeping configured voices', (t) => {
+  const script = { prompt: consent.voicePrompt(), promptEs: consent.spanishPrompt(), state: 'retry', attempt: 1 };
+  withEnv(t, { BUSINESS_NAME: 'Changed & Sons', VOICE_CONSENT_SPANISH: '0', VOICE_NAME: 'Google.en-US-Chirp3-HD-Aoede', VOICE_NAME_ES: 'Polly.Lupe-Neural' });
+  const xml = consent.gatherTwiml('https://shop.example', script);
+  assert.ok(xml.includes(voice.say(script.prompt)));
+  assert.ok(xml.includes(voice.say(script.promptEs, 'es')));
+  assert.ok(xml.indexOf(script.promptEs) < xml.indexOf('</Gather>'), 'Spanish replay stays inside the Gather');
+  assert.doesNotMatch(xml, /Changed|retry=/, 'changed shop settings do not alter the saved script');
+  assert.match(xml, /actionOnEmptyResult="true" action="https:\/\/shop\.example\/twilio\/voice\/consent\?attempt=2"/, 'replay identifies the second attempt in its signed action URL');
+  const goodbye = consent.goodbyeTwiml('', script);
+  assert.doesNotMatch(goodbye, /<Gather/);
+  assert.ok(goodbye.includes(voice.say('No recibimos respuesta, así que no le enviaremos mensajes. Adiós.', 'es')));
 });
 
 test('custom valid voices are used', (t) => {

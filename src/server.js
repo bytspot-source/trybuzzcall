@@ -300,8 +300,7 @@ function verifyTwilio(req, res, next) {
 }
 
 const missedSayNoText = () => (agent.isAppointments() && agent.solo() ? 'Sorry I missed you. Please try again later.' : 'Sorry we missed you. Please try again later.');
-const missedSay = () => (!agent.isAppointments() ? 'Sorry we missed you. We just texted you and will call back shortly.'
-  : agent.solo() ? 'Sorry I missed you. I just sent you a text so we can get you booked.' : 'Sorry we missed you. We just sent you a text so we can get you booked.');
+const missedSay = () => env.MISSED_CALL_SAY || `Thanks for calling ${consent.shopName()}. We just texted you. You can hang up now and reply to that text to continue. Goodbye.`;
 
 // When the shop's subscription lapsed (past_due/canceled, see billing.access), callers get one polite generic text
 // (at most once per number per 24h; INACTIVE_MODE=silent sends nothing) and no booking/deposit flow.
@@ -377,14 +376,14 @@ async function startTextBack(phone) {
   if (!textBackAllowed(phone)) { console.log(`[textback] throttled ${sec.maskPhone(phone)} (already texted recently)`); return false; }
   let lead = store.findOpenLead(phone);
   if (!lead) lead = store.createLead(phone);
-  const msg = agent.firstMessage();
+  const msg = agent.firstMessage(lead);
   lead.messages.push({ dir: 'out', body: msg }); store.save();
   return (await sendSms(phone, msg)).ok;
 }
 
 // Can this caller be offered texts at all? Non-US/Canada / anonymous caller IDs, opted-out and paused numbers, and a
 // shop without a name never hear the opt-in prompt (nothing would be sent).
-async function missedCallTwiml(phone) {
+async function missedCallTwiml(phone, callSid) {
   if (!consent.shopName()) { await noNameAlert(shopContext.current()?.id || null, 'missed call'); return `${say(missedSayNoText())}<Hangup/>`; }
   if (!sec.isNanp(phone)) {
     const why = sec.nanpReason(phone);
@@ -393,7 +392,8 @@ async function missedCallTwiml(phone) {
     return `${say(missedSayNoText())}<Hangup/>`;
   }
   if (store.isOptedOut(phone) || store.isPaused(phone)) return `${say(missedSayNoText())}<Hangup/>`;
-  return consent.gatherTwiml(BASE);
+  const entry = await consent.offer({ callSid, from: phone });
+  return entry.state === 'pending' ? consent.gatherTwiml(BASE, entry) : '<Hangup/>';
 }
 const consentNoTextSay = () => 'Thanks. We were not able to send a text right now. Please try calling again later. Goodbye.';
 let noNameAlertedAt = new Map();
@@ -411,8 +411,9 @@ app.locals.resetNoNameAlerts = () => { noNameAlertedAt = new Map(); };
 
 // Instant owner buzz: ONE short SMS to the shop owner per missed call (on top of the end-of-conversation buzz).
 // INSTANT_MISSED_BUZZ=0 turns it off (default on). The wording needs the press-1 outcome, so:
-//  - caller hears the opt-in prompt -> buzz from /twilio/voice/consent as soon as they answer (1, other key or no
-//    input); if they hang up during the prompt Twilio never posts the consent result, so a fallback timer
+//  - caller hears the opt-in prompt -> buzz from /twilio/voice/consent on a final answer (1, other key or second
+//    silence); first silence replays the script and renews the fallback. If they hang up during the prompt
+//    Twilio never posts the consent result, so a fallback timer
 //    (INSTANT_MISSED_BUZZ_FALLBACK_SECONDS, default 60) sends the "didn't opt in" buzz instead;
 //  - caller isn't offered texts (opted out / paused / no shop name) -> buzz right away.
 // Deduped by CallSid in the shop's own store (db.missedBuzzes, 24h), so repeated status callbacks, the consent
@@ -460,13 +461,16 @@ async function missedBuzz(callSid, from, outcome) {
   return true;
 }
 // Called when a call is determined missed. `offered` = the caller hears the press-1 prompt (consent callback buzzes).
-async function armMissedBuzz(callSid, from, offered) {
+async function armMissedBuzz(callSid, from, offered, replay = false) {
   if (!instantBuzzOn() || !validCallSid(callSid)) return;
   if (!sec.isNanp(from)) { console.log(`[buzz] no instant buzz: caller id ${from ? sec.maskPhone(String(from).slice(0, 20)) : '(blank)'} is ${sec.nanpReason(from)}`); return; }
   if (missedBuzzSeen(callSid)) return;
   if (!offered) return void await missedBuzz(callSid, from, store.isOptedOut(from) || store.isPaused(from) ? 'opted_out' : 'no_optin');
   const key = instantBuzzKey(callSid);
-  if (instantBuzzTimers.has(key)) return;
+  if (instantBuzzTimers.has(key)) {
+    if (!replay) return;
+    clearTimeout(instantBuzzTimers.get(key));
+  }
   // Timers keep the request's shop context (AsyncLocalStorage), so the fallback reaches the right owner and store.
   const timer = setTimeout(() => {
     instantBuzzTimers.delete(key);
@@ -501,11 +505,13 @@ function recordVendorCall(req, status) {
   store.save(); return true;
 }
 app.post('/twilio/voice', verifyTwilio, routeTwilio(), async (req, res) => {
+  const prior = consent.latest(req.body.CallSid, req.body.From);
+  if (prior && prior.state !== 'pending') return twiml(res, '<Hangup/>');
   if (recordVendorCall(req, env.FORWARD_TO_PHONE ? 'ringing' : 'missed') === false) return twiml(res, '<Hangup/>');
   if (env.FORWARD_TO_PHONE) {
     return twiml(res, `<Dial timeout="${env.RING_TIMEOUT_SECONDS || 20}" action="${BASE}/twilio/voice/status">${env.FORWARD_TO_PHONE}</Dial>`);
   }
-  const xml = await missedCallTwiml(req.body.From); // opt-in prompt; nothing is texted until the caller presses 1
+  const xml = await missedCallTwiml(req.body.From, req.body.CallSid); // opt-in prompt; nothing is texted until the caller presses 1
   outcomes.missed({ callSid: req.body.CallSid, from: req.body.From, offered: xml.includes('<Gather') });
   buzzLater(armMissedBuzz(req.body.CallSid, req.body.From, xml.includes('<Gather')));
   twiml(res, xml);
@@ -513,10 +519,12 @@ app.post('/twilio/voice', verifyTwilio, routeTwilio(), async (req, res) => {
 
 // 2) Dial result: no-answer/busy/failed => missed call
 app.post('/twilio/voice/status', verifyTwilio, routeTwilio(true), async (req, res) => {
+  const prior = consent.latest(req.body.CallSid, req.body.From);
+  if (prior && prior.state !== 'pending') return twiml(res, '<Hangup/>');
   const s = req.body.DialCallStatus;
   if (recordVendorCall(req, ['no-answer','busy','failed','canceled'].includes(s) ? 'missed' : s === 'completed' ? 'answered' : 'ringing') === false) return twiml(res, '<Hangup/>');
   if (['no-answer', 'busy', 'failed', 'canceled'].includes(s)) {
-    const xml = await missedCallTwiml(req.body.From); // same consent gate
+    const xml = await missedCallTwiml(req.body.From, req.body.CallSid); // same consent gate
     outcomes.missed({ callSid: req.body.CallSid, from: req.body.From, offered: xml.includes('<Gather') });
     buzzLater(armMissedBuzz(req.body.CallSid, req.body.From, xml.includes('<Gather')));
     return twiml(res, xml);
@@ -529,12 +537,18 @@ app.post('/twilio/voice/status', verifyTwilio, routeTwilio(true), async (req, re
 app.post('/twilio/voice/consent', verifyTwilio, routeTwilio(true), async (req, res) => {
   const from = req.body.From, digits = String(req.body.Digits ?? '');
   if (!consent.shopName()) { await noNameAlert(shopContext.current()?.id || null, 'consent'); return twiml(res, `${say(missedSayNoText())}<Hangup/>`); }
-  const entry = await consent.record({ callSid: req.body.CallSid, from, digits });
+  const entry = await consent.record({ callSid: req.body.CallSid, from, digits, attempt: req.query.attempt });
+  if (entry.invalid) return twiml(res, '<Hangup/>');
+  if (entry.state === 'retry') {
+    if (!entry.duplicate) buzzLater(armMissedBuzz(req.body.CallSid, from, true, true));
+    return twiml(res, consent.gatherTwiml(BASE, entry));
+  }
+  if (entry.duplicate) return twiml(res, '<Hangup/>');
   const call = shopContext.current() && (store.db.calls || []).find((c) => c.id === req.body.CallSid);
   if (call) { call.consent = entry.consented ? 'yes' : entry.digits ? 'declined' : 'no_input'; store.save(); }
   if (!entry.consented) {
     outcomes.consent({ callSid: req.body.CallSid, from, digits: entry.digits, consented: false });
-    buzzLater(missedBuzz(req.body.CallSid, from, 'no_optin')); return twiml(res, consent.goodbyeTwiml(entry.digits));
+    buzzLater(missedBuzz(req.body.CallSid, from, 'no_optin')); return twiml(res, consent.goodbyeTwiml(entry.digits, entry));
   }
   const texted = sec.isNanp(from) ? await startTextBack(from) : false;
   outcomes.consent({ callSid: req.body.CallSid, from, digits: entry.digits, consented: true, texted });
@@ -621,7 +635,22 @@ app.post('/twilio/sms', verifyTwilio, routeTwilio(), async (req, res) => {
     if (keep.adminAlert) await platformAlert(keep.adminAlert, 'BuzzCall: no-show claim needs review');
     return twiml(res, '');
   }
-  let lead = store.findOpenLead(from) || store.createLead(from);
+  let lead = store.findOpenLead(from);
+  // A courtesy reply after wrap-up belongs to that conversation, not a brand-new intake.
+  // Bound reuse to a day; payment/dispute/opt-out handlers above retain priority.
+  if (!lead && agent.isAcknowledgement(body)) {
+    lead = store.db.leads.find((item) => item.phone === from && item.status === 'done'
+      && Date.now() - Date.parse(item.completedAt || item.createdAt) < 86400000);
+  }
+  if (!lead) {
+    lead = store.createLead(from);
+    if (/^new request[.!]?$/i.test(body.trim())) {
+      const greeting = agent.firstMessage(lead);
+      lead.messages.push({ dir: 'in', body }, { dir: 'out', body: greeting }); store.save();
+      await sendSms(from, greeting);
+      return twiml(res, '');
+    }
+  }
   lead.messages.push({ dir: 'in', body });
   const { reply, completed, booking: b } = await agent.handleReply(lead, body);
   outcomes.conversation(from, lead);
