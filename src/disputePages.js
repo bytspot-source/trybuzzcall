@@ -45,7 +45,7 @@ function evidenceList(d, { photoUrl } = {}) {
   return `<ul class="evidence-list">${ev.map((e) => `<li><strong>${esc(SOURCE[e.source] || e.source)}</strong> · ${esc(when(e.at))}${e.text ? `<br>${esc(e.text)}` : ''}${(e.media || []).map((m, i) => `<br><a class="text-action" href="${esc(m.url)}" target="_blank" rel="noopener noreferrer">MMS photo ${i + 1}${m.contentType ? ` (${esc(m.contentType)})` : ''}</a>`).join('')}${e.photoId && photoUrl ? `<br><a class="text-action" href="${esc(photoUrl(e.photoId))}" target="_blank" rel="noopener noreferrer">Uploaded photo</a>` : e.photoId ? '<br>Photo uploaded' : ''}</li>`).join('')}</ul>`;
 }
 // Vendor proof form (signed link or portal).
-function proofPage({ deposit: d, booking: b, shopName, action, message, error, open, mode, backHref }) {
+function proofPage({ deposit: d, booking: b, shopName, action, message, error, open, mode, backHref, evidenceHref, photoUrl }) {
   const appt = b ? `${b.service || b.need || 'Appointment'}${b.slotLabel ? ` · ${b.slotLabel}` : ''}` : `Booking ${d ? d.bookingId : ''}`;
   const checked = d && d.vendorCheckIn ? `<p>${badge(`You checked in ${when(d.vendorCheckIn.at)}`, 'good')}</p>` : '';
   const form = open
@@ -54,7 +54,9 @@ function proofPage({ deposit: d, booking: b, shopName, action, message, error, o
       + `<button class="button button-primary" type="submit">Send proof</button></form><p class="muted">You can also reply to BuzzCall's text with a photo or details.</p>`
     : '<p class="muted">This claim is closed, so no more proof is needed.</p>';
   const body = `<section class="payment-card"><h1>Respond to a no-show claim</h1><p><strong>${esc(shopName || '')}</strong></p><p>${esc(appt)}</p><p>The customer replied that you didn't show. Send a photo or a short note (for example, arrival time, a photo of the job or the address, a text thread). BuzzCall reviews both sides before any refund.</p>${checked}`
-    + `${message ? `<p class="notice">${esc(message)}</p>` : ''}${error ? `<p class="notice notice-warning">${esc(error)}</p>` : ''}${form}<h2>Proof on file</h2>${evidenceList(d)}${backHref ? `<p><a class="text-action" href="${esc(backHref)}">Back to your workspace</a></p>` : ''}</section>`;
+    + `${message ? `<p class="notice">${esc(message)}</p>` : ''}${error ? `<p class="notice notice-warning">${esc(error)}</p>` : ''}${form}<h2>Proof on file</h2>${evidenceList(d, { photoUrl })}`
+    + (evidenceHref ? `<p><a class="button button-outline" href="${esc(evidenceHref)}">Download evidence</a></p><p class="muted">If the customer disputes the charge with their bank, Stripe asks you to respond in your Stripe Dashboard. Attach this summary (check-in time, location and timeline) and your photos.</p>` : '')
+    + `${backHref ? `<p><a class="text-action" href="${esc(backHref)}">Back to your workspace</a></p>` : ''}</section>`;
   return shell('No-show claim', body, { businessName: shopName, mode });
 }
 

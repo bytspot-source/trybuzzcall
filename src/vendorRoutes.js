@@ -181,10 +181,23 @@ function register(app, { requireAdmin, BASE, sameOrigin }) {
   const disputeView = (req, extra = {}) => {
     const d = deposits.find(req.params.id);
     if (!d || !d.dispute) throw vendors.error('Claim not found.',404);
-    return { deposit:d, booking:store.findBooking(d.bookingId), shopName:config.env.BUSINESS_NAME || req.vendor.name, action:`/vendor/disputes/${encodeURIComponent(d.id)}/proof`,
+    const base = `/vendor/disputes/${encodeURIComponent(d.id)}`;
+    return { deposit:d, booking:store.findBooking(d.bookingId), shopName:config.env.BUSINESS_NAME || req.vendor.name, action:`${base}/proof`,
+      evidenceHref:`${base}/evidence.txt`, photoUrl:(pid) => `${base}/photo/${encodeURIComponent(pid)}`,
       open:disputes.isOpen(d), mode:connect.mode() === 'mock' && !sec.demoAllowed() ? 'unconfigured' : connect.mode(), backHref:'/vendor#payments', ...extra };
   };
   app.get('/vendor/disputes/:id', requireVendor, safe(async (req,res) => show(res,require('./disputePages').proofPage(disputeView(req)))));
+  // The shop's own evidence summary and uploaded photos, for its Stripe dispute response.
+  app.get('/vendor/disputes/:id/evidence.txt', requireVendor, safe(async (req,res) => {
+    const view = disputeView(req);
+    const text = disputes.evidenceText(view.deposit, view.booking, { shop:view.shopName, vendor:true });
+    res.set('Content-Disposition', `attachment; filename="evidence-${String(view.deposit.bookingId).replace(/[^A-Za-z0-9_-]/g, '')}.txt"`).type('text/plain; charset=utf-8').send(text);
+  }));
+  app.get('/vendor/disputes/:id/photo/:pid', requireVendor, safe(async (req,res) => {
+    const p = disputes.getPhoto(disputeView(req).deposit, req.params.pid);
+    if (!p) throw vendors.error('Photo not found.',404);
+    res.set({ 'Content-Disposition':'inline', 'Content-Security-Policy':"default-src 'none'; sandbox" }).type(p.type).send(Buffer.from(p.data, 'base64'));
+  }));
   app.post('/vendor/disputes/:id/proof', requireVendor, safe(async (req,res) => {
     const view = disputeView(req);
     const r = app.locals.submitProof(view.deposit, req.body, 'portal');
