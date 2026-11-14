@@ -315,6 +315,10 @@ test('repeat-claim flag: 2+ NO claims in 90 days flags the claim and the custome
   const r = deposits.handleNoshowReply(customer, 'no');
   assert.deepEqual(two.d.dispute.repeatClaim, { count: 2, threshold: 2 });
   assert.match(r.adminAlert, /REPEAT CLAIMER: 2 no-show claims in 90 days/);
+  assert.match(disputes.evidenceText(two.d, two.b), /Repeat claimer: 2 claims/);
+  const shopCopy = disputes.evidenceText(two.d, two.b, { vendor: true });
+  assert.match(shopCopy, /Customer replied NO \(says the vendor did not show\)\n/);
+  assert.doesNotMatch(shopCopy, /Repeat claimer/, "the shop's copy has no cross-shop claim counts");
   const f = disputes.flagFor(customer);
   assert.equal(f.count, 2);
   assert.equal(f.requirePrepay, false);
@@ -459,6 +463,25 @@ test('vendor portal: check-in button on the appointment day and proof upload for
     assert.equal(d.dispute.evidence.at(-1).source, 'portal');
     assert.match(d.dispute.evidence.at(-1).text, /Invoice #42/);
   });
+  // The shop downloads its own evidence and photos for a Stripe dispute in its Dashboard.
+  const png = 'data:image/png;base64,' + Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3]).toString('base64');
+  assert.equal((await vendorPost(`/vendor/disputes/${d.id}/proof`, cookie, 'note=gate&photo=' + encodeURIComponent(png))).status, 200);
+  const page = await (await fetch(`${URL0}/vendor/disputes/${d.id}`, { headers: { cookie } })).text();
+  assert.ok(page.includes(`/vendor/disputes/${d.id}/evidence.txt`), 'download link on the vendor claim page');
+  const photoId = await vendors.run(shop.id, async () => d.dispute.evidence.at(-1).photoId);
+  assert.ok(page.includes(`/vendor/disputes/${d.id}/photo/${photoId}`), 'uploaded photo linked for the vendor');
+  const ev = await fetch(`${URL0}/vendor/disputes/${d.id}/evidence.txt`, { headers: { cookie } });
+  assert.equal(ev.status, 200);
+  assert.match(ev.headers.get('content-disposition'), /attachment; filename="evidence-/);
+  const evText = await ev.text();
+  assert.match(evText, /location 33\.7, -84\.4 \(accuracy 30 m\)/);
+  assert.match(evText, /Invoice #42/);
+  assert.doesNotMatch(evText, /Repeat claimer/);
+  const photo = await fetch(`${URL0}/vendor/disputes/${d.id}/photo/${photoId}`, { headers: { cookie } });
+  assert.equal(photo.status, 200);
+  assert.equal(photo.headers.get('content-type'), 'image/png');
+  assert.equal((await fetch(`${URL0}/vendor/disputes/${d.id}/photo/nope`, { headers: { cookie } })).status, 404);
+  assert.notEqual((await fetch(`${URL0}/vendor/disputes/${d.id}/evidence.txt`, { redirect: 'manual' })).status, 200, 'signed-in vendors only');
   // Admin can open that shop's deposits.
   const adminHtml = await (await admin(`/admin/deposits?shop=${shop.id}`)).text();
   assert.match(adminHtml, /Invoice #42 signed by customer/);
