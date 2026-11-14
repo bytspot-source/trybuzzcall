@@ -523,7 +523,8 @@ function fullTimeline(d, b) {
   return rows.sort((a, c) => String(a.at).localeCompare(String(c.at)));
 }
 // Plain-text summary for a Stripe dispute response or the admin's records.
-function evidenceText(d, b, { shop = shopName(d), zone = shopTime.timeZone() } = {}) {
+// vendor: the shop's own copy. Cross-shop repeat-claim counts about the customer are left out.
+function evidenceText(d, b, { shop = shopName(d), zone = shopTime.timeZone(), vendor = false } = {}) {
   const fmt = (v) => { try { return new Date(v).toLocaleString('en-US', { timeZone: zone, dateStyle: 'medium', timeStyle: 'short', timeZoneName: 'short' }); } catch { return String(v); } };
   const lines = [
     `BuzzCall no-show claim evidence`,
@@ -546,7 +547,10 @@ function evidenceText(d, b, { shop = shopName(d), zone = shopTime.timeZone() } =
     if (e.photoId) lines.push(`    photo uploaded in BuzzCall (id ${e.photoId})`);
   }
   lines.push('', 'Timeline:');
-  for (const t of fullTimeline(d, b)) lines.push(`  ${fmt(t.at)}  ${t.text}`);
+  for (const t of fullTimeline(d, b)) {
+    if (vendor && t.type === 'pending') continue;
+    lines.push(`  ${fmt(t.at)}  ${vendor ? String(t.text).replace(/\. Repeat claimer: .*$/, '') : t.text}`);
+  }
   if (d.dispute && d.dispute.resolution) lines.push('', `Resolution: ${d.dispute.resolution === 'vendor' ? 'payout released to the vendor' : 'deposit refunded to the customer'} (${d.dispute.resolvedBy}) on ${fmt(d.dispute.resolvedAt)}`);
   return lines.filter((l) => l !== null).join('\n') + '\n';
 }
