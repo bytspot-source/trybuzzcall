@@ -97,7 +97,7 @@ test('legacy BUSINESS_VERTICAL=plumber (and the default) keeps the exact plumbin
       `Hi, this is Acme. Sorry we missed your call! We're likely on a job. What's your name? ${COMPLIANCE}`,
       "Thanks Dana! What's going on - leak, clog, water heater, something else? Any active flooding?",
       'Got it. When\'s a good time for a callback today (e.g. "now", "after 3pm")?',
-      "Thanks Dana, we'll call you back after 3pm. If water is actively leaking, shut off your main valve.",
+      'Acme: Thanks Dana! Your callback request is saved.\nRequest: burst pipe in the basement\nPreferred time: after 3pm.\nThe business will need to confirm timing; this is not a booked appointment.',
     ]);
     assert.equal(r.lead.urgent, true);
   }
@@ -110,7 +110,7 @@ test('legacy BUSINESS_VERTICAL=hvac keeps the exact HVAC texts; booking offers w
     `Hi, this is Acme. Sorry we missed your call! What's your name? ${COMPLIANCE}`,
     "Thanks Lee! What's happening - no cooling, no heat, noise, maintenance? Anyone vulnerable in the home?",
     'Got it. When\'s a good time for a callback (e.g. "now", "after 3pm")?',
-    'Thanks Lee, a tech will call you back now. Stay safe!',
+    'Acme: Thanks Lee! Your callback request is saved.\nRequest: no heat at all\nPreferred time: now.\nThe business will need to confirm timing; this is not a booked appointment.',
   ]);
   assert.equal(r.lead.urgent, true);
   shop({ BUSINESS_VERTICAL: 'hvac', BOOKING_ENABLED: '1', DEPOSIT_ENABLED: '0' });
@@ -152,7 +152,7 @@ test('pet grooming mentions the pet; barber and tutor wording; appointments neve
   assert.match(p.replies[1], /your pet's name, breed and size/);
   assert.equal(p.replies[2], 'Got it - Full groom. What day works best for you and your pet? (e.g. "Saturday", "10/24", or "soonest")');
   assert.match(p.replies[3], /When's a good time for me to call you back/);
-  assert.equal(p.replies[4], "Thanks Sam! I'll call you back tomorrow morning.");
+  assert.equal(p.replies[4], 'Acme: Thanks Sam! Your callback request is saved.\nRequest: Full groom (Max, doodle, 40 lbs emergency)\nPreferred time: tomorrow morning.\nThe business will need to confirm timing; this is not a booked appointment.');
   assert.equal(p.lead.urgent, false, 'urgent words only matter for the jobs flow');
   assert.match(p.lead.need, /^Full groom \(.*Max, doodle, 40 lbs/);
   shop({ BUSINESS_TYPE: 'barber' });
@@ -177,7 +177,7 @@ test('handyman (jobs): describe the need, urgent words, next windows, deposit, c
   assert.equal(agent.isUrgent("back door won't lock"), true);
   const cb = await talk(['Chris', 'shelves', 'callback', 'after 5']);
   assert.equal(cb.lead.urgent, false);
-  assert.equal(cb.replies[4], "Thanks Chris, we'll call you back after 5.");
+  assert.equal(cb.replies[4], 'Acme: Thanks Chris! Your callback request is saved.\nRequest: shelves\nPreferred time: after 5.\nThe business will need to confirm timing; this is not a booked appointment.');
   assert.match(agent.systemPrompt(), /a local handyman business/);
   assert.match(agent.systemPrompt(), /No prices, no promises of arrival times\./);
 });

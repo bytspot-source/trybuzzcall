@@ -13,7 +13,8 @@ for (const k of ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'STRIPE_CONNECT_W
   'TWILIO_PHONE_NUMBER', 'OPENAI_API_KEY', 'DATABASE_URL', 'FORWARD_TO_PHONE', 'VERTICAL', 'BUSINESS_VERTICAL', 'BUSINESS_TYPE', 'SERVICES', 'BOOKING_LINK',
   'BILLING_REQUIRE_SUBSCRIPTION', 'BILLING_ENFORCE', 'DEMO_MODE', 'ADMIN_USERNAME', 'RENDER', 'CLIENT_IP_HEADER', 'TEXTBACK_COOLDOWN_MINUTES',
   'OUTBOUND_MAX_PER_HOUR', 'OUTBOUND_MAX_PER_DAY', 'RETENTION_DAYS', 'BOOKING_ENABLED', 'DEPOSIT_ENABLED', 'REQUIRE_POSTGRES', 'HELP_MESSAGE',
-  'INACTIVE_MESSAGE', 'INACTIVE_MODE', 'KEYWORD_REPLIES', 'VOICE_CONSENT_PROMPT', 'VOICE_CONSENT_SPANISH', 'TEXT_EXTRA_AREA_CODES', 'VOICE_NAME', 'VOICE_NAME_ES']) delete process.env[k];
+  'INACTIVE_MESSAGE', 'INACTIVE_MODE', 'KEYWORD_REPLIES', 'VOICE_CONSENT_PROMPT', 'VOICE_CONSENT_SPANISH', 'TEXT_EXTRA_AREA_CODES', 'VOICE_NAME', 'VOICE_NAME_ES',
+  'MISSED_CALL_SAY', 'INSTANT_MISSED_BUZZ', 'INSTANT_MISSED_BUZZ_FALLBACK_SECONDS', 'INSTANT_MISSED_BUZZ_MAX_PER_HOUR']) delete process.env[k];
 const OWNER = '+14045550100';
 const OWNER_EMAIL = 'owner-private@example.com';
 Object.assign(process.env, { DATA_DIR: dir, TZ: 'UTC', BUSINESS_TZ: 'UTC', NODE_ENV: 'test', ADMIN_PASSWORD: 'a2p-test-password-long-enough', BUSINESS_NAME: 'Peach State Plumbing',
@@ -27,10 +28,10 @@ const { app } = require('../src/server');
 
 let server, BASE;
 test.before(async () => { await new Promise((r) => { server = app.listen(0, '127.0.0.1', r); }); BASE = `http://127.0.0.1:${server.address().port}`; });
-test.after(() => { server.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+test.after(() => { app.locals.resetInstantBuzz(); server.close(); fs.rmSync(dir, { recursive: true, force: true }); });
 
 const req = (p, opts = {}) => fetch(BASE + p, { redirect: 'manual', ...opts });
-const form = (p, fields) => req(p, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(fields).toString() });
+const form = (p, fields, headers = {}) => req(p, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers }, body: new URLSearchParams(fields).toString() });
 const smsLog = () => { try { return fs.readFileSync(path.join(dir, 'sms.log'), 'utf8'); } catch { return ''; } };
 const sentTo = (p) => smsLog().split('\n').filter((l) => l.includes(`SMS -> ${p}:`));
 const quiet = (t) => { const o = console.error, l = console.log; console.error = () => {}; console.log = () => {}; t.after(() => { console.error = o; console.log = l; }); };
@@ -43,6 +44,12 @@ let n = 0; const num = () => `+1404555${String(2000 + (n++)).slice(-4)}`;
 let sid = 0; const callSid = () => `CA${String(++sid).padStart(32, '0')}`;
 const xmlText = (s) => s.replace(/&/g, '&amp;').replace(/'/g, '&apos;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const PROMPT = "Peach State Plumbing can't take your call right now. Press 1 and we'll text you at this number to get you booked. Message frequency varies, message and data rates may apply. Reply STOP to opt out or HELP for help.";
+const gatherAction = (xml) => {
+  const match = xml.match(/<Gather\b[^>]*\baction="([^"]+)"/);
+  assert.ok(match, 'response offers a Gather action');
+  const url = new URL(match[1].replace(/&amp;/g, '&'));
+  return url.pathname + url.search;
+};
 
 // ---------- 1. voice consent before texting ----------
 test('missed call plays the press-1 opt-in prompt and texts nothing yet', async (t) => {
@@ -58,31 +65,225 @@ test('missed call plays the press-1 opt-in prompt and texts nothing yet', async 
   assert.ok(!store.findOpenLead(p), 'no lead before consent');
   assert.equal(consent.voicePrompt(), PROMPT);
 });
-test('consent gate: no digit or another key -> goodbye, no text, logged; 1 -> one text, logged', async (t) => {
+test('first silence replays the full script; second silence ends without texting or a duplicate owner buzz', async (t) => {
   quiet(t);
-  const none = num(), two = num(), one = num();
-  for (const [p, Digits] of [[none, ''], [two, '2']]) {
-    const CallSid = callSid();
-    await form('/twilio/voice', { From: p, CallSid });
-    const r = await form('/twilio/voice/consent', { From: p, CallSid, Digits });
-    const xml = await r.text();
-    assert.match(xml, /won't text you|won&apos;t text you/);
+  const p = num(), CallSid = callSid(), fields = { From: p, CallSid };
+  const initial = await (await form('/twilio/voice', fields)).text();
+  const first = await (await form(gatherAction(initial), fields)).text();
+  assert.equal(gatherAction(first), '/twilio/voice/consent?attempt=2');
+  assert.equal(first, initial.replace(gatherAction(initial), gatherAction(first)), 'one replay of the entire required script, not a shortened reminder');
+  assert.equal(sentTo(p).length, 0);
+  assert.equal(sentTo(OWNER).filter((l) => l.includes(`Missed call from ${p} `)).length, 0, 'no owner buzz on first silence');
+  assert.equal(store.db.outcomes[CallSid].result_stage, 'missed', 'first silence is not a final no-consent outcome');
+  const firstRecord = consent.latest(CallSid, p);
+  assert.deepEqual([firstRecord.attempt, firstRecord.state, firstRecord.digits, firstRecord.prompt], [1, 'retry', '', PROMPT]);
+  assert.ok(Number.isFinite(Date.parse(firstRecord.promptedAt)));
+  // Reload persisted state as at boot: the recorded first silence still authorizes only attempt 2.
+  store.db.voiceConsents = store.createStore({ dir }).db.voiceConsents;
+  for (const route of ['/twilio/voice', '/twilio/voice/status']) {
+    assert.doesNotMatch(await (await form(route, { ...fields, DialCallStatus: 'no-answer' })).text(), /<Gather/);
+  }
+  const second = await (await form(gatherAction(first), { ...fields, Digits: '' })).text();
+  assert.doesNotMatch(second, /<Gather/);
+  assert.match(second, /We didn&apos;t get a response, so we won&apos;t text you/);
+  assert.match(second, /Goodbye\.<\/Say><Hangup\/>/);
+  assert.equal(consent.latest(CallSid, p).attempt, 2);
+  assert.equal(store.db.outcomes[CallSid].result_stage, 'no_consent');
+  const closed = structuredClone(consent.latest(CallSid, p));
+  for (const action of [gatherAction(initial), gatherAction(first)]) {
+    for (const Digits of ['', '', '1']) {
+      assert.doesNotMatch(await (await form(action, { ...fields, Digits })).text(), /<Gather/);
+      assert.deepEqual(consent.latest(CallSid, p), closed, 'terminal callbacks never reset or overwrite the saved answer');
+    }
+  }
+  assert.equal(store.db.voiceConsents.filter((c) => c.callSid === CallSid).length, 2, 'duplicates do not append evidence');
+  assert.equal(sentTo(p).length, 0);
+  assert.ok(!store.findOpenLead(p));
+  assert.equal(sentTo(OWNER).filter((l) => l.includes(`Missed call from ${p} `)).length, 1, 'one final owner buzz');
+});
+test('any non-1 answer is a terminal explicit decline, with no replay or late opt-in', async (t) => {
+  quiet(t);
+  for (const Digits of ['2', '0', '*', '#', '11', 'x1']) {
+    const p = num(), CallSid = callSid(), fields = { From: p, CallSid };
+    await form('/twilio/voice', fields);
+    const xml = await (await form('/twilio/voice/consent', { ...fields, Digits })).text();
+    assert.doesNotMatch(xml, /<Gather/);
+    assert.match(xml, /Okay, we won&apos;t text you/);
     assert.match(xml, /Goodbye\.<\/Say><Hangup\/>/);
+    const rec = consent.latest(CallSid, p);
+    assert.deepEqual([rec.from, rec.shopId, rec.digits, rec.consented, rec.attempt], [p, 'legacy', Digits, false, 1]);
+    for (const answer of ['', '1']) assert.doesNotMatch(await (await form('/twilio/voice/consent', { ...fields, Digits: answer })).text(), /<Gather/);
     assert.equal(sentTo(p).length, 0, `Digits=${JSON.stringify(Digits)}: no text`);
     assert.ok(!store.findOpenLead(p));
-    const rec = store.db.voiceConsents.find((c) => c.callSid === CallSid);
-    assert.deepEqual([rec.from, rec.shopId, rec.digits, rec.consented], [p, 'legacy', Digits, false]);
   }
-  const CallSid = callSid();
-  await form('/twilio/voice', { From: one, CallSid });
-  const r = await form('/twilio/voice/consent', { From: one, CallSid, Digits: '1' });
-  assert.match(await r.text(), /We just texted you/);
-  const lines = sentTo(one);
-  assert.equal(lines.length, 1, 'exactly one text after pressing 1');
-  assert.match(lines[0], /Hi, this is Peach State Plumbing\./);
-  const rec = store.db.voiceConsents.find((c) => c.callSid === CallSid);
-  assert.equal(rec.consented, true); assert.equal(rec.digits, '1'); assert.equal(rec.from, one); assert.equal(rec.shopId, 'legacy');
-  assert.ok(Number.isFinite(Date.parse(rec.at))); assert.equal(rec.prompt, PROMPT);
+});
+test('press 1 on either attempt texts once, names the business and explains how to continue in text', async (t) => {
+  quiet(t);
+  withEnv(t, { TEXTBACK_COOLDOWN_MINUTES: '0' });
+  for (const replay of [false, true]) {
+    const p = num(), CallSid = callSid(), fields = { From: p, CallSid };
+    let prompt = await (await form('/twilio/voice', fields)).text();
+    if (replay) prompt = await (await form(gatherAction(prompt), fields)).text();
+    const action = gatherAction(prompt);
+    assert.equal(sentTo(p).length, 0, 'no text before 1');
+    const xml = await (await form(action, { ...fields, Digits: '1' })).text();
+    assert.match(xml, /Thanks for calling Peach State Plumbing\. We just texted you\./);
+    assert.match(xml, /hang up now and reply to that text to continue\. Goodbye\./);
+    assert.doesNotMatch(xml, /<Gather/);
+    const rec = consent.latest(CallSid, p);
+    assert.deepEqual([rec.consented, rec.digits, rec.from, rec.shopId, rec.attempt], [true, '1', p, 'legacy', replay ? 2 : 1]);
+    assert.ok(Number.isFinite(Date.parse(rec.at))); assert.equal(rec.prompt, PROMPT);
+    // Even with the phone cooldown disabled, overlapping redeliveries cannot send another initial text.
+    await Promise.all([1, 2, 3].map(() => form(action, { ...fields, Digits: '1' })));
+    assert.equal(sentTo(p).length, 1);
+    assert.match(sentTo(p)[0], /Hi, this is Peach State Plumbing\./);
+    assert.equal(store.db.outcomes[CallSid].textback_sent, true, 'duplicates do not overwrite the successful outcome');
+    assert.equal(sentTo(OWNER).filter((l) => l.includes(`Missed call from ${p} `)).length, 1);
+  }
+});
+test('duplicate first silence returns the same replay without renewing the fallback; real replay press 1 texts once', async (t) => {
+  quiet(t);
+  withEnv(t, { TEXTBACK_COOLDOWN_MINUTES: '0', INSTANT_MISSED_BUZZ_FALLBACK_SECONDS: '120' });
+  const originalTimeout = global.setTimeout;
+  let fallbackTimers = 0;
+  t.mock.method(global, 'setTimeout', (callback, ms, ...args) => {
+    if (ms === 120000) fallbackTimers++;
+    return originalTimeout(callback, ms, ...args);
+  });
+  const p = num(), CallSid = callSid(), fields = { From: p, CallSid };
+  const initial = await (await form('/twilio/voice', fields)).text();
+  const action = gatherAction(initial);
+  const results = await Promise.all([1, 2, 3].map(async () => (await form(action, fields)).text()));
+  const replay = results[0];
+  assert.equal(gatherAction(replay), '/twilio/voice/consent?attempt=2');
+  assert.ok(results.every((xml) => xml === replay), 'overlapping first silences all receive the same replay');
+  const saved = structuredClone(consent.latest(CallSid, p));
+  assert.deepEqual([saved.attempt, saved.state], [1, 'retry']);
+  for (let i = 0; i < 5; i++) assert.equal(await (await form(action, fields)).text(), replay);
+  assert.deepEqual(consent.latest(CallSid, p), saved, 'duplicate silence does not change timestamps or evidence');
+  assert.equal(store.db.voiceConsents.filter((c) => c.callSid === CallSid).length, 1);
+  assert.equal(fallbackTimers, 2, 'only the offer and first silence arm a fallback, never duplicate callbacks');
+  assert.equal(store.db.outcomes[CallSid].result_stage, 'missed');
+  assert.equal(sentTo(p).length, 0);
+  assert.equal(sentTo(OWNER).filter((l) => l.includes(`Missed call from ${p} `)).length, 0);
+  const responses = await Promise.all([1, 2, 3].map(async () => (await form(gatherAction(replay), { ...fields, Digits: '1' })).text()));
+  assert.equal(responses.filter((xml) => xml.includes('We just texted you')).length, 1);
+  assert.deepEqual([consent.latest(CallSid, p).attempt, consent.latest(CallSid, p).state], [2, 'accepted']);
+  assert.equal(sentTo(p).length, 1);
+  assert.equal(sentTo(OWNER).filter((l) => l.includes(`Missed call from ${p} `)).length, 1);
+  assert.equal(store.db.outcomes[CallSid].textback_sent, true);
+  for (const endpoint of [action, gatherAction(replay)]) {
+    assert.doesNotMatch(await (await form(endpoint, fields)).text(), /<Gather/);
+  }
+  assert.equal(store.db.voiceConsents.filter((c) => c.callSid === CallSid).length, 2);
+  assert.equal(consent.latest(CallSid, p).state, 'accepted');
+});
+test('persisted replay survives a process restart and duplicate first silence still permits real replay consent', async (t) => {
+  quiet(t);
+  const p = num(), CallSid = callSid(), fields = { From: p, CallSid };
+  const initial = await (await form('/twilio/voice', fields)).text();
+  const replay = await (await form(gatherAction(initial), fields)).text();
+  const saved = structuredClone(consent.latest(CallSid, p));
+  const restarted = JSON.parse(require('node:child_process').execFileSync(process.execPath, ['-e', `
+    require('dotenv').config = () => ({ parsed: {} });
+    const consent = require('./src/consent');
+    const fields = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+    consent.record(fields).then((entry) => process.stdout.write(JSON.stringify({
+      entry, xml: consent.gatherTwiml('https://shop.example', entry),
+      saved: consent.latest(fields.callSid, fields.from)
+    })));
+  `], { cwd: path.join(__dirname, '..'), input: JSON.stringify({ callSid: CallSid, from: p, digits: '' }), encoding: 'utf8' }));
+  assert.equal(restarted.entry.duplicate, true);
+  assert.equal(restarted.entry.state, 'retry');
+  assert.deepEqual(restarted.saved, saved, 'restart recognizes the existing first silence without rewriting it');
+  assert.ok(replay.includes(restarted.xml), 'the restarted process produces the identical replay');
+  store.db.voiceConsents = store.createStore({ dir }).db.voiceConsents;
+  assert.equal(await (await form(gatherAction(initial), fields)).text(), replay);
+  await form(gatherAction(replay), { ...fields, Digits: '1' });
+  assert.equal(sentTo(p).length, 1);
+  assert.equal(consent.latest(CallSid, p).attempt, 2);
+  assert.equal(store.db.voiceConsents.filter((c) => c.callSid === CallSid).length, 2);
+});
+test('attempt markers cannot skip the first silence, invent a replay, or advance pending/retry state', async (t) => {
+  quiet(t);
+  const p = num(), CallSid = callSid(), fields = { From: p, CallSid };
+  const initial = await (await form('/twilio/voice', fields)).text();
+  const pending = structuredClone(consent.latest(CallSid, p));
+  for (const query of ['attempt=2', 'attempt=0', 'attempt=3', 'attempt=unknown', 'attempt=', 'attempt=02', 'attempt=2&attempt=1', 'attempt[x]=2']) {
+    for (const Digits of ['', '1']) {
+      assert.doesNotMatch(await (await form(`/twilio/voice/consent?${query}`, { ...fields, Digits })).text(), /<Gather/);
+      assert.deepEqual(consent.latest(CallSid, p), pending, 'invalid marker never advances the offer');
+    }
+  }
+  const other = { From: num(), CallSid: callSid() };
+  for (const Digits of ['', '1']) {
+    for (const caller of [other, { ...fields, From: other.From }, { ...fields, CallSid: other.CallSid }]) {
+      assert.doesNotMatch(await (await form('/twilio/voice/consent?attempt=2', { ...caller, Digits })).text(), /<Gather/);
+      assert.equal(consent.latest(caller.CallSid, caller.From), null, 'query alone cannot create a replay or consent');
+    }
+  }
+  const replay = await (await form(gatherAction(initial), fields)).text();
+  const saved = structuredClone(consent.latest(CallSid, p));
+  for (const query of ['attempt=unknown', 'attempt=3', 'attempt=2&attempt=2']) {
+    for (const Digits of ['', '1']) {
+      assert.doesNotMatch(await (await form(`/twilio/voice/consent?${query}`, { ...fields, Digits })).text(), /<Gather/);
+      assert.deepEqual(consent.latest(CallSid, p), saved, 'invalid marker never consumes the genuine second chance');
+    }
+  }
+  assert.doesNotMatch(await (await form(gatherAction(initial), { ...fields, Digits: '1' })).text(), /<Gather/);
+  assert.deepEqual(consent.latest(CallSid, p), saved, 'a changed answer to the first attempt cannot opt in after silence');
+  assert.equal(sentTo(p).length, 0);
+  assert.equal(sentTo(other.From).length, 0);
+  assert.equal(sentTo(OWNER).filter((l) => l.includes(`Missed call from ${p} `)).length, 0);
+  assert.equal(store.db.outcomes[CallSid].result_stage, 'missed');
+  await form(gatherAction(replay), { ...fields, Digits: '1' });
+  assert.equal(sentTo(p).length, 1, 'only the genuine replay action authorizes the second answer');
+});
+test('the replay marker is signed, and even a valid signature cannot skip the persisted first silence', async (t) => {
+  quiet(t);
+  const p = num(), CallSid = callSid(), fields = { From: p, CallSid };
+  const initial = await (await form('/twilio/voice', fields)).text();
+  const pending = structuredClone(consent.latest(CallSid, p));
+  withEnv(t, { TWILIO_AUTH_TOKEN: require('node:crypto').randomBytes(32).toString('hex'), SKIP_TWILIO_VALIDATION: '0' });
+  const signed = (action, body, signedAction = action) => form(action, body, {
+    'x-twilio-signature': require('twilio').getExpectedTwilioSignature(process.env.TWILIO_AUTH_TOKEN, 'https://shop.example' + signedAction, body),
+  });
+  const secondAction = '/twilio/voice/consent?attempt=2';
+  assert.doesNotMatch(await (await signed(secondAction, { ...fields, Digits: '1' })).text(), /<Gather/);
+  assert.deepEqual(consent.latest(CallSid, p), pending, 'signed attempt 2 cannot bypass the initial prompt');
+  const replay = await (await signed(gatherAction(initial), fields)).text();
+  const saved = structuredClone(consent.latest(CallSid, p));
+  const press = { ...fields, Digits: '1' };
+  assert.equal((await signed(gatherAction(replay), press, gatherAction(initial))).status, 403, 'changing the signed URL invalidates its signature');
+  assert.equal((await form(gatherAction(replay), press)).status, 403, 'unsigned replay is refused');
+  assert.deepEqual(consent.latest(CallSid, p), saved);
+  assert.equal(sentTo(p).length, 0);
+  const accepted = await signed(gatherAction(replay), press);
+  assert.equal(accepted.status, 200);
+  assert.match(await accepted.text(), /We just texted you/);
+  await signed(gatherAction(replay), press);
+  assert.equal(sentTo(p).length, 1);
+});
+test('silence needs a valid call/from pair and a recorded offer to earn a replay', async (t) => {
+  quiet(t);
+  for (const fields of [{ From: num() }, { From: num(), CallSid: '../invalid' }, { From: 'anonymous', CallSid: callSid() }]) {
+    await form('/twilio/voice', fields);
+    assert.doesNotMatch(await (await form('/twilio/voice/consent?retry=0', fields)).text(), /<Gather/);
+  }
+  const From = num(), CallSid = callSid();
+  await form('/twilio/voice', { From, CallSid });
+  assert.doesNotMatch(await (await form('/twilio/voice/consent', { From: num(), CallSid })).text(), /<Gather/, 'another caller cannot borrow the offer');
+  assert.doesNotMatch(await (await form('/twilio/voice/consent', { From, CallSid: callSid() })).text(), /<Gather/, 'another call cannot borrow the offer');
+  assert.match(await (await form('/twilio/voice/consent', { From, CallSid })).text(), /<Gather/, 'original valid pair retains its one retry');
+});
+test('an explicit custom MISSED_CALL_SAY remains the successful call wrap-up', async (t) => {
+  quiet(t);
+  withEnv(t, { MISSED_CALL_SAY: 'Peach State Plumbing: please reply to our text. Thanks & goodbye.' });
+  const p = num(), CallSid = callSid();
+  await form('/twilio/voice', { From: p, CallSid });
+  const xml = await (await form('/twilio/voice/consent', { From: p, CallSid, Digits: '1' })).text();
+  assert.ok(xml.includes(`<Say voice="Polly.Joanna-Neural">${xmlText(process.env.MISSED_CALL_SAY)}</Say><Hangup/>`));
+  assert.equal(sentTo(p).length, 1);
 });
 test('forwarded call: no-answer status plays the prompt (no text); answered call hangs up; 1 then texts', async (t) => {
   quiet(t);
@@ -113,7 +314,7 @@ test('no prompt for callers who cannot be texted (international, anonymous, opte
 });
 test('per-shop prompt wording (VOICE_CONSENT_PROMPT) needs the required disclosures; Spanish option', async (t) => {
   quiet(t);
-  withEnv(t, { VOICE_CONSENT_PROMPT: 'Thanks for calling {shop}. Press 1 and we will text you to book. Message frequency varies, message and data rates may apply. Reply STOP to opt out or HELP for help.' });
+  withEnv(t, { VOICE_CONSENT_SPANISH: undefined, VOICE_CONSENT_PROMPT: 'Thanks for calling {shop}. Press 1 and we will text you to book. Message frequency varies, message and data rates may apply. Reply STOP to opt out or HELP for help.' });
   assert.equal(consent.voicePrompt(), 'Thanks for calling Peach State Plumbing. Press 1 and we will text you to book. Message frequency varies, message and data rates may apply. Reply STOP to opt out or HELP for help.');
   process.env.VOICE_CONSENT_PROMPT = 'Press 1 for texts from {shop}!'; // missing disclosures -> default script
   assert.equal(consent.voicePrompt(), PROMPT);
@@ -122,6 +323,26 @@ test('per-shop prompt wording (VOICE_CONSENT_PROMPT) needs the required disclosu
   const xml = await (await form('/twilio/voice', { From: num(), CallSid: callSid() })).text();
   assert.match(xml, /<Say language="es-MX" voice="Polly\.Mia-Neural">Peach State Plumbing no puede atender su llamada en este momento\. Oprima 1 /);
   assert.ok(xml.indexOf('es-MX') < xml.indexOf('</Gather>'), 'Spanish script is inside the same Gather');
+});
+
+test('bilingual replay and consent evidence keep the actual custom scripts issued before settings changed', async (t) => {
+  quiet(t);
+  withEnv(t, { VOICE_CONSENT_SPANISH: '1', VOICE_CONSENT_PROMPT: 'Thank you for calling {shop}. Press 1 for a text. Message frequency varies, message and data rates may apply. Reply STOP to opt out or HELP for help.' });
+  const p = num(), CallSid = callSid(), fields = { From: p, CallSid };
+  const prompt = consent.voicePrompt(), promptEs = consent.spanishPrompt();
+  const initial = await (await form('/twilio/voice', fields)).text();
+  process.env.VOICE_CONSENT_PROMPT = '';
+  process.env.VOICE_CONSENT_SPANISH = '0';
+  const replay = await (await form(gatherAction(initial), fields)).text();
+  assert.equal(replay, initial.replace(gatherAction(initial), gatherAction(replay)), 'full English and Spanish scripts are replayed unchanged');
+  assert.ok(replay.includes(xmlText(prompt)) && replay.includes(xmlText(promptEs)));
+  assert.equal(await (await form(gatherAction(initial), fields)).text(), replay, 'duplicate silence also keeps both saved scripts');
+  const goodbye = await (await form(gatherAction(replay), fields)).text();
+  assert.doesNotMatch(goodbye, /<Gather/);
+  assert.match(goodbye, /<Say language="es-MX" voice="Polly.Mia-Neural">No recibimos respuesta/);
+  const entries = store.db.voiceConsents.filter((c) => c.callSid === CallSid);
+  assert.deepEqual(entries.map((c) => [c.attempt, c.digits, c.prompt, c.promptEs]), [[2, '', prompt, promptEs], [1, '', prompt, promptEs]]);
+  assert.equal(sentTo(p).length, 0);
 });
 
 // ---------- 3. a real shop name before any outbound text ----------
@@ -246,4 +467,28 @@ test('privacy, terms and sms-consent: no draft banners or TODO(legal); sms-conse
   const home = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8');
   assert.doesNotMatch(home, /should not simply be assumed to authorize|must be finalized/);
   assert.match(home, /Only callers who press 1 get a text/);
+});
+
+test('consent retry state is scoped to the receiving shop even for the same call/from pair', async (t) => {
+  quiet(t);
+  const vendors = require('../src/vendors');
+  const shops = await Promise.all(['Retry Shop One', 'Retry Shop Two'].map((name, i) => vendors.create({ name, email: `retry${i}@example.com` })));
+  const fields = { callSid: callSid(), from: num() };
+  for (const { shop } of shops) {
+    await vendors.run(shop.id, async () => {
+      assert.equal(consent.latest(fields.callSid, fields.from), null);
+      await consent.offer(fields);
+      const first = await consent.record({ ...fields, digits: '' });
+      assert.equal(first.state, 'retry');
+      assert.equal(first.attempt, 1);
+      assert.equal(first.shopId, shop.id);
+      const duplicate = await consent.record({ ...fields, digits: '' });
+      assert.equal(duplicate.state, 'retry');
+      assert.equal(duplicate.duplicate, true);
+      const second = await consent.record({ ...fields, digits: '', attempt: '2' });
+      assert.equal(second.state, 'no_input');
+      assert.equal(second.attempt, 2);
+    }, { suspended: true });
+  }
+  assert.equal(consent.latest(fields.callSid, fields.from), null, 'no vendor consent leaks to the legacy line');
 });

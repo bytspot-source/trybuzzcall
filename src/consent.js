@@ -1,8 +1,9 @@
 'use strict';
 // A2P 10DLC voice consent. A missed call never starts texting on its own: the caller hears the opt-in script in a
 // <Gather numDigits="1"> and only a press of 1 starts the text-back (POST /twilio/voice/consent, Twilio-signed).
-// Every answer (1, another key, or no input) is logged per shop in db.voiceConsents with the time, CallSid, From,
-// shop id, digits and the exact script played. Those records are consent evidence: retention never purges them
+// Each offered prompt and answer is logged per shop in db.voiceConsents with the time, CallSid, From,
+// shop id, digits and the exact script issued. One silence may replay that script; a second silence or any other
+// key ends the call without texting. Those records are consent evidence: retention never purges them
 // (they are capped at MAX_RECORDS, newest kept).
 // Shop name: no caller-facing text goes out without a real shop name (shopName() is '' when BUSINESS_NAME is unset or
 // a placeholder); sms.js blocks the send and the platform administrator is alerted.
@@ -43,38 +44,73 @@ const spanishPrompt = (name = shopName()) => fill(SPANISH_PROMPT, name);
 const spanish = () => /^(1|true|yes|on)$/i.test(String(env.VOICE_CONSENT_SPANISH || ''));
 const xml = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[c]);
 
-// TwiML body for a missed call: the opt-in script in a one-digit Gather. actionOnEmptyResult makes Twilio post the
-// no-input outcome too, so it is logged (and answered with a goodbye, never a text).
-function gatherTwiml(base) {
-  const name = shopName();
-  const es = spanish() ? `<Pause length="1"/>${say(spanishPrompt(name), 'es')}` : '';
-  return `<Gather input="dtmf" numDigits="1" timeout="8" actionOnEmptyResult="true" action="${xml(base)}/twilio/voice/consent" method="POST"><Pause length="1"/>${say(voicePrompt(name))}${es}</Gather>`
-    + `${say(NO_INPUT)}${spanish() ? say(NO_INPUT_ES, 'es') : ''}<Hangup/>`;
+const prompts = () => ({ prompt: voicePrompt(), ...(spanish() ? { promptEs: spanishPrompt() } : {}) });
+// Use the saved script on replay, even if the shop changes its settings between callbacks.
+// The action URL (including its attempt marker) is covered by Twilio's webhook signature. The marker identifies
+// which Gather answered; record() still requires a saved first silence before accepting the replay's answer.
+function gatherTwiml(base, script = prompts()) {
+  const es = script.promptEs ? `<Pause length="1"/>${say(script.promptEs, 'es')}` : '';
+  const attempt = script.state === 'retry' ? '?attempt=2' : '';
+  return `<Gather input="dtmf" numDigits="1" timeout="8" actionOnEmptyResult="true" action="${xml(base)}/twilio/voice/consent${attempt}" method="POST"><Pause length="1"/>${say(script.prompt)}${es}</Gather>`
+    + `${say(NO_INPUT)}${script.promptEs ? say(NO_INPUT_ES, 'es') : ''}<Hangup/>`;
 }
-const goodbyeTwiml = (digits) => {
+const goodbyeTwiml = (digits, script = prompts()) => {
   const none = !digits;
-  return `${say(none ? NO_INPUT : DECLINED)}${spanish() ? say(none ? NO_INPUT_ES : DECLINED_ES, 'es') : ''}<Hangup/>`;
+  return `${say(none ? NO_INPUT : DECLINED)}${script.promptEs ? say(none ? NO_INPUT_ES : DECLINED_ES, 'es') : ''}<Hangup/>`;
 };
 
 // Consent log, in the current shop's store (legacy root or the vendor's namespaced store).
-async function record({ callSid, from, digits }) {
-  const d = String(digits ?? '').replace(/[^0-9*#]/g, '').slice(0, 4);
-  const entry = {
-    at: new Date().toISOString(),
-    callSid: typeof callSid === 'string' && /^[A-Za-z0-9]{1,80}$/.test(callSid) ? callSid : null,
-    from: /^\+[1-9]\d{7,14}$/.test(String(from || '')) ? String(from) : null,
-    shopId: shopContext.shopId() || 'legacy',
-    digits: d,
-    consented: d === '1',
-    prompt: voicePrompt(),
-    ...(spanish() ? { promptEs: spanishPrompt() } : {}),
-  };
+const identity = (callSid, from) => ({
+  callSid: typeof callSid === 'string' && /^[A-Za-z0-9]{1,80}$/.test(callSid) ? callSid : null,
+  from: typeof from === 'string' && /^\+[1-9]\d{7,14}$/.test(from) ? from : null,
+  shopId: shopContext.shopId() || 'legacy',
+});
+function latest(callSid, from) {
+  const id = identity(callSid, from);
+  if (!id.callSid || !id.from) return null;
+  return (store.db.voiceConsents || []).find((c) => c.callSid === id.callSid && c.from === id.from && c.shopId === id.shopId) || null;
+}
+async function persist(entry, insert = true) {
   const list = (store.db.voiceConsents ||= []);
-  list.unshift(entry);
+  if (insert) list.unshift(entry);
   if (list.length > MAX_RECORDS) list.length = MAX_RECORDS;
   store.save();
   try { if (typeof store.flush === 'function') await Promise.race([store.flush(), new Promise((r) => setTimeout(r, 5000).unref())]); } catch {}
   return entry;
+}
+// Save the script before returning the initial Gather. An unanswered repeated webhook reuses the same offer.
+async function offer({ callSid, from }) {
+  const prior = latest(callSid, from);
+  if (prior) return prior;
+  const entry = { at: new Date().toISOString(), ...identity(callSid, from), digits: null, consented: false,
+    attempt: 1, state: 'pending', ...prompts() };
+  // Legacy callbacks without a usable identity can still press 1, but cannot get a persisted retry allowance.
+  return entry.callSid && entry.from ? persist(entry) : entry;
+}
+async function record({ callSid, from, digits, attempt = '1' }) {
+  // The unmarked original action remains attempt 1. Reject unknown/ambiguous markers without consuming an answer.
+  if (attempt !== '1' && attempt !== '2') return { invalid: true };
+  const d = String(digits ?? '');
+  const prior = latest(callSid, from);
+  const pending = prior?.state === 'pending' && prior.attempt === 1;
+  const replay = prior?.state === 'retry' && prior.attempt === 1;
+  // Older answer-only records are terminal too. Keep their evidence intact; repeats never append or reopen.
+  if (prior && !pending && !replay) return { ...prior, duplicate: true };
+  if (attempt === '2' && !replay) return { invalid: true };
+  // A redelivered first silence reissues the same replay, without spending attempt 2 or renewing its timer.
+  // A different late answer to attempt 1 cannot replace the silence that has already been recorded.
+  if (replay && attempt === '1') return d === '' ? { ...prior, duplicate: true } : { invalid: true };
+  const entry = {
+    at: new Date().toISOString(), ...identity(callSid, from),
+    digits: d.slice(0, 80), consented: d === '1',
+    attempt: attempt === '2' ? 2 : 1,
+    state: d === '' && pending ? 'retry' : d === '1' ? 'accepted' : d ? 'declined' : 'no_input',
+    prompt: prior?.prompt || null,
+    ...(prior?.promptEs ? { promptEs: prior.promptEs } : {}),
+  };
+  // Claim the answer synchronously before the persistence await, so overlapping callbacks cannot both retry/text.
+  if (pending) { Object.assign(prior, entry, { promptedAt: prior.at }); return persist(prior, false); }
+  return persist(entry);
 }
 
 // Caller-facing keyword replies (src/server.js /twilio/sms).
@@ -85,5 +121,5 @@ const stopTextEs = (name = shopName()) => `${name}: Se canceló su suscripción 
 // Custom texts (HELP_MESSAGE, INACTIVE_MESSAGE) must still name the shop.
 const named = (msg, name = shopName()) => (String(msg).toLowerCase().includes(name.toLowerCase()) ? String(msg) : `${name}: ${msg}`);
 
-module.exports = { shopName, voicePrompt, spanishPrompt, promptTemplate, gatherTwiml, goodbyeTwiml, record, helpText, startText, stopText, stopTextEs, named, xml,
+module.exports = { shopName, voicePrompt, spanishPrompt, promptTemplate, gatherTwiml, goodbyeTwiml, offer, latest, record, helpText, startText, stopText, stopTextEs, named, xml,
   DEFAULT_PROMPT, SPANISH_PROMPT, SUPPORT_PHONE, SUPPORT_EMAIL, MAX_RECORDS };

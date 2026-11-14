@@ -27,6 +27,16 @@ Caller ──SMS──▶ POST /twilio/sms ──▶ agent.handleReply (name →
                                    └─ when complete ──▶ BUZZ SMS to OWNER_PHONE
 ```
 
+### Conversation loop and wrap-up
+
+- Calls: the existing press-1 consent script stays intact. Silence gets one replay, then a no-text goodbye. Replay answers are tied to persisted per-shop call state and signed attempt URLs; duplicate webhooks cannot consume another attempt or send another text. Other keys decline immediately.
+- SMS: retain a supplied job or explicitly named service while clarifying a missing name once. `skip` continues unnamed; never use a greeting or service as the name. Numbered services are accepted only after intake reaches the service step.
+- Recover once from unclear service/day/time choices, then offer a callback. `callback`/`human` works from any active step; repeated requests at the callback-window step finish without inventing a time.
+- Callback wrap-up includes the shop, request and preferred window, and says this is not a confirmed appointment. Booking holds, payments and confirmations retain their existing separate paths.
+- Repeat calls resume the active question. Short acknowledgements within 24 hours of completion stay in that thread without another owner completion buzz; `new request` opens a fresh intake.
+- State-critical messages are deterministic, so a model cannot replace a retained name or change the question. The reusable phrasing prompt is documented in [Conversation flow and prompt](docs/CONVERSATION_FLOW.md).
+- Offline harness: `node --test tests/conversation-flow.test.js tests/a2p-compliance.test.js tests/voice.test.js tests/trades.test.js`. It uses isolated temporary storage and log-only providers; no real calls, SMS or payments.
+
 ### Optional booking + deposit
 With `BOOKING_ENABLED=1`, after the *need* step the caller gets the 3 next open slots (from `BUSINESS_HOURS`, `BUSINESS_DAYS`, `SLOT_MINUTES`, `BUSINESS_TZ`) and replies `1`/`2`/`3`, or `callback` to fall back to the classic callback-window flow.
 - **No deposit** (`DEPOSIT_ENABLED` off): the slot is booked at once, the caller gets a confirmation, and the owner gets `BOOKED (no deposit)`.
@@ -43,7 +53,7 @@ With `BOOKING_ENABLED=1`, after the *need* step the caller gets the 3 next open 
 - **Refunds:** the shop refunds a deposit in its own Stripe Dashboard. Admin Refund / Release on a direct-model row does not move money. No-show YES/NO is a reputation flag. A reply is NO only when it is exactly `NO` or `NOSHOW` (`No problem` is not a no-show).
 - Files: `src/booking.js` (slots, holds, Stripe/mock links, direct-charge params, fail-closed skip, lead fees, mark-paid), `src/connect.js` (connected account state, onboarding, status, fee cap).
 - Bookings live in `data/db.json` → `bookings`. A slot that is `held` (and not expired) or `confirmed` is never offered or booked again, and the hold is re-checked at pick time. Expired holds release the slot. A payment that arrives after expiry, when someone else has taken the slot, is flagged `paid_conflict` and the owner is told to reschedule or refund.
-Files: `src/server.js` (routes), `src/billing.js` (shop subscription billing), `src/agent.js` (conversation; OpenAI if `OPENAI_API_KEY`, else plumber/HVAC templates), `src/sms.js` (Twilio or log-only), `src/store.js`, `public/index.html` (landing page and waitlist).
+Files: `src/server.js` (routes), `src/billing.js` (shop subscription billing), `src/agent.js` (deterministic trade-aware intake and wrap-up; an optional OpenAI phrasing helper remains available but is not called for intake turns), `src/sms.js` (Twilio or log-only), `src/store.js`, `public/index.html` (landing page and waitlist).
 
 ### Business types (`BUSINESS_TYPE`, see `src/trades.js`)
 Each trade maps to one of two flows plus its own wording and defaults (services, days, hours, deposit, window length, urgent words):
@@ -57,7 +67,7 @@ The /setup form writes `BUSINESS_TYPE`/`BUSINESS_FLOW`/`BUSINESS_TRADE_LABEL` in
 - `braiders`: warm stylist wording in first person, no urgent/emergency language. Flow: *name → style from the `SERVICES` menu (plus optional size/length notes) → preferred day → 3 start times → hold + deposit*. Each caller can also reply `call` for a callback instead.
   - `SERVICES="Knotless braids:360,Box braids:300,Locs retwist:120,Twists:180"` (name:minutes). Start times are spaced `SLOT_STEP_MINUTES` apart (default 60). The whole appointment must fit inside `BUSINESS_HOURS`, and a time is never offered if it overlaps a held or confirmed booking.
   - Defaults when the var is unset: `BUSINESS_HOURS=09:00-19:00`, `BUSINESS_DAYS=1,2,3,4,5,6` (Mon-Sat), `DEPOSIT_AMOUNT=50` (credited toward the service), `LEAD_FEE=5`. Explicit values always override, so remove the home-services values from `.env` when you switch.
-  - Preferred day understands `today`, `tomorrow`, weekday names, `10/24`, `Oct 24`. Anything else (like `soonest`) means the earliest opening. If that day is full, the caller gets the closest openings after it.
+  - Preferred day understands `today`, `tomorrow`, weekday names, `10/24`, `Oct 24`. Explicit `soonest`/`any` requests mean the earliest opening. Unknown or invalid days get a clarification, then a callback alternative rather than silently choosing a date. If that day is full, the caller gets the closest openings after it.
   - `BOOKING_LINK` (optional): the stylist's own Booksy/StyleSeat/GlossGenius link, added to the time-offer and callback texts.
   - Owner texts: `BUZZ …: time held, deposit pending …`, then `BOOKED + PAID: <name>, <service>, <time>, $50 deposit. Notes: <size/length>. tel:…`.
   - Demo: `bash scripts/demo_braiders.sh`. If nothing is listening on `PORT` (default 3000), it starts a temporary braider server with Twilio/Stripe blanked, runs a booking + mock deposit and a callback, prints the SMS log, and stops the server. Only run one server against `data/` at a time.
