@@ -56,6 +56,36 @@ ${held ? `<form method="post" action="/pay/mock/${esc(encodeURIComponent(booking
 </section>`);
 }
 
+// Short booking link texted to the customer. Buttons replace long raw URLs; it never shows the customer's name or phone.
+const directionsUrl = (address) => `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(address)}`;
+const safeHttps = (url) => typeof url === 'string' && /^https?:\/\/[^\s"'<>]+$/i.test(url) ? url : '';
+function bookingLink({ booking, businessName, address = '', mode = 'live' }) {
+  const paid = !!booking.paid;
+  const held = !paid && booking.status === 'held' && Date.parse(booking.holdExpiresAt) > Date.now();
+  const confirmed = booking.status === 'confirmed';
+  const payUrl = held ? safeHttps(booking.payUrl) : '';
+  const amount = Number.isInteger(Number(booking.amount)) ? `$${Number(booking.amount)}` : money(booking.amount);
+  const title = payUrl ? `Pay ${amount} deposit` : confirmed ? "You're booked" : held ? 'Your time is held' : 'Booking details';
+  const description = payUrl ? 'Your time is held for a short while. Pay the deposit to lock it in; it goes toward your service.'
+    : confirmed ? 'See you then. Contact the business if anything changes.'
+      : held ? 'The business will send a payment link shortly.'
+        : 'This hold is no longer active. Contact the business to arrange a time.';
+  const when = [booking.service, booking.slotLabel].filter(Boolean).join(' · ');
+  const place = String(address || '').trim();
+  const buttons = [
+    payUrl ? `<a class="button button-primary button-full" href="${esc(payUrl)}" rel="noopener noreferrer">${icon('card')}<span>Pay ${esc(amount)} deposit</span></a>` : '',
+    place ? `<a class="button button-outline button-full" href="${esc(directionsUrl(place))}" target="_blank" rel="noopener noreferrer">${icon('external')}<span>Get directions</span></a>` : '',
+  ].filter(Boolean).join('');
+  return page({ title, businessName, area: 'payment', mode, script: true,
+    meta: { referrer: 'no-referrer', title: `${title} · ${businessName || 'BuzzCall'}`, description: when || description },
+    body: `<section class="payment-card"><span class="result-icon">${icon(payUrl || held ? 'calendar' : confirmed ? 'check' : 'alert')}</span>
+${heading(businessName, title, description)}
+<div class="payment-summary">${booking.amount && !confirmed ? `<p class="payment-kicker">Deposit</p><p class="payment-amount">${esc(amount)}</p>` : ''}
+<dl class="detail-list">${booking.service ? `<dt>Service</dt><dd>${esc(booking.service)}</dd>` : ''}<dt>Time</dt><dd>${esc(booking.slotLabel || 'Not recorded')}</dd>${place ? `<dt>Address</dt><dd>${esc(place)}</dd>` : ''}</dl></div>
+${buttons}${payUrl ? '<p class="muted">Secure checkout. The deposit is paid to the business.</p>' : ''}
+</section>` });
+}
+
 function connectOnboarding({ connect, businessName }) {
   return paymentPage('Deposit account simulation', businessName,
     `<section class="payment-card"><span class="result-icon">${icon('shield')}</span>${heading(businessName, 'Deposit account simulation', 'Preview the account onboarding flow without connecting a real Stripe account.')}
@@ -89,4 +119,4 @@ ${success ? `<div class="notice"><strong>Confirmation comes separately.</strong>
 <a class="button button-outline" href="/">Back to BuzzCall</a></section>`, mode);
 }
 
-module.exports = { checkout, deposit, connectOnboarding, phoneConfirmation, returnPage };
+module.exports = { checkout, deposit, bookingLink, connectOnboarding, phoneConfirmation, returnPage };

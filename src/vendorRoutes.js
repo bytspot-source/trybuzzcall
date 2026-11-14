@@ -18,7 +18,7 @@ const root = vendors.root;
 const json = req => req.is('application/json') || /application\/json/i.test(req.get('accept') || '');
 const bool = value => /^(1|true|yes|on)$/i.test(String(value || ''));
 const plan = value => ['monthly','annual'].includes(value) ? value : null;
-const editable = ['BUSINESS_NAME','BUSINESS_TYPE','BUSINESS_TRADE_LABEL','BUSINESS_FLOW','BUSINESS_CITY','BUSINESS_TZ','BUSINESS_DAYS','BUSINESS_HOURS','SERVICES','BOOKING_ENABLED',
+const editable = ['BUSINESS_NAME','BUSINESS_TYPE','BUSINESS_TRADE_LABEL','BUSINESS_FLOW','BUSINESS_CITY','BUSINESS_ADDRESS','BUSINESS_TZ','BUSINESS_DAYS','BUSINESS_HOURS','SERVICES','BOOKING_ENABLED',
   'DEPOSIT_ENABLED','DEPOSIT_AMOUNT','SLOT_MINUTES','HOLD_MINUTES','BOOKING_LEAD_MINUTES','BOOKING_LINK'];
 const SERVICE_RE = /^.{1,100}:\d+$/;
 const validServices = value => !value.split(',').some(s => !SERVICE_RE.test(s.trim()) || +s.split(':').at(-1) < 15 || +s.split(':').at(-1) > 720);
@@ -60,6 +60,7 @@ function validateSettings(body) {
     if (!['string','number'].includes(typeof body[key])) throw vendors.error('Invalid setting value.');
     const value = String(body[key]).trim();
     if (value.length > (key === 'SERVICES' ? 2000 : 300)) throw vendors.error('A setting is too long.');
+    if (key === 'BUSINESS_ADDRESS' && (value.length > 200 || /[\u0000-\u001F\u007F<>]/.test(value))) throw vendors.error('Enter a street address of at most 200 characters, or leave it blank.');
     values[key] = value;
   }
   if (!values.BUSINESS_NAME || values.BUSINESS_NAME.length > 80) throw vendors.error('Enter a business name of at most 80 characters.');

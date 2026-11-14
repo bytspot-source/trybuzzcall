@@ -302,7 +302,11 @@ test('text flow, connected + charges enabled: deposit link is a platform Checkou
   assert.deepEqual(f.calls.sessions[0].o, { stripeAccount: 'acct_ready' });
   assert.equal(b.connectAccount, 'acct_ready');
   const lead = store.db.leads.find((l) => l.phone === '+14703330002');
-  assert.match(lead.messages.at(-1).body, /checkout\.stripe\.com/);
+  const text = lead.messages.at(-1).body;
+  assert.ok(text.endsWith(`confirms it: https://shop.example/b/${b.id}`), 'Customer gets a short link, not the raw checkout URL');
+  assert.doesNotMatch(text, /checkout\.stripe\.com/);
+  const page = await (await req(`/b/${b.id}`)).text();
+  assert.ok(page.includes(`href="${b.payUrl.replace(/&/g, '&amp;')}"`), 'The Pay button opens the Stripe checkout');
 });
 
 test('text flow, mock mode: deposit GET is read-only; same-origin POST marks paid and redirects', async (t) => {

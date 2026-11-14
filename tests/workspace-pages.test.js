@@ -204,7 +204,7 @@ test('private invitation shows an escaped one-use code in text only and never cl
 });
 
 test('vendor settings posts only allowed settings and leaves phone routing read-only', () => {
-  const values = { BUSINESS_NAME: 'Updated business', BUSINESS_CITY: 'Atlanta, GA', BUSINESS_TZ: 'America/New_York',
+  const values = { BUSINESS_NAME: 'Updated business', BUSINESS_CITY: 'Atlanta, GA', BUSINESS_ADDRESS: '12 Peach St, Atlanta, GA', BUSINESS_TZ: 'America/New_York',
     BUSINESS_DAYS: '1,2,3,4,5', BUSINESS_HOURS: '09:00-17:00', SERVICES: 'Visit:60', BOOKING_ENABLED: '1', DEPOSIT_ENABLED: '0',
     DEPOSIT_AMOUNT: '25', SLOT_MINUTES: '60', HOLD_MINUTES: '15', BOOKING_LEAD_MINUTES: '30', BOOKING_LINK: 'https://booking.example.test',
     OWNER_PHONE: '+14045550102', FORWARD_TO_PHONE: '+14045550103', STRIPE_SECRET_KEY: 'INTERNAL_MARKER', PRICE_MONTHLY: 'INTERNAL_MARKER' };

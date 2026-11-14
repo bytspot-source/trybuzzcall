@@ -119,6 +119,7 @@ const settingsFields = [
   ['BUSINESS_TYPE', 'Business type', 'trade'],
   ['BUSINESS_TRADE_LABEL', 'Kind of business (only for Other)', 'text', 'For example "dog walker". Leave blank for listed types.'],
   ['BUSINESS_CITY', 'City and state', 'text', 'Include your state.'],
+  ['BUSINESS_ADDRESS', 'Address for directions (optional)', 'text', 'Shown as a "Get directions" button on booking pages. Leave blank if you travel to customers.'],
   ['BUSINESS_TZ', 'Time zone', 'text', 'Use an IANA time zone, such as America/New_York.'],
   ['BUSINESS_DAYS', 'Open days', 'text', 'Comma-separated day numbers: 0 is Sunday, 6 is Saturday.'],
   ['BUSINESS_HOURS', 'Business hours', 'text', '24-hour opening and closing times, for example 09:00-17:00.'],
