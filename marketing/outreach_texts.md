@@ -5,9 +5,9 @@
 > **Positioning (updated):** Text-back alone is a commodity. We sell **booked, paid jobs, not texts.** Lead line: *"$49 deposit in your account before you're off the ladder."* Every message should land on one of these:
 > 1. **Booked + paid:** the caller picks a slot and pays a $49 deposit (credited to their bill). The owner gets a "BOOKED + PAID" alert, plus a **weekly recap** of calls caught, jobs booked, and deposits collected.
 > 2. **Done for you, no software switch:** keep your current number, everything runs over plain text, no app, no dashboard. We do the setup *and* the carrier texting registration (A2P 10DLC).
-> 3. **Local, in person:** a real Georgia person to call, plus ready-made emergency scripts for AC out in a heat wave and frozen/burst pipes in a freeze.
+> 3. **A real person:** a real person to call (in person around Atlanta, by phone anywhere in the US), plus ready-made emergency scripts for AC out in a heat wave and frozen/burst pipes in a freeze.
 >
-> **Who to target (internal only):** Georgia plumbing + HVAC shops with **1–5 trucks** that run on phone, paper, or a calendar, not a field-service software platform. Ask "How do you schedule jobs right now?" If they're already on a full field-service platform, they likely aren't a fit. **Never name competitors to prospects.**
+> **Who to target (internal only):** plumbing + HVAC shops in any US state with **1–5 trucks** that run on phone, paper, or a calendar, not a field-service software platform. Ask "How do you schedule jobs right now?" If they're already on a full field-service platform, they likely aren't a fit. **Never name competitors to prospects.**
 >
 > **Placeholders:** `{first}` owner first name · `{shop}` business name · `{city}` their town · `{you}` your name · `(470) 482-8377` · `hello@trybuzzcall.com` · `[booking link]` · `[refund policy]`.
 > **Proof placeholders** stay in brackets until we have real numbers. Do **not** fill with guesses: `[X calls caught]`, `[X jobs booked]`, `[$X deposits collected]`, `[X pilot shops]`, `[testimonial: name, shop, city]`.
@@ -22,11 +22,11 @@
 
 *Use it when you called the shop, nobody picked up, and they have a prior relationship with you or opted in. The text is the demo: it shows them exactly what their own customers would get.*
 
-> Hi {first}, it's {you} with TryBuzzCall here in Georgia. I just called {shop} and missed you. Imagine this text going to your missed callers, except it books the job and collects a $49 deposit before you're off the ladder. Same number, no app, I set it all up. Free 14-day pilot. Want to see it? Reply STOP to opt out.
+> Hi {first}, it's {you} with TryBuzzCall. I just called {shop} and missed you. Imagine this text going to your missed callers, except it books the job and collects a $49 deposit before you're off the ladder. Same number, no app, I set it all up. Free 14-day pilot. Want to see it? Reply STOP to opt out.
 
 **Shorter version (≤160 chars):**
 
-> {first}, {you} w/ TryBuzzCall GA. Missed you. Your missed callers could get a text that books the job + takes a $49 deposit. Free 14 days? Reply STOP to opt out
+> {first}, {you} w/ TryBuzzCall. Missed you. Your missed callers could get a text that books the job + takes a $49 deposit. Free 14 days? Reply STOP to opt out
 
 ---
 
@@ -53,7 +53,7 @@
 
 > Hi {first},
 >
-> I'm {you} with TryBuzzCall, a small Georgia company. I'll keep this short.
+> I'm {you} with TryBuzzCall, a small Atlanta-based company. I'll keep this short.
 >
 > When you're on a job, driving, or asleep, calls go to voicemail. Lots of folks won't leave one. They just call the next name on Google.
 >
@@ -65,7 +65,7 @@
 > 4. **You get a text:** "BOOKED + PAID $49" with name, job, time, and tap-to-call. Urgent jobs are flagged. Callers can choose "call me back" instead.
 > 5. **Weekly recap:** calls caught, jobs booked, and deposits collected.
 >
-> **No software switch.** Keep your current number. It all runs over text, no app. I do the setup and the carrier texting registration for you. And I'm local, so you've got a real person in Georgia to call.
+> **No software switch.** Keep your current number. It all runs over text, no app. I do the setup and the carrier texting registration for you. And you've got a real person to call.
 >
 > **Pricing (estimates):** a base plan starting at $49/mo, plus about $12 per paid lead, only when a caller books and pays their deposit. You only pay more when you get paid jobs. Setup starting at $99, waived if you go annual. The first 14 days are free so you can see what it books before paying anything.
 >
@@ -82,7 +82,7 @@
 ## 5. Phone / walk-in script (about 60 seconds)
 
 **Opener**
-> "Hey, is this {first}? I'm {you} with TryBuzzCall. We're local, here in Georgia. Got 30 seconds? I'll be quick."
+> "Hey, is this {first}? I'm {you} with TryBuzzCall. Got 30 seconds? I'll be quick."
 
 **Qualify**
 > "How many trucks are you running? And how do you schedule jobs right now? Phone and a calendar, or a software system?"
@@ -113,15 +113,15 @@
 
 *For local business, trades, or community groups. Check each group's self-promo rules first. Many only allow it on certain days.*
 
-> **Georgia plumbers & HVAC folks (1–5 trucks): question for y'all 👋**
+> **Plumbers & HVAC folks (1–5 trucks): question for y'all 👋**
 >
-> How many calls do you miss when you're under a house or up in an attic? I'm a Georgia founder building **BuzzCall** for exactly that. The goal: a **$49 deposit in your account before you're off the ladder.**
+> How many calls do you miss when you're under a house or up in an attic? I'm an Atlanta founder building **BuzzCall** for exactly that. The goal: a **$49 deposit in your account before you're off the ladder.**
 >
 > When you miss a call, it texts the caller back, gets their name + problem, offers your next 3 open slots, and takes a $49 deposit (credited to their bill). Then it texts you: **"BOOKED + PAID $49,"** with the job, the time, and tap-to-call. Urgent jobs get flagged, and you get a weekly recap of calls caught, jobs booked, and deposits collected.
 >
-> No software switch: same number, all by text, no app. I do the setup and carrier registration, in person if you want.
+> No software switch: same number, all by text, no app. I do the setup and carrier registration for you.
 >
-> Looking for a few local shops to try it **free for 14 days**. After that it starts at $49/mo, plus a small fee (est. $12) only per booked + paid lead. You only pay more when you get paid jobs.
+> Looking for a few shops to try it **free for 14 days**. After that it starts at $49/mo, plus a small fee (est. $12) only per booked + paid lead. You only pay more when you get paid jobs.
 >
 > Comment or DM me if you want in. Honest feedback welcome too, even if it's "nah, I'd never use that." 🙏
 >
@@ -187,13 +187,13 @@
 > Get it. It's a couple of friendly texts from your number, worded how you talk, and anyone can reply "callback" to get you instead. Want to see a sample? Reply STOP to opt out.
 
 ### "Texting setup sounds like a hassle."
-> "That's on me. Business texting needs carrier registration now (it's called A2P 10DLC), and I handle all of it. I'm local, so if anything's off, you call me, a real person in Georgia."
+> "That's on me. Business texting needs carrier registration now (it's called A2P 10DLC), and I handle all of it. If anything's off, you call me, a real person."
 
 ---
 
 ## Proof placeholders (fill only with real data later)
 - Pilot results: `[X missed calls caught]`, `[X jobs booked]`, `[$X in deposits collected]`
-- Social proof: `[X Georgia shops using BuzzCall]`
+- Social proof: `[X shops using BuzzCall]`
 - Testimonial: `["Quote" | Name, Shop, City]` (with written permission)
 
 ## Note on existing drafts

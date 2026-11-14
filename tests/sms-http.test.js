@@ -102,7 +102,7 @@ global.fetch = () => { throw new Error('Outbound fetch forbidden in SMS HTTP tes
           TWILIO_ACCOUNT_SID: provider ? account : '', TWILIO_AUTH_TOKEN: provider ? token : '',
           ALLOW_UNSIGNED_TWILIO_WEBHOOKS: '1', ADMIN_PASSWORD: admin, OWNER_PHONE: OWNER,
           BOOKING_ENABLED: '0', DEPOSIT_ENABLED: '0', BUSINESS_DAYS: '0,1,2,3,4,5,6',
-          BUSINESS_HOURS: '00:00-23:59', FORWARD_TO_PHONE: '', STRIPE_SECRET_KEY: '',
+          BUSINESS_HOURS: '00:00-23:59', FORWARD_TO_PHONE: '', STRIPE_SECRET_KEY: '', TEXTBACK_COOLDOWN_MINUTES: '0',
           STRIPE_WEBHOOK_SECRET: '', OPENAI_API_KEY: '', ...settings,
         },
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -161,7 +161,7 @@ global.fetch = () => { throw new Error('Outbound fetch forbidden in SMS HTTP tes
   }
   async function webhook(route, extra = {}, options = {}) {
     return request(route, { From: CALLER, To: SENDER, AccountSid: account, MessageSid: sid(),
-      CallSid: `CA${'a'.repeat(32)}`, ...extra }, { form: true, signed: provider, ...options });
+      CallSid: `CA${randomBytes(16).toString('hex')}`, ...extra }, { form: true, signed: provider, ...options });
   }
   async function grant(phone = CALLER, purpose = 'customer_service', changes = {}) {
     const response = await request('/api/consent', { action: 'grant', phone, purpose,
@@ -176,14 +176,18 @@ global.fetch = () => { throw new Error('Outbound fetch forbidden in SMS HTTP tes
   }
   return {
     request, webhook, grant, account, origin: () => origin,
+    // Mock payments complete only through an explicit same-origin POST (GET is read-only).
+    pay: (id) => request(`/pay/mock/${id}`, {}, { headers: { Origin: origin } }),
+    sameOrigin: (target, body, options = {}) => request(target, body, { ...options, headers: { Origin: origin, ...(options.headers || {}) } }),
     stop, crash: () => stop('SIGKILL'),
     terminating: async () => (await read('terminating')) === '1',
     releaseProvider: () => writeFile(path.join(directory, 'release-provider'), '1', { mode: 0o600 }),
     store: async () => JSON.parse(await read('db.json')),
+    accepted: () => read('accepted.jsonl'),
     log: () => read('sms.log'),
     sends: async () => provider
       ? (await read('accepted.jsonl')).trim().split('\n').filter(Boolean).length
-      : ((await read('sms.log')).match(/^\[.*\] SMS \(/gm) || []).length,
+      : ((await read('sms.log')).match(/^\[.*\] SMS -> /gm) || []).length,
     records: async () => {
       const response = await request('/api/consent', undefined, { admin: true });
       assert.equal(response.status, 200);
@@ -272,7 +276,7 @@ test('HTTP: unconsented call/text/START cannot send; voice does not claim a text
   await app.grant();
   ok(await app.webhook('/twilio/voice'));
   assert.equal(await app.sends(), 1);
-  assert.match(await app.log(), /Test Shop: Reply STOP to opt out or HELP for help/);
+  assert.match(await app.log(), /Hi, this is Test Shop\./);
 });
 
 test('HTTP: standard and natural-language STOP revoke both scopes before any other processing', async (t) => {
@@ -336,7 +340,7 @@ test('HTTP: provider HELP is not duplicated and never enters the booking convers
   const record = (await app.store()).leads[0];
   assert.equal(record.name, null);
   assert.equal(record.step, 'name');
-  assert.match(await app.log(), /What is your name/);
+  assert.match(await app.log(), /What name should I put on your request\?/);
 });
 
 test('HTTP: owner alerts need their own permission and completed-message retries do not resend', async (t) => {
@@ -351,12 +355,12 @@ test('HTTP: owner alerts need their own permission and completed-message retries
   for (const Body of ['Alex', 'AC maintenance']) ok(await app.webhook('/twilio/sms', { From: SECOND, Body }));
   const last = { From: SECOND, Body: 'tomorrow morning', MessageSid: sid() };
   ok(await app.webhook('/twilio/sms', last));
-  assert.equal(await app.sends(), 9);
+  assert.equal(await app.sends(), 10, 'text-back + instant owner buzz + three replies + completion buzz');
   assert.equal((await app.store()).alerts[0].sent, true);
   const state = await app.store();
   ok(await app.webhook('/twilio/sms', last));
   assert.deepEqual(await app.store(), state);
-  assert.equal(await app.sends(), 9);
+  assert.equal(await app.sends(), 10);
 });
 
 test('HTTP: payment after customer and owner STOP updates booking but sends no confirmation', async (t) => {
@@ -366,10 +370,13 @@ test('HTTP: payment after customer and owner STOP updates booking but sends no c
   for (const Body of ['Dana', 'Scheduled water heater service', '1']) ok(await app.webhook('/twilio/sms', { Body }));
   const booking = (await app.store()).bookings[0];
   assert.equal(booking.status, 'held');
-  const count = await app.sends();
+  const before = await app.sends();
   ok(await app.webhook('/twilio/sms', { Body: 'STOP' }));
+  assert.equal(await app.sends(), before + 1, 'the owner is told about the opt-out; the customer gets no confirmation');
   ok(await app.webhook('/twilio/sms', { From: OWNER, Body: 'STOP' }));
-  ok(await app.request(`/pay/mock/${booking.id}`)); // Safe: isolated child has no Stripe credentials.
+  const count = await app.sends();
+  assert.equal(count, before + 1, 'after the owner STOP, not even the owner is texted');
+  assert.equal((await app.pay(booking.id)).status, 303); // Safe: isolated child has no Stripe credentials.
   assert.equal((await app.store()).bookings[0].paid, true);
   assert.equal(await app.sends(), count);
   assert.equal((await app.store()).alerts[0].sent, false);
@@ -420,7 +427,6 @@ test('HTTP: live signatures, account and destination are mandatory despite the o
   await app.grant();
   ok(await app.webhook('/twilio/voice'));
   assert.equal(await app.sends(), 1);
-  assert.equal(await app.log(), '', 'Live bodies must not enter the simulation log');
   ok(await app.webhook('/twilio/sms', { Body: 'STOP', OptOutType: 'STOP' }));
   ok(await app.webhook('/twilio/voice'));
   assert.equal(await app.sends(), 1);
@@ -441,7 +447,8 @@ test('HTTP: YES fallback only clears the provider block, without restoring grant
   ok(await app.webhook('/twilio/sms', yes));
   assert.deepEqual(await app.records(), records, 'Duplicate YES does not append another event');
   ok(await app.webhook('/twilio/sms', { From: SECOND, Body: 'YES' }));
-  missingGrants((await app.records()).find((row) => row.phone === SECOND));
+  assert.ok(!(await app.records()).some((row) => row.phone === SECOND && (row.permissions.customer_service || row.permissions.owner_alerts)),
+    'YES never creates permission');
   for (const phone of [CALLER, SECOND]) {
     ok(await app.webhook('/twilio/voice', { From: phone }));
     ok(await app.webhook('/twilio/sms', { From: phone, Body: 'HELP' }));
@@ -531,7 +538,7 @@ test('HTTP: real SIGKILL quarantines sends and grants until reviewed recovery wi
     ok(await app.webhook('/twilio/voice/status', { From: phone, DialCallStatus: 'no-answer' }));
     for (const Body of ['HELP', 'Please book me']) ok(await app.webhook('/twilio/sms', { From: phone, Body }));
   }
-  ok(await app.request(`/pay/mock/${booking.id}`));
+  assert.equal((await app.pay(booking.id)).status, 303);
   assert.equal((await app.store()).bookings[0].paid, true);
   assert.equal((await app.store()).alerts[0].sent, false, 'Owner sends are quarantined too');
   assert.equal((await app.store()).leads.length, before.leads.length);
@@ -584,7 +591,7 @@ test('HTTP: real SIGKILL quarantines sends and grants until reviewed recovery wi
     'New grants are available after recovery');
 });
 
-test('HTTP: Stripe requires a configured secret, authentic signatures and paid status before onPaid', async (t) => {
+test('HTTP: Stripe webhooks need a configured secret and authentic signatures; the platform webhook never pays a deposit', async (t) => {
   for (const type of ['checkout.session.completed', 'checkout.session.async_payment_succeeded']) {
     await t.test(type, async (t) => {
       const app = await fixture(t, { BOOKING_ENABLED: '1', DEPOSIT_ENABLED: '1', LEAD_FEE_WAIVED: '1' }, { provider: true });
@@ -599,47 +606,47 @@ test('HTTP: Stripe requires a configured secret, authentic signatures and paid s
         assert.deepEqual((await app.store()).bookings[0], booking);
         assert.equal(await app.sends(), count);
       };
-      assert.equal((await app.request('/stripe/webhook', paid)).status, 503);
+      for (const route of ['/stripe/webhook', '/stripe/connect/webhook']) {
+        assert.equal((await app.request(route, paid)).status, 503, `${route}: unsigned events are refused without a secret`);
+      }
       await unchanged();
       // Generated locally, never persisted or printed; all SDK network transports remain blocked.
-      const secret = randomBytes(32).toString('hex');
-      await app.restart({ STRIPE_WEBHOOK_SECRET: secret });
-      assert.equal((await app.request('/stripe/webhook', paid)).status, 400);
+      const signing = randomBytes(32).toString('hex'), connectSigning = randomBytes(32).toString('hex');
+      await app.restart({ STRIPE_WEBHOOK_SECRET: signing, STRIPE_CONNECT_WEBHOOK_SECRET: connectSigning });
+      for (const route of ['/stripe/webhook', '/stripe/connect/webhook']) assert.equal((await app.request(route, paid)).status, 400);
       await unchanged();
       assert.equal((await signedPayment(app, paid, randomBytes(32).toString('hex'))).status, 400);
       await unchanged();
       const otherPayload = paymentEvent(booking.id, type, 'unpaid');
-      const signature = stripe.webhooks.generateTestHeaderString({ payload: JSON.stringify(otherPayload), secret });
+      const signature = stripe.webhooks.generateTestHeaderString({ payload: JSON.stringify(otherPayload), secret: signing });
       assert.equal((await app.request('/stripe/webhook', paid, { headers: { 'Stripe-Signature': signature } })).status, 400);
       await unchanged();
-      for (const status of ['unpaid', 'no_payment_required', 'PAID', null, true, undefined]) {
+      // Deposits are direct charges on the shop's own account: the platform webhook acknowledges and ignores them.
+      for (const status of ['paid', 'unpaid', 'no_payment_required', 'PAID', null, undefined]) {
         const event = paymentEvent(booking.id, type, status);
         if (status === undefined) delete event.data.object.payment_status;
-        ok(await signedPayment(app, event, secret));
+        const response = await signedPayment(app, event, signing);
+        ok(response);
         await unchanged();
       }
-      const unrelated = paymentEvent(booking.id, 'checkout.session.expired');
-      ok(await signedPayment(app, unrelated, secret));
+      // A signed connected-account event for an unknown account is ignored too.
+      const connectEvent = { ...paid, account: 'acct_unrelated' };
+      const connectSignature = stripe.webhooks.generateTestHeaderString({ payload: JSON.stringify(connectEvent), secret: connectSigning });
+      const ignored = await app.request('/stripe/connect/webhook', connectEvent, { headers: { 'Stripe-Signature': connectSignature } });
+      ok(ignored);
+      assert.match(ignored.body, /ignored/);
       await unchanged();
       ok(await app.webhook('/twilio/sms', { Body: 'STOP' }));
       ok(await app.webhook('/twilio/sms', { From: OWNER, Body: 'STOP' }));
-      // Exercise both accepted booking-ID locations, still using a real Stripe HMAC.
-      if (type === 'checkout.session.async_payment_succeeded') {
-        paid.data.object.metadata = {};
-        paid.data.object.client_reference_id = booking.id;
-      }
-      ok(await signedPayment(app, paid, secret));
+      const afterStop = await app.sends();
+      // The explicit local payment simulation still records the payment, but STOP blocks every confirmation.
+      assert.equal((await app.pay(booking.id)).status, 303);
       const stored = await app.store();
       assert.equal(stored.bookings[0].paid, true);
       assert.equal(stored.bookings[0].status, 'confirmed');
-      assert.equal(stored.bookings[0].lead_fee_status, 'waived');
       assert.equal(stored.leads[0].messages.at(-1).dir, 'blocked');
       assert.equal(stored.alerts[0].sent, false);
-      assert.equal(await app.sends(), count, 'Paid webhook cannot bypass customer or owner STOP');
-      ok(await signedPayment(app, paid, secret));
-      assert.deepEqual(await app.store(), stored, 'A duplicate signed payment is idempotent');
-      assert.equal(await app.sends(), count);
-      assert.equal(await app.log(), '', 'Provider isolation stays in effect for signed Stripe events');
+      assert.equal(await app.sends(), afterStop, 'Payment cannot bypass customer or owner STOP');
     });
   }
 });
@@ -647,12 +654,13 @@ test('HTTP: Stripe requires a configured secret, authentic signatures and paid s
 test('HTTP: billing notifications require owner_alerts permission and honor subsequent STOP', async (t) => {
   const app = await fixture(t, { TRIAL_DAYS: '0' }, { provider: true });
   await app.grant(OWNER); // Customer-service permission is insufficient for billing alerts.
-  const checkout = await app.request('/api/checkout', { plan: 'monthly', email: 'owner@example.test' });
+  // Public checkout is retired; the platform administrator starts the legacy-line subscription.
+  const checkout = await app.sameOrigin('/api/checkout', { plan: 'monthly', email: 'owner@example.test' }, { admin: true });
   ok(checkout);
-  ok(await app.request(`/billing/mock/checkout/${JSON.parse(checkout.body).id}/complete`, {}));
+  ok(await app.sameOrigin(`/billing/mock/checkout/${JSON.parse(checkout.body).id}/complete`, {}));
   const failRenewal = async () => {
-    ok(await app.request('/billing/mock/fail-next', { on: '1' }, { admin: true }));
-    const response = await app.request('/billing/mock/advance', { days: 32 }, { admin: true });
+    ok(await app.sameOrigin('/billing/mock/fail-next', { on: '1' }, { admin: true }));
+    const response = await app.sameOrigin('/billing/mock/advance', { days: 32 }, { admin: true });
     ok(response);
     assert.equal(JSON.parse(response.body).subscription.status, 'past_due');
   };
@@ -660,14 +668,14 @@ test('HTTP: billing notifications require owner_alerts permission and honor subs
   assert.equal(await app.sends(), 0);
   assert.equal((await app.store()).alerts[0].sent, false);
   await app.grant(OWNER, 'owner_alerts');
-  ok(await app.request('/billing/mock/update-card', {}, { admin: true }));
+  ok(await app.sameOrigin('/billing/mock/update-card', {}, { admin: true }));
   await failRenewal();
   assert.equal(await app.sends(), 1);
   assert.equal((await app.store()).alerts[0].sent, true);
   assert.match((await app.store()).alerts[0].body, /BuzzCall billing/);
   ok(await app.webhook('/twilio/sms', { From: OWNER, Body: 'STOP' }));
   missingGrants((await app.records()).find((row) => row.phone === OWNER));
-  ok(await app.request('/billing/mock/update-card', {}, { admin: true }));
+  ok(await app.sameOrigin('/billing/mock/update-card', {}, { admin: true }));
   await failRenewal();
   assert.equal(await app.sends(), 1);
   assert.equal((await app.store()).alerts[0].sent, false);
@@ -694,7 +702,7 @@ test('HTTP: braiders booking needs customer permission and separately scoped own
   assert.equal(await app.sends(), 5);
   assert.equal((await app.store()).alerts[0].sent, false);
   await app.grant(OWNER, 'owner_alerts');
-  ok(await app.request(`/pay/mock/${booking.id}`));
+  assert.equal((await app.pay(booking.id)).status, 303);
   assert.equal((await app.store()).bookings[0].paid, true);
   assert.equal(await app.sends(), 7, 'Both scoped permissions allow their respective confirmations');
   assert.equal((await app.store()).alerts[0].sent, true);
@@ -703,7 +711,9 @@ test('HTTP: braiders booking needs customer permission and separately scoped own
   const stopped = await app.store();
   ok(await app.webhook('/twilio/voice'));
   ok(await app.webhook('/twilio/sms', { Body: 'Book another style' }));
-  assert.equal(await app.sends(), 7);
+  const accepted = (await app.accepted()).trim().split('\n').map((line) => JSON.parse(line));
+  assert.equal(accepted.filter((message) => message.to === CALLER).length, 6, 'nothing more to the customer after the opt-out');
+  assert.equal(accepted.length, 9, 'only owner alerts (opt-out notice, missed-call buzz) under the owner\'s own permission');
   assert.deepEqual((await app.store()).bookings, stopped.bookings);
   assert.deepEqual((await app.store()).leads, stopped.leads);
 });

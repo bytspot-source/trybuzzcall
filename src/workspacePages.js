@@ -1,0 +1,166 @@
+'use strict';
+// Pure HTML renderers. Authentication, tenant selection, validation and writes belong to the routes.
+const { esc, page, badge, date, empty, icon, formatPhone, labelCells } = require('./ui');
+const trades = require('./trades');
+
+const adminShell = {
+  basePath: '/admin', caption: 'PLATFORM ADMIN', breadcrumb: 'Platform admin',
+  businessName: 'BuzzCall platform', identityCaption: 'Platform administrator',
+  nav: [['vendors', 'Vendors', 'overview', '/admin'], ['onboarding', 'Onboarding', 'checklist', '/admin/onboarding'], ['outcomes', 'Outcomes', 'checklist', '/admin/outcomes'], ['deposits', 'Deposits', 'card', '/admin/deposits'], ['legacy', 'Legacy workspace', 'database', '/admin/legacy']],
+  active: 'vendors', headerAction: { href: '/vendor/login', label: 'Vendor sign in', icon: 'external' },
+};
+const vendorShell = {
+  basePath: '/vendor', caption: 'VENDOR WORKSPACE', breadcrumb: 'Vendor workspace', identityCaption: 'Vendor owner',
+  nav: [['overview', 'Overview', 'overview', '/vendor'], ['leads', 'Leads', 'phone', '/vendor#leads'],
+    ['bookings', 'Bookings', 'calendar', '/vendor#bookings'], ['payments', 'Payments', 'card', '/vendor#payments'],
+    ['settings', 'Settings', 'settings', '/vendor/settings']],
+  active: 'settings', headerAction: { href: '/vendor', label: 'Your workspace' }, logout: { action: '/vendor/logout' },
+};
+function heading(kicker, title, description) {
+  return `<div class="page-heading"><div><p class="eyebrow">${esc(kicker)}</p><h1>${esc(title)}</h1><p class="page-description">${esc(description)}</p></div></div>`;
+}
+function panel(title, body) {
+  return `<section class="panel"><div class="panel-header"><h2>${esc(title)}</h2></div><div class="panel-body">${body}</div></section>`;
+}
+function count(value) {
+  const numeric = typeof value === 'number' || typeof value === 'string' && /^\d+$/.test(value);
+  return numeric && Number.isSafeInteger(Number(value)) && Number(value) >= 0 ? Number(value) : null;
+}
+function countText(value) { return count(value) ?? 'Not recorded'; }
+function metric(label, value, note) {
+  return `<article class="metric-card"><div class="metric-top">${esc(label)}</div><strong class="metric-value">${esc(value)}</strong><p>${esc(note)}</p></article>`;
+}
+function details(rows) {
+  return `<dl class="detail-list">${rows.map(([label, value]) => `<dt>${esc(label)}</dt><dd>${esc(value ?? 'Not recorded')}</dd>`).join('')}</dl>`;
+}
+function table(headers, rows, label) {
+  return `<div class="table-wrap" tabindex="0" role="region" aria-label="${esc(label)}"><table class="data-table data-table--stack"><thead><tr>${headers.map(h => `<th scope="col">${esc(h)}</th>`).join('')}</tr></thead><tbody>${labelCells(rows, headers)}</tbody></table></div>`;
+}
+// Do not serialize arbitrary registry records: hashes, provider credentials and internal fields never reach HTML.
+function publicShop(shop = {}) {
+  return Object.fromEntries(['id', 'name', 'email', 'status', 'phoneNumber', 'createdAt', 'subscriptionStatus', 'bookingCount', 'leadCount', 'payoutStatus', 'needsDepositApproval', 'stripeBusinessName', 'stripeBusinessUrl', 'stripeCountry', 'stripeNameMismatch', 'noshowCount', 'disputeCount'].map(key => [key, shop[key]]));
+}
+function vendorPath(id) { return `/admin/vendors/${encodeURIComponent(String(id ?? ''))}`; }
+function notices(error, message) {
+  const text = error && (typeof error === 'string' ? error : error.message || 'Please review the form and try again.');
+  return `${text ? `<div class="notice notice-error" id="form-error" role="alert">${esc(text)}</div>` : ''}${message ? `<div class="notice notice-good" role="status">${esc(message)}</div>` : ''}`;
+}
+function errorAttrs(error, name, hintId = '') {
+  const descriptions = [error ? 'form-error' : '', hintId].filter(Boolean).join(' ');
+  return `${descriptions ? ` aria-describedby="${esc(descriptions)}"` : ''}${error && error.field === name ? ' aria-invalid="true"' : ''}`;
+}
+function input(name, label, value = '', { type = 'text', required = false, readonly = false, hint = '', attrs = '', error } = {}) {
+  const id = `field-${name}`;
+  return `<label class="field" for="${esc(id)}">${esc(label)}<input id="${esc(id)}" name="${esc(name)}" type="${esc(type)}" value="${esc(value)}"${required ? ' required' : ''}${readonly ? ' readonly disabled' : ''}${errorAttrs(error, name, hint ? `${id}-hint` : '')}${attrs}>${hint ? `<small id="${esc(id)}-hint">${esc(hint)}</small>` : ''}</label>`;
+}
+// Business type picker from the shared trade catalog; it decides the texts callers get (braider, barber, plumber...).
+function tradeSelect(name, value = '', { required = true, id = `field-${name}` } = {}) {
+  const groups = trades.grouped().map(g => `<optgroup label="${esc(g.label)}">${g.trades.map(t => `<option value="${esc(t.key)}"${t.key === value ? ' selected' : ''}>${esc(t.key === 'other' ? 'Other (type it below)' : t.label)}</option>`).join('')}</optgroup>`).join('');
+  return `<label class="field" for="${esc(id)}">Business type<select id="${esc(id)}" name="${esc(name)}"${required ? ' required' : ''}><option value=""${value ? '' : ' selected'} disabled>Choose a business type</option>${groups}</select><small>This picks the questions BuzzCall texts to missed callers.</small></label>`;
+}
+function tradeLabel(key, custom) {
+  const t = key ? trades.get(key, { label: custom }) : null;
+  return t ? (t.key === 'other' ? `Other: ${custom || 'not named'}` : t.label) : 'Not set (uses home-services texts)';
+}
+function platform({ shops = [], setups = [], storage = {}, legacyName, legacyBilling, mode = 'live', alerts = [] } = {}) {
+  const roster = shops.map(publicShop);
+  const pending = setups.filter(setup => setup.status === 'pending');
+  const total = key => roster.every(shop => count(shop[key]) !== null) ? roster.reduce((sum, shop) => sum + count(shop[key]), 0) : 'Not available';
+  const cards = `<div class="metric-grid">${metric('Vendors', roster.length, 'Registered vendor records')}${metric('Active vendors', roster.filter(shop => shop.status === 'active').length, 'Status is active; not a delivery guarantee')}${metric('Bookings', total('bookingCount'), 'Recorded across the vendor roster')}${metric('Leads', total('leadCount'), 'Recorded across the vendor roster')}</div>`;
+  const rows = roster.map(shop => `<tr><td><a class="text-action" href="${esc(vendorPath(shop.id))}">${esc(shop.name || 'Unnamed vendor')} ${icon('arrow')}</a><small class="cell-detail">${esc(shop.id)}</small></td><td>${esc(shop.email || 'Not recorded')}</td><td>${badge(shop.status || 'Not recorded')}</td><td class="nowrap">${esc(shop.phoneNumber ? formatPhone(shop.phoneNumber) : 'Not assigned')}</td><td>${esc(date(shop.createdAt))}</td><td>${esc(shop.subscriptionStatus || 'Not recorded')}</td><td>${esc(countText(shop.bookingCount))}</td><td>${esc(countText(shop.leadCount))}</td><td>${esc(shop.payoutStatus || 'Not recorded')}<small class="cell-detail">No-shows ${esc(countText(shop.noshowCount))} · Disputes ${esc(countText(shop.disputeCount))}</small></td></tr>`).join('');
+  const vendors = `<section class="panel"><div class="panel-header"><h2>Vendor roster</h2><span class="count-label">${roster.length} vendors</span></div>${rows ? table(['Vendor', 'Owner email', 'Status', 'Assigned phone', 'Created', 'Subscription', 'Bookings', 'Leads', 'Payouts'], rows, 'Vendor roster') : empty('No vendors yet', 'Create a vendor or approve a pending setup. No sample businesses are shown.')}</section>`;
+  const requests = pending.length ? pending.map(setup => `<article class="workspace-request"><h3>${esc(setup.values?.businessName || 'Unnamed business')}</h3><p>${esc(setup.values?.email || 'Email not recorded')}</p>${badge(setup.status)}<details><summary>Review submitted business settings</summary>${details([['Owner alert phone',setup.values?.ownerPhone],['Forward calls to',setup.values?.forwardPhone],['City',setup.values?.city],['Trade',setup.values?.businessType],['Time zone',setup.values?.tz],['Open days',(setup.values?.days || []).join(', ')],['Hours',`${setup.values?.open || ''}–${setup.values?.close || ''}`],['Booking',setup.values?.booking ? 'On' : 'Off'],['Deposit',setup.values?.deposit ? setup.values.depositAmount : 'Off'],['Services',(setup.values?.services || []).map(s => `${s.name}: ${s.minutes} minutes`).join(', ')]])}</details><form method="post" action="/admin/vendors/approve"><input type="hidden" name="setupId" value="${esc(setup.id)}"><label class="checkbox-field"><input type="checkbox" name="confirm_setup" value="1" required><span>I have reviewed these settings and confirmed the owner's email.</span></label><button class="button button-primary" type="submit">Approve vendor setup</button></form></article>`).join('') : empty('No pending setups', 'Submitted setups awaiting approval will appear here.');
+  const depositQueue = roster.filter(shop => shop.needsDepositApproval);
+  const stripeLine = (shop) => `<dl class="detail-list"><dt>Stripe business name</dt><dd>${esc(shop.stripeBusinessName || 'Not on the account yet')}</dd><dt>Stripe URL</dt><dd>${esc(shop.stripeBusinessUrl || 'Not on the account yet')}</dd><dt>Stripe country</dt><dd>${esc(shop.stripeCountry || 'Not on the account yet')}</dd></dl>${shop.stripeNameMismatch ? '<p class="notice notice-warning">The Stripe business name does not match the shop name on BuzzCall.</p>' : ''}`;
+  const depositItems = depositQueue.length ? depositQueue.map(shop => `<article class="workspace-request"><h3>${esc(shop.name || 'Unnamed vendor')}</h3><p>Stripe account linked. Customer deposits stay off until you approve this shop.</p>${stripeLine(shop)}<form method="post" action="${esc(vendorPath(shop.id))}/connect/approve"><label class="checkbox-field"><input type="checkbox" name="confirm" value="1" required><span>I approve this shop's Stripe account for customer deposits.</span></label><button class="button button-primary" type="submit">Approve deposits</button></form></article>`).join('') : empty('No deposit accounts waiting', 'A shop appears here after it links a Stripe account and before an admin approves deposits.');
+  const connectNotes = (alerts || []).filter(a => a && a.kind === 'connect');
+  const health = storage.degraded ? 'Degraded' : storage.fallback ? 'Fallback storage' : storage.backend ? 'No storage failure reported' : 'Not reported';
+  const body = heading('Platform administration', 'Platform admin', 'Manage vendor access and assignments. Customer work stays inside each vendor workspace.') + cards + vendors +
+    `<div class="grid-two">${panel('Deposit account approvals', `<p>${depositQueue.length} Stripe account${depositQueue.length === 1 ? '' : 's'} waiting for admin approval before deposits go live.</p>${depositItems}`)}${panel('Pending setups', `<p>${pending.length} awaiting approval</p>${requests}`)}</div>` +
+    `<div class="grid-two">${panel('Create vendor', `<form method="post" action="/admin/vendors">${input('name', 'Business name', '', { required: true, attrs: ' maxlength="80"' })}${input('email', 'Owner email', '', { type: 'email', required: true, attrs: ' maxlength="254" autocomplete="email"' })}${tradeSelect('businessType')}${input('tradeName', 'Kind of business (only for Other)', '', { attrs: ' maxlength="60"', hint: 'For example "dog walker". Leave blank for listed types.' })}<label class="field" for="field-services">Services and durations<textarea id="field-services" name="services" maxlength="2000" aria-describedby="field-services-hint" placeholder="Knotless braids:360, Box braids:300"></textarea><small id="field-services-hint">One per line or comma-separated, as name:minutes. Leave blank to start with the usual services for this business type. Not used by home-service trades.</small></label><button class="button button-primary" type="submit">Create vendor</button></form>`)}</div>` +
+    panel('Platform service health', `${badge(health, storage.degraded || storage.fallback ? 'warning' : 'neutral')}${details([['Storage backend', storage.backend || 'Not reported'], ['Payment environment', mode]])}${storage.pathWarnings?.length ? `<p class="notice notice-warning"><b>path warning</b>: ${storage.pathWarnings.map(esc).join('; ')}</p>` : ''}<p class="muted">Platform storage status only. This does not verify vendor phone delivery or payout readiness.</p>`) +
+    panel('Connect alerts', connectNotes.length ? `<ul class="activity-list">${connectNotes.map(a => `<li><p>${esc(a.body)}</p><span>${esc(date(a.at))}</span></li>`).join('')}</ul><p class="muted">These stay in BuzzCall even when email is not configured.</p>` : '<p>No Stripe account alerts yet. Account changes and blocked onboarding refreshes are recorded here without email.</p>') +
+    panel('Legacy workspace', `<p>${esc(legacyName || 'Legacy business records')} are separate from the vendor roster and are not assigned to any vendor.</p>${legacyBilling?.subscription?.status ? `<p>Legacy subscription: ${esc(legacyBilling.subscription.status)}</p>` : ''}<a class="text-action" href="/admin/legacy">Open legacy workspace ${icon('arrow')}</a>`);
+  return page({ ...adminShell, title: 'Platform admin', body, mode, script: false });
+}
+function vendorDetail({ shop = {}, stats = {}, settings = {}, smsCaps = {}, capDefaults = {} } = {}) {
+  const vendor = publicShop(shop), path = vendorPath(vendor.id);
+  const body = heading('Platform administration · vendor record', vendor.name || 'Vendor details', 'Manage this vendor’s access and assigned phone. These controls are restricted to platform administrators.') +
+    panel('Vendor record', details([['Vendor ID', vendor.id], ['Owner email', vendor.email], ['Status', vendor.status], ['Assigned phone', vendor.phoneNumber || 'Not assigned'], ['Created', date(vendor.createdAt)],
+      ['Subscription', vendor.subscriptionStatus], ['Bookings', countText(stats.bookingCount ?? vendor.bookingCount)], ['Leads', countText(stats.leadCount ?? vendor.leadCount)], ['Payouts', vendor.payoutStatus],
+      ['Deposit approval', vendor.needsDepositApproval ? 'Waiting for admin' : 'Not waiting'],
+      ['No-shows', countText(vendor.noshowCount)], ['Card disputes', countText(vendor.disputeCount)],
+      ['Business type', tradeLabel(settings.BUSINESS_TYPE, settings.BUSINESS_TRADE_LABEL)], ['City', settings.BUSINESS_CITY], ['Time zone', settings.BUSINESS_TZ]])) +
+    `<div class="grid-two">${panel('Vendor access', `<form method="post" action="${esc(path)}/status"><label class="field" for="vendor-status">Access status<select id="vendor-status" name="status" required><option value="active"${vendor.status === 'active' ? ' selected' : ''}>Active</option><option value="suspended"${vendor.status === 'suspended' ? ' selected' : ''}>Suspended</option></select></label><button class="button button-primary" type="submit">Update access status</button></form>`)}${panel('Invitation or password reset', `<p>Generate a one-use activation code to share privately with the owner. This action revokes existing vendor sessions. No email is sent by this page.</p><form method="post" action="${esc(path)}/invite"><button class="button button-danger" type="submit">Create activation code and revoke existing sessions</button></form>`)}</div>` +
+    (vendor.needsDepositApproval ? panel('Deposit account approval', `<p>This shop linked a Stripe account. Customer deposit links stay off until you approve it. Later account changes and disconnects alert the admin separately.</p><dl class="detail-list"><dt>Stripe business name</dt><dd>${esc(vendor.stripeBusinessName || 'Not on the account yet')}</dd><dt>Stripe URL</dt><dd>${esc(vendor.stripeBusinessUrl || 'Not on the account yet')}</dd><dt>Stripe country</dt><dd>${esc(vendor.stripeCountry || 'Not on the account yet')}</dd></dl>${vendor.stripeNameMismatch ? '<p class="notice notice-warning">The Stripe business name does not match the shop name on BuzzCall.</p>' : ''}<form method="post" action="${esc(path)}/connect/approve"><label class="checkbox-field"><input type="checkbox" name="confirm" value="1" required><span>I approve this shop's Stripe account for customer deposits.</span></label><button class="button button-primary" type="submit">Approve deposits</button></form>`) : '') +
+    panel('Phone assignment', `<p>Phone routing changes require administrator review and confirmation. Server validation must also approve the assignment.</p><form method="post" action="${esc(path)}/phone">${input('phoneNumber', 'Assigned phone number', vendor.phoneNumber || '', { type: 'tel', hint: 'International format, including the + country code.' })}<label class="checkbox-field"><input type="checkbox" name="confirm_phones" value="1" required><span>I have reviewed and confirm this phone assignment.</span></label><button class="button button-primary" type="submit">Save phone assignment</button></form>`) +
+    panel('Texting volume limits', `<p>Automatic caller texts from this vendor's line stop for the rest of the window once a limit is reached; the platform-wide total still applies on top. Leave blank to use the platform default (${esc(capDefaults.hour ?? '')}/hour, ${esc(capDefaults.day ?? '')}/day). 0 turns this vendor's limit off.</p><form method="post" action="${esc(path)}/sms-caps">${input('hour', 'Texts per hour', smsCaps.hour ?? '', { type: 'number', attrs: ' min="0" max="10000" step="1"' })}${input('day', 'Texts per 24 hours', smsCaps.day ?? '', { type: 'number', attrs: ' min="0" max="100000" step="1"' })}<label class="checkbox-field"><input type="checkbox" name="confirm_caps" value="1" required><span>I approve this texting volume for this vendor.</span></label><button class="button button-primary" type="submit">Save texting limits</button></form>`) +
+    panel('Owner contact and call forwarding', `<p>These destinations belong only to this vendor. Confirm them with the owner before saving.</p><form method="post" action="${esc(path)}/contacts">${input('OWNER_PHONE','Owner alert phone',settings.OWNER_PHONE || '',{type:'tel',required:true})}${input('FORWARD_TO_PHONE','Forward calls to (optional)',settings.FORWARD_TO_PHONE || '',{type:'tel'})}<label class="checkbox-field"><input type="checkbox" name="confirm_phones" value="1" required><span>I have confirmed these destinations with this vendor.</span></label><button class="button button-primary" type="submit">Save contact routing</button></form>`);
+  return page({ ...adminShell, title: 'Vendor details', body, script: false });
+}
+function auth({ kind = 'login', error, message } = {}) {
+  const activate = kind === 'activate', title = activate ? 'Activate vendor access' : 'Vendor sign in';
+  const password = input('password', activate ? 'New password' : 'Password', '', { type: 'password', required: true, error,
+    attrs: ` minlength="16" maxlength="128" autocomplete="${activate ? 'new-password' : 'current-password'}"`, hint: 'Use 16–128 characters.' });
+  const fields = activate ? input('token', 'One-use activation code', '', { required: true, error, attrs: ' autocomplete="off" spellcheck="false"', hint: 'Paste the code shared privately by your platform administrator. Do not put it in a URL.' }) + password + input('passwordConfirm', 'Confirm new password', '', { type: 'password', required: true, error, attrs: ' minlength="16" maxlength="128" autocomplete="new-password"' })
+    : input('email', 'Owner email', '', { type: 'email', required: true, error, attrs: ' maxlength="254" autocomplete="username"' }) + password;
+  const body = `<div class="workspace-auth">${heading('Vendor access · not platform administration', title, activate ? 'Set a password for your own business workspace.' : 'Sign in to see only your business’s leads, bookings and payments.')}${notices(error, message)}${panel(title, `<form method="post" action="/vendor/${activate ? 'activate' : 'login'}"${error ? ' aria-describedby="form-error"' : ''}>${fields}<button class="button button-primary" type="submit">${activate ? 'Activate access' : 'Sign in'}</button></form><a class="text-action" href="/vendor/${activate ? 'login' : 'activate'}">${activate ? 'Already activated? Sign in' : 'Have an activation code?'}</a>`)}</div>`;
+  return page({ title, body, area: 'payment', script: false, headerAction: { href: '/admin', label: 'Platform admin · separate access', icon: 'shield' } });
+}
+function invitation({ shop = {}, token = '' } = {}) {
+  // Private admin response only: routes must prohibit caching/logging this response and its token.
+  const vendor = publicShop(shop);
+  const body = heading('Private · platform administrator only', 'Vendor activation code', 'Share this code privately with the intended owner. It is not an email delivery confirmation.') +
+    panel('One-use activation code', `<p>Business: <strong>${esc(vendor.name || 'Vendor')}</strong></p><p>Owner email: ${esc(vendor.email)}</p><p>This code expires in 24 hours and can be used only once. Treat it like a password; do not include it in logs, public messages, screenshots or URLs.</p><pre class="activation-code" aria-label="One-use activation code"><code>${esc(token)}</code></pre><ol><li>Send the code privately to the intended owner.</li><li>Ask them to open <a href="/vendor/activate">Vendor activation</a> and paste the code into the form.</li><li>They choose a new password to access their own workspace.</li></ol><a class="text-action" href="${esc(vendorPath(vendor.id))}">Back to vendor record ${icon('arrow')}</a>`);
+  return page({ ...adminShell, title: 'Private vendor invitation', body, script: false });
+}
+const settingsFields = [
+  ['BUSINESS_NAME', 'Business name', 'text', 'The name your customers know.'],
+  ['BUSINESS_TYPE', 'Business type', 'trade'],
+  ['BUSINESS_TRADE_LABEL', 'Kind of business (only for Other)', 'text', 'For example "dog walker". Leave blank for listed types.'],
+  ['BUSINESS_CITY', 'City and state', 'text', 'Include your state.'],
+  ['BUSINESS_TZ', 'Time zone', 'text', 'Use an IANA time zone, such as America/New_York.'],
+  ['BUSINESS_DAYS', 'Open days', 'text', 'Comma-separated day numbers: 0 is Sunday, 6 is Saturday.'],
+  ['BUSINESS_HOURS', 'Business hours', 'text', '24-hour opening and closing times, for example 09:00-17:00.'],
+  ['SERVICES', 'Services and durations', 'textarea', 'Comma-separated service:minutes entries. Do not include prices.'],
+  ['BOOKING_ENABLED', 'Offer appointment times', 'boolean'], ['DEPOSIT_ENABLED', 'Collect booking deposits', 'boolean'],
+  ['DEPOSIT_AMOUNT', 'Deposit amount (USD)', 'number'], ['SLOT_MINUTES', 'Appointment window (minutes)', 'number'],
+  ['HOLD_MINUTES', 'Unpaid hold duration (minutes)', 'number'], ['BOOKING_LEAD_MINUTES', 'Minimum booking notice (minutes)', 'number'],
+  ['BOOKING_LINK', 'External booking link', 'url', 'Use a full https:// address, or leave blank.'],
+];
+function settings({ shop = {}, values = {}, error, message } = {}) {
+  const vendor = publicShop(shop);
+  const fields = settingsFields.map(([name, label, type, hint]) => {
+    const value = values[name] ?? (name === 'BUSINESS_NAME' ? vendor.name || '' : '');
+    if (type === 'trade') return tradeSelect(name, String(value || ''));
+    if (type === 'boolean') {
+      const enabled = /^(1|true|on|yes)$/i.test(String(value));
+      return `<label class="field" for="field-${name}">${esc(label)}<select id="field-${name}" name="${name}"${errorAttrs(error, name)}><option value="0"${enabled ? '' : ' selected'}>Off</option><option value="1"${enabled ? ' selected' : ''}>On</option></select></label>`;
+    }
+    if (type === 'textarea') return `<label class="field" for="field-${name}">${esc(label)}<textarea id="field-${name}" name="${name}"${errorAttrs(error, name, 'services-hint')}>${esc(value)}</textarea><small id="services-hint">${esc(hint)}</small></label>`;
+    return input(name, label, value, { type, hint, error, required: name === 'BUSINESS_NAME', attrs: type === 'number' ? ` min="0" step="${name === 'DEPOSIT_AMOUNT' ? '0.01' : '1'}"` : '' });
+  }).join('');
+  const body = heading('Vendor workspace · your business only', 'Your settings', 'Update your business details and booking preferences. Phone routing is managed by a platform administrator.') + notices(error, message) +
+    panel('Business and booking settings', `<form method="post" action="/vendor/settings"${error ? ' aria-describedby="form-error"' : ''}><div class="workspace-form-grid">${fields}</div><button class="button button-primary" type="submit">Save your settings</button></form>`) +
+    panel('Phone routing · read only', `${details([['Assigned business line', vendor.phoneNumber || 'Not assigned']])}${input('OWNER_PHONE', 'Owner alert phone', values.OWNER_PHONE || '', { type: 'tel', readonly: true })}${input('FORWARD_TO_PHONE', 'Forward calls to', values.FORWARD_TO_PHONE || '', { type: 'tel', readonly: true })}<p class="muted">Contact your platform administrator to request phone changes. These fields cannot be changed here.</p>`);
+  return page({ ...vendorShell, title: 'Your settings', body, businessName: vendor.name || 'Your business', ownerEmail: vendor.email, script: false });
+}
+function message({ title = 'Workspace notice', message: text = 'Please try again or contact support.', status } = {}) {
+  return page({ title, area: 'payment', script: false, body: `<section class="result-card">${heading('BuzzCall workspace', title, text)}${status != null ? `<p class="muted">Status: ${esc(status)}</p>` : ''}<div class="action-row"><a class="button button-primary" href="/vendor/login">Vendor sign in</a><a class="button button-outline" href="/admin">Platform admin · separate access</a></div></section>` });
+}
+// Outcomes log (src/outcomes.js): counts per stage and the most recent records. Phones are masked on screen; the full
+// CSV (/admin/outcomes.csv) has them for operations, the training CSV has none.
+const STAGE_LABELS = { missed: 'Missed', no_consent: 'No consent', consented: 'Consented', conversed: 'Conversed', slot_offered: 'Slot offered',
+  booked: 'Booked', deposit_paid: 'Deposit paid', opted_out: 'Opted out' };
+function outcomes({ counts = {}, rows = [], shopNames = {}, maskPhone = (p) => p, limit = 200, emailStep = false, maxRecords = 0 } = {}) {
+  const by = counts.byStage || {};
+  const cards = `<div class="metric-grid">${metric('Outcomes', counts.total ?? 0, 'Missed calls recorded (all shops)')}${metric('Phone verified', counts.phoneVerified ?? 0, 'Records verified before this release (no new verifications)')}${metric('Training excluded', counts.trainingExcluded ?? 0, 'Opted out: never in the training export')}${metric('Booked + paid', (by.booked || 0) + (by.deposit_paid || 0), 'Current stage booked or deposit paid')}</div>`;
+  const stageRows = Object.keys(STAGE_LABELS).map(k => `<tr><td>${esc(STAGE_LABELS[k])}</td><td>${esc(by[k] || 0)}</td></tr>`).join('');
+  const recent = rows.slice(0, limit).map(r => `<tr><td class="nowrap">${esc(date(r.created_at, { hour: 'numeric', minute: '2-digit' }))}</td><td>${esc(shopNames[r.shop_id] || r.shop_slug || r.shop_id || '')}</td><td class="nowrap">${esc(maskPhone(r.caller_phone || ''))}</td><td>${badge(STAGE_LABELS[r.result_stage] || r.result_stage || 'Not recorded', r.result_stage === 'deposit_paid' || r.result_stage === 'booked' ? 'good' : r.result_stage === 'opted_out' || r.result_stage === 'no_consent' ? 'warning' : 'neutral')}</td><td>${esc(r.phone_verified ? 'Yes' : 'No')}</td><td>${esc(r.service || '')}</td><td>${esc(r.urgency || '')}</td><td>${esc(r.callback_time || '')}</td><td>${esc(r.training_excluded ? 'Excluded' : 'Included')}</td></tr>`).join('');
+  const exports = `<div class="action-row"><a class="button button-primary" href="/admin/outcomes.csv">Download CSV (operations, includes phones)</a><a class="button button-outline" href="/admin/outcomes-training.csv">Download de-identified training CSV</a></div><p class="muted">The training CSV drops phone, email and name, replaces the caller with a salted hash and leaves out every caller who opted out. Records are capped at ${esc(maxRecords)} per shop (oldest pruned first). Email step: ${esc(emailStep ? 'on' : 'off')}.</p>`;
+  const body = heading('Platform administration', 'Outcomes', 'One record per missed call, updated as the call progresses.') + cards +
+    `<div class="grid-two">${panel('Count per stage', table(['Stage', 'Records'], stageRows, 'Outcomes per stage'))}${panel('Exports', exports)}</div>` +
+    `<section class="panel"><div class="panel-header"><h2>Recent outcomes</h2><span class="count-label">${esc(Math.min(rows.length, limit))} shown</span></div>${recent ? table(['When', 'Shop', 'Caller', 'Stage', 'Verified', 'Service', 'Urgency', 'Callback', 'Training'], recent, 'Recent outcomes') : empty('No outcomes yet', 'Missed calls will appear here.')}</section>`;
+  return page({ ...adminShell, active: 'outcomes', title: 'Outcomes', body, script: false });
+}
+module.exports = { platform, vendorDetail, auth, invitation, settings, message, outcomes };

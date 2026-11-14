@@ -1,15 +1,29 @@
-// Optional booking + deposit. Slots computed in server-local time (set BUSINESS_TZ, applied as TZ at startup).
+// Optional booking + deposit. Slots use the active shop's explicit BUSINESS_TZ.
 const crypto = require('crypto');
 const store = require('./store');
-const env = process.env;
+const env = require('./config').env; // override > env (see config.js)
+const shopTime = require('./shopTime');
+const trades = require('./trades');
+const connect = require('./connect');
 const on = (v) => /^(1|true|yes|on)$/i.test(String(v || ''));
-// Vertical: 'home_services' (plumber/HVAC, default) or 'braiders' (service menu, variable-length appointments).
-const vertical = () => {
+// Trade (see trades.js): BUSINESS_TYPE (+ BUSINESS_FLOW / BUSINESS_TRADE_LABEL for 'other') wins. Legacy env still works:
+// VERTICAL=braiders (or BUSINESS_VERTICAL=braid*) -> braiders; otherwise BUSINESS_VERTICAL plumber (default) | hvac | ...
+function trade() {
+  const bt = String(env.BUSINESS_TYPE || '').trim();
+  if (bt) { const t = trades.get(bt, { flow: env.BUSINESS_FLOW, label: env.BUSINESS_TRADE_LABEL }); if (t) return t; }
   const v = String(env.VERTICAL || '').trim().toLowerCase();
-  if (/^braid/.test(v) || (!v && /^braid/i.test(env.BUSINESS_VERTICAL || ''))) return 'braiders';
-  return 'home_services';
-};
-const DEFAULT_SERVICES = 'Knotless braids:360,Box braids:300,Locs retwist:120,Twists:180';
+  if (/^braid/.test(v) || (!v && /^braid/i.test(env.BUSINESS_VERTICAL || ''))) return trades.get('braiders');
+  if (v === 'appointments') return trades.get('other', { flow: 'appointments', label: env.BUSINESS_TRADE_LABEL });
+  const bv = String(env.BUSINESS_VERTICAL || 'plumber').trim().toLowerCase();
+  const known = trades.get(bv);
+  if (known && known.flow === 'jobs') return known;
+  const t = trades.get('plumbing'); // pre-trades behavior: plumber texts, prompt names the configured vertical
+  if (bv && !known) t.promptLabel = bv;
+  return t;
+}
+// Vertical (kept for /health and older callers): 'braiders' | 'appointments' (other appointment trades) | 'home_services' (jobs flow).
+const vertical = () => { const t = trade(); return t.key === 'braiders' ? 'braiders' : t.flow === 'jobs' ? 'home_services' : 'appointments'; };
+const DEFAULT_SERVICES = trades.servicesString(trades.get('braiders'));
 // SERVICES="Name:minutes,Name:minutes" -> [{ name, minutes }]
 function parseServices(str) {
   return String(str || '').split(',').map((x) => x.trim()).filter(Boolean).map((x) => {
@@ -20,25 +34,26 @@ function parseServices(str) {
 }
 const num = (v, d) => (String(v ?? '').trim() !== '' && Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : d);
 const cfg = () => {
-  const braid = vertical() === 'braiders';
-  const [o, c] = (env.BUSINESS_HOURS || (braid ? '09:00-19:00' : '08:00-17:00')).split('-');
+  const t = trade(), appts = t.flow === 'appointments';
+  const [o, c] = (env.BUSINESS_HOURS || t.hours).split('-');
   const hm = (s) => { const [h, m] = s.split(':').map(Number); return h * 60 + (m || 0); };
-  const slotMin = Number(env.SLOT_MINUTES || 120);
+  const slotMin = Number(env.SLOT_MINUTES || (appts ? 120 : t.slotMinutes || 120));
   return {
-    vertical: vertical(), braiders: braid,
+    vertical: vertical(), braiders: t.key === 'braiders', appointments: appts, flow: t.flow, trade: t.key, tradeLabel: t.label,
     booking: on(env.BOOKING_ENABLED), deposit: on(env.DEPOSIT_ENABLED),
     slotMin, open: hm(o), close: hm(c),
-    // Start-time grid: home_services = SLOT_MINUTES blocks; braiders = SLOT_STEP_MINUTES (default 60) start times.
-    stepMin: braid ? Number(env.SLOT_STEP_MINUTES || 60) : slotMin,
-    services: braid ? parseServices(env.SERVICES || DEFAULT_SERVICES) : [],
+    // Start-time grid: jobs = SLOT_MINUTES blocks; appointments = SLOT_STEP_MINUTES (trade default, else 60) start times.
+    stepMin: appts ? Number(env.SLOT_STEP_MINUTES || t.step || 60) : slotMin,
+    services: appts ? parseServices(env.SERVICES || trades.servicesString(t) || DEFAULT_SERVICES) : [],
     bookingLink: (env.BOOKING_LINK || '').trim() || null,
-    days: (env.BUSINESS_DAYS || (braid ? '1,2,3,4,5,6' : '1,2,3,4,5')).split(',').map(Number),
+    days: (env.BUSINESS_DAYS || t.days.join(',')).split(',').map(Number),
     leadMin: Number(env.BOOKING_LEAD_MINUTES || 60), holdMin: Number(env.HOLD_MINUTES || 30),
-    amount: num(env.DEPOSIT_AMOUNT, braid ? 50 : 49),
+    amount: num(env.DEPOSIT_AMOUNT, t.deposit),
     // Per-paid-lead fee (USD) charged to the shop only when a caller books AND pays the deposit.
-    leadFee: num(env.LEAD_FEE, braid ? 5 : 12),
-    leadFeeWaived: on(env.LEAD_FEE_WAIVED), // e.g. during the free pilot: fee is recorded as 'waived', nothing charged
-    connectAccount: (env.STRIPE_CONNECT_ACCOUNT_ID || '').trim() || null, // shop's Stripe Connect account (acct_...)
+    leadFee: num(env.LEAD_FEE, appts ? 5 : 12),
+    // Pilot default: waived unless LEAD_FEE_WAIVED is explicitly 0/false/off. Fee is recorded as 'waived', nothing charged.
+    leadFeeWaived: String(env.LEAD_FEE_WAIVED ?? '').trim() === '' ? true : on(env.LEAD_FEE_WAIVED),
+    connectAccount: connect.accountId(), // shop's Stripe connected account (acct_...): config override, else env fallback
   };
 };
 
@@ -64,24 +79,30 @@ function nextSlots(count = 3, opts = {}) {
   const c = cfg(), out = [];
   const dur = opts.minutes || c.slotMin, step = opts.minutes ? c.stepMin : c.slotMin;
   const t = new Date(Date.now() + c.leadMin * 60000);
-  const d = new Date(opts.from && opts.from > t ? opts.from : t); d.setHours(0, 0, 0, 0);
-  for (let day = 0; day < 21 && out.length < count; day++, d.setDate(d.getDate() + 1)) {
-    if (!c.days.includes(d.getDay())) continue;
+  const zone = shopTime.timeZone();
+  let d = shopTime.parts(opts.from && opts.from > t ? opts.from : t, zone);
+  for (let day = 0; day < 21 && out.length < count; day++, d = shopTime.addDays(d, 1)) {
+    if (!c.days.includes(shopTime.weekday(d))) continue;
     for (let m = c.open; m + dur <= c.close && out.length < count; m += step) {
-      const s = new Date(d); s.setMinutes(m);
+      const s = shopTime.toInstant(d, m, zone);
+      if (!s) continue; // spring-forward gap: do not silently offer a different wall time/day.
       const e = new Date(s.getTime() + dur * 60000);
+      const end = shopTime.parts(e, zone);
+      const sameDate = end.year === d.year && end.month === d.month && end.day === d.day;
+      const midnightClose = c.close === 1440 && end.hour === 0 && end.minute === 0
+        && shopTime.sameDay(e, shopTime.toInstant(shopTime.addDays(d, 1), 0, zone), zone);
+      if ((!sameDate || end.hour * 60 + end.minute > c.close) && !midnightClose) continue;
       if (s < t || isTaken(s.toISOString(), e.toISOString())) continue;
-      out.push({ start: s.toISOString(), end: e.toISOString(), minutes: dur, label: label(s, dur) });
+      out.push({ start: s.toISOString(), end: e.toISOString(), minutes: dur, label: label(s, dur, zone) });
     }
   }
   return out;
 }
-const tm = (x) => x.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-const dayLabel = (s) => s.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
-function label(s, dur) {
+function label(s, dur, zone = shopTime.timeZone()) {
   const e = new Date(s.getTime() + (dur || cfg().slotMin) * 60000);
-  if (cfg().braiders) return `${dayLabel(s)}, ${tm(s)} (done ~${tm(e)})`;
-  return `${dayLabel(s)} ${tm(s)}-${tm(e)}`;
+  const day = shopTime.dayLabel(s, zone), start = shopTime.timeLabel(s, zone), end = shopTime.timeLabel(e, zone);
+  if (cfg().appointments) return `${day}, ${start} (done ~${end})`;
+  return `${day} ${start}-${end}`;
 }
 
 // Returns booking or null if slot was taken in the meantime (double-booking guard).
@@ -89,35 +110,50 @@ function hold(lead, slot) {
   const c = cfg();
   const end = slot.end || new Date(Date.parse(slot.start) + c.slotMin * 60000).toISOString();
   if (isTaken(slot.start, end)) return null;
+  const prepay = require('./disputes').prepayFor(lead.phone, { email: lead.email });
+  const mustPay = !!prepay;
+  const amount = mustPay ? (c.amount > 0 ? c.amount : 1) : (c.deposit ? c.amount : 0);
   const b = { id: crypto.randomBytes(6).toString('hex'), leadId: lead.id, phone: lead.phone, name: lead.name, need: lead.need,
+    ...(lead.email ? { email: lead.email } : {}),
     ...(lead.service ? { service: lead.service, details: lead.details || null } : {}),
-    slotStart: slot.start, slotEnd: end, slotLabel: slot.label, status: c.deposit ? 'held' : 'confirmed', paid: false,
-    amount: c.deposit ? c.amount : 0, holdExpiresAt: new Date(Date.now() + c.holdMin * 60000).toISOString(),
+    slotStart: slot.start, slotEnd: end, slotLabel: slot.label, status: (c.deposit || mustPay) ? 'held' : 'confirmed', paid: false,
+    amount, requirePrepay: mustPay || undefined, holdExpiresAt: new Date(Date.now() + c.holdMin * 60000).toISOString(),
     createdAt: new Date().toISOString() };
   store.db.bookings.unshift(b); store.save(); return b;
 }
 
-// Stripe Connect destination charge: the deposit goes to the shop's connected account and the
-// per-paid-lead fee is kept by the platform as the application fee. Fee is capped at the deposit.
-function connectParams(b) {
+// Platform Checkout Session payment_intent metadata. Deposit funds sit on the platform; vendor payout is a later
+// Transfer (src/deposits.js). Optional DEPOSIT_PLATFORM_FEE_PCT is applied at transfer time, not as application_fee.
+// Lead fee is recorded on the booking (due/waived/review) for invoicing — it is not an application fee on the charge.
+function connectParams(b, acct) {
   const c = cfg();
-  if (!c.connectAccount) return {};
-  const feeCents = c.leadFeeWaived ? 0 : Math.min(Math.round(c.leadFee * 100), Math.round(b.amount * 100));
-  b.connectAccount = c.connectAccount; b.applicationFeeCents = feeCents;
-  return { payment_intent_data: { transfer_data: { destination: c.connectAccount },
-    ...(feeCents > 0 ? { application_fee_amount: feeCents } : {}), metadata: { bookingId: b.id } } };
+  const feeCents = connect.applicationFeeCents(Math.round(b.amount * 100), c.leadFee, c.leadFeeWaived);
+  // Tag the booking with the vendor's Connect account when known (payout target); charge still runs on the platform.
+  if (acct) b.connectAccount = acct;
+  b.applicationFeeCents = feeCents; // recorded for lead-fee bookkeeping only
+  const shopId = require('./shopContext').shopId();
+  return { payment_intent_data: {
+    transfer_group: b.id,
+    metadata: { bookingId: b.id, ...(shopId ? { shopId } : {}), ...(acct ? { connectAccount: acct } : {}) } } };
+}
+
+// Kept for callers that previously skipped deposits when Connect was missing. Platform charges no longer need Connect;
+// prefer leaving the hold + pay link. Still available for explicit skip paths.
+function skipDeposit(b, reason = 'stripe_not_connected') {
+  if (b && b.requirePrepay) return b;
+  b.status = 'confirmed'; b.amount = 0; b.depositSkipped = reason; b.holdExpiresAt = null; store.save();
+  return b;
 }
 
 // Records the lead fee on a paid booking (once). Status:
-//   'collected' = taken as Stripe Connect application fee; 'due' = to be invoiced monthly;
+//   'collected' = legacy direct-charge application fee; 'due' = to be invoiced / netted from payout;
 //   'waived' = LEAD_FEE_WAIVED (pilot); 'review' = paid but slot lost (refund deposit and fee).
 function recordLeadFee(b, conflict) {
   if (b.lead_fee_status) return b;
   const c = cfg();
-  const viaConnect = !!b.connectAccount;
-  const fee = viaConnect && b.applicationFeeCents != null ? b.applicationFeeCents / 100 : c.leadFee;
+  const fee = b.applicationFeeCents != null ? b.applicationFeeCents / 100 : c.leadFee;
   b.lead_fee = c.leadFeeWaived ? 0 : fee;
-  b.lead_fee_status = c.leadFeeWaived ? 'waived' : conflict ? 'review' : viaConnect ? 'collected' : 'due';
+  b.lead_fee_status = c.leadFeeWaived ? 'waived' : conflict ? 'review' : 'due';
   b.lead_fee_at = new Date().toISOString();
   return b;
 }
@@ -133,21 +169,78 @@ function leadFeeTotals() {
   return t;
 }
 
+const depositCapEnv = () => {
+  const sec = require('./security');
+  return sec.num(process.env.DEPOSIT_AMOUNT_MAX, 50);
+};
+const depositCap = () => {
+  const base = depositCapEnv();
+  const over = Number(store.getOverride().depositCapOverride);
+  return Number.isFinite(over) && over > base ? over : base;
+};
+const applicationFeeCents = () => {
+  const sec = require('./security');
+  return Math.max(0, Math.round(sec.num(process.env.DEPOSIT_APPLICATION_FEE_CENTS, 0)));
+};
+
+// Direct charge on the shop's connected account. BuzzCall does not hold the money.
+// Mock mode (no Stripe key) still returns a local pay page so demos work.
 async function depositLink(b, BASE) {
+  const blocked = require('./deposits').velocityBlock();
+  if (blocked) {
+    b.depositBlocked = blocked === 'count' ? 'daily_count' : 'daily_amount';
+    store.save();
+    throw Object.assign(new Error('This shop has reached its daily deposit limit. BuzzCall will review it.'), { status: 429 });
+  }
+  const cap = depositCap();
+  if (Number(b.amount) > cap) {
+    b.depositBlocked = 'over_cap';
+    store.save();
+    throw Object.assign(new Error(`Deposits are capped at $${cap} for this pilot.`), { status: 400 });
+  }
+  await connect.ensureFresh();
+  const shopId = require('./shopContext').shopId();
   if (env.STRIPE_SECRET_KEY) {
-    const stripe = require('stripe')(env.STRIPE_SECRET_KEY);
-    const s = await stripe.checkout.sessions.create({
+    const reason = connect.checkoutBlock();
+    if (reason) {
+      b.depositBlocked = reason;
+      store.save();
+      throw Object.assign(new Error('This shop cannot take a deposit until Stripe charges are enabled and an admin approves the account.'), { status: 409, reason });
+    }
+    const acct = connect.checkoutAccount();
+    const amount = Math.round(Number(b.amount) * 100);
+    const fee = applicationFeeCents();
+    const paymentIntentData = { metadata: { bookingId: b.id, ...(shopId ? { shopId } : {}) } };
+    if (fee > 0 && fee < amount) paymentIntentData.application_fee_amount = fee;
+    const s = await connect.stripe().checkout.sessions.create({
       mode: 'payment',
-      line_items: [{ quantity: 1, price_data: { currency: 'usd', unit_amount: Math.round(b.amount * 100),
-        product_data: { name: b.service ? `Deposit: ${b.service} with ${env.BUSINESS_NAME || 'your stylist'}, ${b.slotLabel}` : `Deposit: ${env.BUSINESS_NAME || 'service'} visit ${b.slotLabel}` } } }],
-      metadata: { bookingId: b.id }, client_reference_id: b.id,
-      expires_at: Math.floor(Date.now() / 1000) + Math.max(cfg().holdMin, 30) * 60, // Stripe min 30 min
-      success_url: `${BASE}/?deposit=success`, cancel_url: `${BASE}/?deposit=cancel`,
-      ...connectParams(b),
-    });
-    b.stripeSessionId = s.id; b.payUrl = s.url;
-  } else b.payUrl = `${BASE}/pay/mock/${b.id}`;
-  store.save(); return b.payUrl;
+      line_items: [{ quantity: 1, price_data: { currency: 'usd', unit_amount: amount,
+        product_data: { name: b.service ? `Deposit: ${b.service} with ${env.BUSINESS_NAME || `your ${trade().pro || 'pro'}`}, ${b.slotLabel}` : `Deposit: ${env.BUSINESS_NAME || 'service'} visit ${b.slotLabel}` } } }],
+      metadata: { bookingId: b.id, ...(shopId ? { shopId } : {}) },
+      client_reference_id: b.id,
+      expires_at: Math.floor(Date.now() / 1000) + Math.max(cfg().holdMin, 30) * 60,
+      success_url: `${BASE}/payment/return?status=success`, cancel_url: `${BASE}/payment/return?status=cancel`,
+      payment_intent_data: paymentIntentData,
+    }, { stripeAccount: acct });
+    b.stripeSessionId = s.id;
+    b.payUrl = s.url;
+    b.connectAccount = acct;
+    b.chargeModel = 'direct';
+    b.applicationFeeCents = fee > 0 && fee < amount ? fee : 0;
+  } else {
+    b.payUrl = `${BASE}/pay/mock/${b.id}`;
+    b.stripeSessionId = b.stripeSessionId || `cs_mock_${b.id}`;
+    b.chargeModel = 'direct_mock';
+    const acct = connect.checkoutAccount();
+    if (acct) b.connectAccount = acct;
+  }
+  store.save();
+  if (require('./shopContext').current()) {
+    await store.flush();
+    const s = store.status();
+    if (s.degraded || s.fallback || s.lastError) throw Object.assign(new Error('Payment storage unavailable; please retry later'), { status: 503 });
+  }
+  return b.payUrl;
 }
 
 // Marks paid+confirmed. Returns {booking, changed}. Refuses if hold expired and slot taken by someone else.
@@ -163,4 +256,22 @@ function markPaid(id) {
   return { booking: b, changed: true };
 }
 
-module.exports = { cfg, vertical, parseServices, nextSlots, hold, depositLink, markPaid, expireHolds, leadFeeTotals, connectParams };
+async function voidOpenSessions(accountId) {
+  let n = 0;
+  for (const b of store.db.bookings || []) {
+    if (!b || b.paid || !b.stripeSessionId || b.sessionVoided) continue;
+    if (accountId && b.connectAccount && b.connectAccount !== accountId) continue;
+    if (env.STRIPE_SECRET_KEY && connect.stripe().checkout?.sessions?.expire) {
+      try { await connect.stripe().checkout.sessions.expire(b.stripeSessionId, {}, accountId ? { stripeAccount: accountId } : undefined); }
+      catch (e) { console.error('[booking] void session failed:', e.message); }
+    }
+    b.sessionVoided = true;
+    b.payUrl = null;
+    b.depositPaused = 'disconnected';
+    n++;
+  }
+  if (n) store.save();
+  return n;
+}
+
+module.exports = { cfg, vertical, trade, parseServices, nextSlots, hold, depositLink, markPaid, expireHolds, leadFeeTotals, connectParams, skipDeposit, voidOpenSessions, depositCap, depositCapEnv, applicationFeeCents };

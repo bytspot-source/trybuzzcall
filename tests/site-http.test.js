@@ -17,8 +17,8 @@ const LEGAL = {
   refunds: 'Customer Deposit Refund Policy',
   'sms-consent': 'How text consent works',
 };
-const PAGES = ['/', '/index.html', ...Object.keys(LEGAL).flatMap((name) => [`/${name}.html`, `/${name}`])];
-const PUBLIC_PATHS = new Set([...PAGES, '/home.css', '/site.js', '/styles.css']);
+const PAGES = ['/', '/index.html', ...Object.keys(LEGAL).flatMap((name) => [`/${name}.html`, `/${name}`]), '/setup.html', '/setup'];
+const PUBLIC_PATHS = new Set([...PAGES, '/vendor/login', '/home.css', '/site.js', '/styles.css', '/setup.css', '/setup.js', '/setup-rules.js', '/trades.js']);
 const REQUEST_MS = 3000;
 
 // Reserve an OS-selected port, then release it immediately before spawning. A
@@ -75,6 +75,7 @@ function launchServer(port, cwd, adminPassword) {
       BOOKING_ENABLED: '0',
       DEPOSIT_ENABLED: '0',
       TRIAL_DAYS: '14',
+      WAITLIST_RATE_MAX: '1000', // this suite posts many waitlist entries from one IP; the limiter has its own test
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -169,7 +170,7 @@ async function startSite(t) {
     assert.equal(url.username + url.password, '', 'No URL credentials');
     const method = body === undefined ? 'GET' : 'POST';
     if (method === 'GET') {
-      assert.ok(PUBLIC_PATHS.has(url.pathname) || ['/health', '/admin'].includes(url.pathname) || checkoutPaths.has(url.pathname),
+      assert.ok(PUBLIC_PATHS.has(url.pathname) || ['/health', '/admin/legacy'].includes(url.pathname) || checkoutPaths.has(url.pathname),
         `Refusing unexpected GET ${url.pathname} (especially deposit/payment actions)`);
     } else {
       assert.ok(['/api/waitlist', '/api/checkout'].includes(url.pathname), 'Never complete a checkout or charge');
@@ -188,7 +189,7 @@ async function startSite(t) {
             'Content-Type': 'application/json',
             'Content-Length': Buffer.byteLength(payload),
           }),
-          ...(url.pathname === '/admin' ? {
+          ...(url.pathname === '/admin/legacy' ? {
             Authorization: `Basic ${Buffer.from(`test:${adminPassword}`).toString('base64')}`,
           } : {}),
         },
@@ -213,9 +214,12 @@ async function startSite(t) {
   const health = JSON.parse(response.body);
   assert.equal(health.ok, true);
   assert.equal(health.billing, 'mock');
-  for (const key of ['twilio', 'openai', 'stripe', 'connect', 'booking', 'deposit']) {
+  for (const key of ['twilio', 'stripe', 'connect', 'booking', 'deposit']) {
     assert.equal(health[key], false, `${key} must be disabled`);
   }
+  for (const key of ['openai', 'leadFee', 'leadFeeWaived']) assert.equal(key in health, false, `public /health must not expose ${key}`);
+  assert.equal('storage' in health, false, 'public /health must not expose the storage backend (T3: admin-only)');
+  assert.ok(['ok', 'degraded'].includes(health.storageState));
 
   const cache = new Map();
   function publicResource(target) {
@@ -288,11 +292,37 @@ test('public site over real local HTTP', { timeout: 60000 }, async (t) => {
     }
   });
 
+  await t.test('refund policy: the shop refunds a direct charge; BuzzCall does not', async () => {
+    const html = await site.publicResource('/refunds');
+    assert.match(html, /plumbing and HVAC shops, braiders/);
+    assert.match(html, /merchant of record/);
+    assert.match(html, /direct charge on the <b>shop's own Stripe account<\/b>/);
+    assert.match(html, /does not hold, escrow, or transfer/);
+    assert.match(html, /<b>Contact the shop\.<\/b>/);
+    assert.match(html, /Stripe Dashboard/);
+    assert.match(html, /id="shops"/);
+    assert.match(html, /href="terms\.html#deposits"/);
+    assert.match(html, /href="terms\.html#billing"/);
+    assert.doesNotMatch(html, /100% of your deposit back|cancel at least 24 hours before|within 30 days|within 15 minutes/);
+    assert.doesNotMatch(html, /BuzzCall collects|pause the shop's payout|issued by BuzzCall/i);
+    assert.match(html, /no partial refunds/);
+    assert.match(html, /hello@trybuzzcall\.com/);
+    assert.match(html, /\(470\) 482-8377/);
+    assert.match(html, /8735 Dunwoody Place/);
+    const home = await site.publicResource('/');
+    assert.match(home, /charged on the shop's own Stripe account/);
+    assert.match(home, /sets and discloses its own cancellation and refund rules/);
+    assert.match(home, /Refunds come from the shop/);
+    assert.match(home, /does not hold the money or decide refunds/);
+    assert.match(home, /href="refunds\.html">Deposit refund policy/);
+    assert.doesNotMatch(home, /24 hours ahead|trip fee|payout timing|fully refunded/);
+  });
+
   await t.test('expected local page links and assets resolve, including cross-page and SVG fragments', async () => {
     const home = await site.publicResource('/');
     const homeLinks = new Set(localReferences(home, '/', site.origin).map((url) => url.pathname + url.hash));
     for (const expected of ['/', '/#main', '/#home-services', '/#braiders', '/#how-it-works', '/#pricing', '/#faq', '/#waitlist',
-      '/home.css', '/site.js', '/privacy.html', '/terms.html', '/refunds.html', '/terms.html#sms', '/sms-consent.html']) {
+      '/home.css', '/site.js', '/privacy.html', '/terms.html', '/refunds.html', '/terms.html#sms', '/sms-consent.html', '/setup.html', '/vendor/login']) {
       assert.ok(homeLinks.has(expected), `Homepage must link to ${expected}`);
     }
     for (const page of PAGES) {
@@ -333,8 +363,8 @@ test('public site over real local HTTP', { timeout: 60000 }, async (t) => {
     assert.equal(Object.hasOwn(waitlist[1], 'businessType'), false, 'Empty segment remains legacy');
   });
 
-  await t.test('both business types persist and duplicates preserve the segment and timestamp', async () => {
-    for (const businessType of ['home_services', 'braiders']) {
+  await t.test('all business types persist and duplicates preserve the segment and timestamp', async () => {
+    for (const businessType of ['home_services', 'braiders', 'other']) {
       const email = `${businessType}@example.com`;
       const response = await site.request('/api/waitlist', { email: ` ${email.toUpperCase()} `, businessType });
       assertResponse(response, 200, /^application\/json$/i, 'segmented signup');
@@ -403,37 +433,26 @@ test('public site over real local HTTP', { timeout: 60000 }, async (t) => {
     assertResponse(signup, 200, /^application\/json$/i, 'escaped admin signup');
     assert.deepEqual(JSON.parse(signup.body), { ok: true });
     const before = await site.readStore();
-    const response = await site.request('/admin');
-    assertResponse(response, 200, /^text\/html$/i, '/admin');
-    assert.ok(response.body.includes('<li>home_services@example.com · Business type: Home services</li>'));
-    assert.ok(response.body.includes('<li>braiders@example.com · Business type: Braiders</li>'));
-    assert.ok(response.body.includes('<li>other.shop@example.com</li>'));
-    assert.ok(response.body.includes('<li>&lt;owner&amp;&quot;tag&gt;@example.com · Business type: Braiders</li>'));
+    const raw = await site.request('/admin/legacy');
+    assertResponse(raw, 200, /^text\/html$/i, '/admin/legacy');
+    // Cells carry data-label attributes for the stacked mobile layout; compare the cell text.
+    const response = { ...raw, body: raw.body.replace(/<td data-label="[^"]*"/g, '<td') };
+    assert.ok(response.body.includes('<td>home_services@example.com</td><td>Home services</td>'));
+    assert.ok(response.body.includes('<td>braiders@example.com</td><td>Braiders</td>'));
+    assert.ok(response.body.includes('<td>other@example.com</td><td>Other local business</td>'));
+    assert.ok(response.body.includes('<td>other.shop@example.com</td><td>Not specified</td>'));
+    assert.ok(response.body.includes('<td>&lt;owner&amp;&quot;tag&gt;@example.com</td><td>Braiders</td>'));
     assert.ok(!response.body.includes(email), 'Raw HTML must not appear in the admin waitlist');
     assert.deepEqual(await site.readStore(), before, 'Viewing admin must not change persisted data');
   });
 
   for (const plan of ['monthly', 'annual']) {
-    await t.test(`${plan} checkout returns a local mock page without completing or charging`, async () => {
-      const response = await site.request('/api/checkout', { plan });
-      assertResponse(response, 200, /^application\/json$/i, `${plan} checkout`);
-      const checkout = JSON.parse(response.body);
-      assert.equal(checkout.mock, true);
-      assert.match(checkout.id, /^cs_mock_[a-f0-9]+$/);
-      const url = new URL(checkout.url);
-      assert.equal(url.origin, site.origin);
-      assert.equal(url.pathname, `/billing/mock/checkout/${checkout.id}`);
-      assert.equal(url.search + url.hash + url.username + url.password, '');
-      site.checkoutPaths.add(url.pathname);
+    await t.test(`${plan} public checkout is retired: 410 pointing to /setup, nothing stored`, async () => {
       const before = await site.readStore();
-      assert.equal(before.billing.mock.sessions[checkout.id].plan, plan);
-      assertUncompleted(before);
-      // GET the page only: never submit its /complete form or visit /pay/mock.
-      const page = await site.request(url.href);
-      assertResponse(page, 200, /^text\/html$/i, `${plan} mock checkout page`);
-      assert.match(page.body, /<h1>MOCK Stripe Checkout<\/h1>/);
-      assert.ok(page.body.includes(`Plan: <b>${plan}</b>`));
-      assert.deepEqual(await site.readStore(), before, 'Viewing checkout must not complete it or charge');
+      const response = await site.request('/api/checkout', { plan });
+      assertResponse(response, 410, /^application\/json$/i, `${plan} checkout`);
+      assert.equal(JSON.parse(response.body).next, '/setup');
+      assert.deepEqual(await site.readStore(), before, 'A retired checkout must not create a session');
     });
   }
 });

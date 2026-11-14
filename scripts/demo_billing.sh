@@ -5,6 +5,8 @@
 #     trial; shop #12 cancels during the trial (pending setup item voided, $0); shop #13 annual (waived).
 #  B. Lifecycle on shop #11: trial_will_end buzz -> paid -> payment fails (past_due, service off) -> card updated ->
 #     plan change preview + switch to annual (proration) -> cancel at period end -> canceled.
+# Texts need SMS_ENABLED=1 and written permission recorded through the admin API (a call never creates it): the demo
+# server runs with SMS on in log-only mode and records demo-only permission for its own test numbers.
 # Usage: bash scripts/demo_billing.sh
 set -e
 cd "$(dirname "$0")/.."
@@ -17,7 +19,8 @@ env PORT=$DEMO_PORT PUBLIC_BASE_URL=$BASE DATA_DIR="$DATA" ADMIN_PASSWORD=demo-p
   BUSINESS_NAME="Peach State Plumbing" OWNER_PHONE=+14045550100 BOOKING_ENABLED=1 DEPOSIT_ENABLED=1 \
   TRIAL_DAYS=${TRIAL_DAYS:-14} FOUNDING_SHOPS_LIMIT=${FOUNDING_SHOPS_LIMIT:-10} SETUP_FEE_WAIVED=0 SETUP_WAIVER_CODE= \
   BILLING_ENFORCE=1 PAST_DUE_GRACE_DAYS=0 INACTIVE_MODE=generic \
-  TWILIO_ACCOUNT_SID= TWILIO_AUTH_TOKEN= TWILIO_PHONE_NUMBER= STRIPE_SECRET_KEY= STRIPE_WEBHOOK_SECRET= STRIPE_CONNECT_ACCOUNT_ID= OPENAI_API_KEY= \
+  SMS_ENABLED=1 SMS_CONSENT_BUSINESS_ID=billing-demo TWILIO_PHONE_NUMBER=+14705550100 ALLOW_UNSIGNED_TWILIO_WEBHOOKS=1 NODE_ENV=development \
+  TWILIO_ACCOUNT_SID= TWILIO_AUTH_TOKEN= STRIPE_SECRET_KEY= STRIPE_WEBHOOK_SECRET= STRIPE_CONNECT_ACCOUNT_ID= OPENAI_API_KEY= \
   node src/server.js > "$DATA/server.log" 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null' EXIT
@@ -27,27 +30,31 @@ J(){ node -e "const j=JSON.parse(require('fs').readFileSync(0,'utf8'));$1"; }
 status(){ curl -s -u $AUTH "$BASE/billing/status"; }
 signup(){ # plan -> prints sub id
   local url; url=$(curl -s -X POST "$BASE/api/checkout" -d plan=$1 | J 'console.log(j.url)')
-  curl -s -X POST "$BASE/billing/mock/checkout/${url##*/}/complete" | J 'console.log(j.subscription.id)'; }
+  curl -s -H "Origin: $BASE" -X POST "$BASE/billing/mock/checkout/${url##*/}/complete" | J 'console.log(j.subscription.id)'; }
 shop(){ status | J "const h=j.shops.find(s=>s.subscription==='$1'), inv=j.invoices.filter(i=>i.subscription==='$1');
   console.log('   shop #'+h.n+' '+h.plan+' status='+h.status+(h.cancel_at_period_end?' (cancels at trial/period end)':'')+(h.founding?' FOUNDING':'')+' setup='+h.setup.status+(h.setup.amount!=null?' \$'+h.setup.amount:'')+' ('+h.setup.reason+')');
   for (const i of inv.slice(0,${2:-1})) console.log('     invoice \$'+i.amount_due+' '+i.status+' ['+i.reason+']: '+i.lines.map(l=>l.description+' \$'+l.amount).join(' + '));"; }
 state(){ status | J 'const s=j.subscription||{},d=v=>v?v.slice(0,10):"-";
   console.log(`   STATE [clock ${d(j.now)}] primary=${s.id} status=${s.status} plan=${s.plan} period_end=${d(s.current_period_end)} cancel_at_period_end=${!!s.cancel_at_period_end} service=${j.access.active?"ACTIVE":"INACTIVE"} (${j.access.reason}) credit=$${j.mockCreditBalance}`)'; }
-adv(){ curl -s -u $AUTH -X POST "$BASE/billing/mock/advance" -d "days=$1" >/dev/null; }
-api(){ curl -s -u $AUTH -X POST "$BASE$1" "${@:2}"; }
+adv(){ curl -s -u $AUTH -H "Origin: $BASE" -X POST "$BASE/billing/mock/advance" -d "days=$1" >/dev/null; }
+api(){ curl -s -u $AUTH -H "Origin: $BASE" -X POST "$BASE$1" "${@:2}"; }
 missed(){ curl -s -X POST "$BASE/twilio/voice/status" --data-urlencode "From=$1" --data-urlencode "DialCallStatus=no-answer" >/dev/null; sleep 0.2; tail -n1 "$DATA/sms.log" | sed 's/^.*SMS -> /   SMS -> /'; }
+CONSENTED_AT=$(node -e 'console.log(new Date(Date.now() - 60000).toISOString())')
+# Demo-only written permission for test numbers, via the authenticated operator API.
+grant(){ api /api/consent -H 'Content-Type: application/json' -d "{\"action\":\"grant\",\"phone\":\"$1\",\"purpose\":\"${2:-customer_service}\",\"consentedAt\":\"$CONSENTED_AT\",\"disclosureVersion\":\"demo-v1\",\"evidenceRef\":\"demo-only-not-real-consent\"}" | grep -q '"ok":true' || { echo "Could not record demo permission for $1"; exit 1; }; }
+grant +14045550100 owner_alerts; grant +14705550198; grant +14705550197
 
 echo "== A. SETUP FEE"
 echo "-- Shop #1 signs up (monthly): mock checkout page says:"
 URL=$(curl -s -X POST "$BASE/api/checkout" -d plan=monthly | J 'console.log(j.url)')
 curl -s "$URL" | sed 's/<[^>]*>/ /g' | tr -s ' \n' ' ' | sed 's/^ *MOCK checkout //' | cut -c1-260 | sed 's/^/   /'; echo
-S1=$(curl -s -X POST "$BASE/billing/mock/checkout/${URL##*/}/complete" | J 'console.log(j.subscription.id)'); shop $S1
+S1=$(curl -s -H "Origin: $BASE" -X POST "$BASE/billing/mock/checkout/${URL##*/}/complete" | J 'console.log(j.subscription.id)'); shop $S1
 echo "-- Shops #2-#10 sign up (monthly, founding)"; for i in $(seq 2 10); do signup monthly >/dev/null; done
 status | J 'console.log("   founding slots taken: "+j.founding.taken+"/"+j.founding.limit)'
 echo "-- Shop #11 signs up (monthly): checkout page says:"
 URL=$(curl -s -X POST "$BASE/api/checkout" -d plan=monthly | J 'console.log(j.url)')
 curl -s "$URL" | sed 's/<[^>]*>/ /g' | tr -s ' \n' ' ' | grep -o 'One-time setup[^.]*\.[^.]*\.' | sed 's/^/   /'
-S11=$(curl -s -X POST "$BASE/billing/mock/checkout/${URL##*/}/complete" | J 'console.log(j.subscription.id)'); shop $S11
+S11=$(curl -s -H "Origin: $BASE" -X POST "$BASE/billing/mock/checkout/${URL##*/}/complete" | J 'console.log(j.subscription.id)'); shop $S11
 echo "-- Shop #12 signs up (monthly), then cancels during the trial"; S12=$(signup monthly); shop $S12
 api /api/billing/cancel -d sub=$S12 >/dev/null; shop $S12
 echo "-- Shop #13 signs up (annual)"; S13=$(signup annual); shop $S13

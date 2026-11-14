@@ -3,7 +3,7 @@
 > Framing: we sell **booked, paid jobs, not texts.** Lead line: "$49 deposit in your account before you're off the ladder." Done for you: they keep their current number, no app. Every text ends with "Reply STOP to opt out." See `marketing/outreach_texts.md` for the full kit.
 
 **1. Cold-intro (after a call or a web form)**
-Hi {first}, it's {you} with TryBuzzCall in {city}. When {shop} misses a call, BuzzCall texts the caller back, books them into one of your open slots, and collects a $49 deposit credited to their bill. You get a BOOKED + PAID text. Same number, no app, we set it up. Free 14-day pilot for GA plumbing/HVAC. Want in? Reply STOP to opt out.
+Hi {first}, it's {you} with TryBuzzCall in {city}. When {shop} misses a call, BuzzCall texts the caller back, books them into one of your open slots, and collects a $49 deposit credited to their bill. You get a BOOKED + PAID text. Same number, no app, we set it up. Free 14-day pilot for plumbing/HVAC shops. Want in? Reply STOP to opt out.
 
 **2. Follow-up**
 {first}, quick one: a lot of missed callers just call the next shop on Google. BuzzCall books them on your schedule with $49 down before you're off the ladder. Keep your number, no app, we do the setup. Try it free for 14 days? Reply STOP to opt out.

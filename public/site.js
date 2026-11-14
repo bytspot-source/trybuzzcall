@@ -5,11 +5,8 @@
   const email = document.getElementById('waitlist-email');
   const business = document.getElementById('waitlist-business');
   const waitlistStatus = document.getElementById('waitlist-status');
-  const checkoutStatus = document.getElementById('checkout-status');
   const submit = form.querySelector('button[type="submit"]');
-  const checkoutButtons = [...document.querySelectorAll('[data-checkout]')];
   let joining = false;
-  let checkingOut = false;
 
   function status(element, message, state = '') {
     element.textContent = message;
@@ -33,20 +30,6 @@
     }
   }
 
-  // Only hand off to our local demo checkout or the existing Stripe integration.
-  function checkoutUrl(value) {
-    if (typeof value !== 'string' || !value) return null;
-    try {
-      const url = new URL(value, window.location.origin);
-      if (url.username || url.password) return null;
-      const stripe = url.origin === 'https://checkout.stripe.com';
-      const mock = url.origin === window.location.origin && url.pathname.startsWith('/billing/mock/checkout/');
-      return stripe || mock ? url.href : null;
-    } catch {
-      return null;
-    }
-  }
-
   business.addEventListener('change', () => {
     business.removeAttribute('aria-invalid');
     if (!joining) status(waitlistStatus, '');
@@ -54,7 +37,7 @@
 
   document.querySelectorAll('[data-audience]').forEach((link) => {
     link.addEventListener('click', () => {
-      if (joining || !['home_services', 'braiders'].includes(link.dataset.audience)) return;
+      if (joining || !['home_services', 'braiders', 'other'].includes(link.dataset.audience)) return;
       business.value = link.dataset.audience;
       business.removeAttribute('aria-invalid');
       status(waitlistStatus, '');
@@ -79,7 +62,7 @@
     email.removeAttribute('aria-invalid');
     business.removeAttribute('aria-invalid');
     const businessType = business.value;
-    const pilotName = businessType === 'braiders' ? 'Braiders' : 'Home Services';
+    const pilotName = { braiders: 'Braiders', other: 'BuzzCall' }[businessType] || 'Home Services';
     status(waitlistStatus, 'Adding you to the list…');
     try {
       const { response, data } = await post('/api/waitlist', { email: email.value, businessType });
@@ -107,28 +90,6 @@
     }
   });
 
-  checkoutButtons.forEach((button) => {
-    button.addEventListener('click', async () => {
-      if (checkingOut) return;
-      checkingOut = true;
-      checkoutButtons.forEach((item) => { item.disabled = true; });
-      button.setAttribute('aria-busy', 'true');
-      status(checkoutStatus, 'Opening secure checkout…');
-      try {
-        const { response, data } = await post('/api/checkout', { plan: button.dataset.checkout });
-        const url = response.ok && checkoutUrl(data.url);
-        if (!url) throw new Error('Checkout unavailable');
-        window.location.assign(url);
-        status(checkoutStatus, 'Checkout is ready. If it does not open, please try again.');
-      } catch {
-        status(checkoutStatus, "Checkout isn't available right now. Please try again or join the pilot list below.", 'error');
-      } finally {
-        checkingOut = false;
-        checkoutButtons.forEach((item) => { item.disabled = false; });
-        button.removeAttribute('aria-busy');
-      }
-    });
-    button.disabled = false;
-  });
+  // Signup is through /setup (plain links); there is no public checkout on this page.
   submit.disabled = false;
 })();

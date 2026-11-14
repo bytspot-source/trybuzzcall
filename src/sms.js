@@ -1,87 +1,221 @@
-// All sends, including simulations, require explicit scoped written permission.
+// Sends SMS via Twilio if configured; otherwise log-only (console + data/sms.log).
+// sendSms NEVER throws: it resolves { ok, sid?, skipped?, code?, error? } so one failed send (Twilio outage, 21610
+// "unsubscribed recipient", a bad number) can't take the process down.
+// Before every send: SMS_ENABLED=1 and recorded written permission (src/smsPermission.js), the persisted opt-out list
+// (store.optOuts), the production placeholder-owner guard, and the
+// caps on caller-facing texts: per shop (OUTBOUND_SHOP_MAX_PER_HOUR/DAY, see SHOP_CAPS) and platform-wide OUTBOUND_MAX_PER_HOUR (default 200) and OUTBOUND_MAX_PER_DAY (default 500, rolling
+// 24h window); 0 = off; owner alerts don't count. The daily cap bounds a slow SMS-pumping drip that stays under the
+// hourly cap (200/h would otherwise allow 4,800/day). 500/day is ~10x a busy single-location shop's real volume
+// (~20-40 missed calls/day x a few texts each) while capping worst-case spend at roughly $4-5/day in US SMS fees.
+// Logs: stdout gets metadata only (masked number, kind, length, result), never the body. data/sms.log is the local
+// demo "outbox" and keeps bodies outside production (the demo scripts read it); in production it is metadata only
+// unless SMS_LOG_BODIES=1. Phone numbers are masked in production unless LOG_FULL_PHONES=1.
 const fs = require('fs');
 const path = require('path');
-const consent = require('./consent');
-let pendingSends = 0;
+const store = require('./store');
+const { maskPhone, isProduction, PLACEHOLDER_PHONE, num, on } = require('./security');
+const shopContext = require('./shopContext');
+const env = require('./config').env;
+const { shopName } = require('./consent');
+const smsPermission = require('./smsPermission');
+const { TWILIO_ACCOUNT_SID: sid, TWILIO_AUTH_TOKEN: tok } = process.env;
+let client = sid && tok ? require('twilio')(sid, tok) : null;
+let injectedClient = false;
+const OPTED_OUT_CODES = new Set([21610]); // Twilio: "Attempt to send to unsubscribed recipient"
 
-function live() {
-  return !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN &&
-    consent.validPhone(process.env.TWILIO_PHONE_NUMBER));
+const CAPS = {
+  hour: { windowMs: 3600000, env: 'OUTBOUND_MAX_PER_HOUR', def: 200, lim: null, key: null, alerted: 0 },
+  day: { windowMs: 86400000, env: 'OUTBOUND_MAX_PER_DAY', def: 500, lim: null, key: null, alerted: 0 },
+};
+// Global daily cap for onboarding OTP texts. 0 = off. Counts in addition to the platform caps.
+const OTP_CAP = { windowMs: 86400000, env: 'OTP_MAX_PER_DAY', def: 200, lim: null, key: null, alerted: 0 };
+// Per-shop caps (each vendor, and the legacy single shop, separately): OUTBOUND_SHOP_MAX_PER_HOUR (default 100) and
+// OUTBOUND_SHOP_MAX_PER_DAY (default 300); 0 = off. A platform administrator can set a per-vendor limit (shop.smsCaps).
+// The platform-wide CAPS above stay on top as the total, so one busy or abused line cannot use up every shop's texts.
+const SHOP_CAPS = {
+  hour: { windowMs: 3600000, env: 'OUTBOUND_SHOP_MAX_PER_HOUR', def: 100 },
+  day: { windowMs: 86400000, env: 'OUTBOUND_SHOP_MAX_PER_DAY', def: 300 },
+};
+const capMax = (c) => num(process.env[c.env], c.def);
+function shopMax(per, shop) {
+  const own = shop && shop.smsCaps ? shop.smsCaps[per] : undefined;
+  return Number.isInteger(own) && own >= 0 ? own : num(process.env[SHOP_CAPS[per].env], SHOP_CAPS[per].def);
 }
-function businessName() {
-  const value = process.env.BUSINESS_NAME;
-  return typeof value === 'string' && value.trim().length > 0 && value.length <= 120 &&
-    !/[\x00-\x1f\x7f]/.test(value) ? value.trim() : null;
+// Counts live in the platform store (rateCaps) so a restart keeps the window. `alerted` stays in memory:
+// it only suppresses repeat warning texts, and it is not the cap itself.
+const shopAlerts = new Map();
+function capBucket(name) { return require('./security').rateBucket(name); }
+function capBlocked(name, key, windowMs, max) {
+  if (!(max > 0)) return 0;
+  return capBucket(name).blocked(key, windowMs, max);
 }
-function canSend(to, purpose = 'customer_service') {
-  if (process.env.SMS_ENABLED !== '1') return { allowed: false, reason: 'sms_disabled' };
-  const permission = consent.check(to, purpose);
-  if (!permission.allowed) return permission;
-  // Required in log-only mode too, so simulations have the same disclosures as live sends.
-  if (!businessName()) return { allowed: false, reason: 'business_name_required' };
-  return permission;
-}
-function providerBlocked(to) {
-  try { consent.revoke(to, { method: 'provider_21610', providerBlocked: true }); }
-  catch { /* Consent latches persistence failures closed; never expose provider error details. */ }
-  return { sent: false, reason: 'provider_blocked' };
-}
-async function deliverSms(to, body, options = {}) {
-  if (!options || typeof options !== 'object' || Array.isArray(options)) {
-    return { sent: false, reason: 'invalid_options' };
-  }
-  const { purpose = 'customer_service' } = options;
-  let permission = canSend(to, purpose);
-  if (!permission.allowed) return { sent: false, reason: permission.reason };
-  if (typeof body !== 'string' || !body.trim()) return { sent: false, reason: 'invalid_body' };
-  const config = consent.configuration();
-  const message = `${body}\n\n${businessName()}: Reply STOP to opt out or HELP for help. Message frequency varies. Message and data rates may apply.`;
-  if (live()) {
-    try {
-      // Lazy construction avoids even loading the provider SDK for denied sends.
-      const client = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-      // Recheck at the actual handoff, not when a reply was scheduled/generated.
-      permission = canSend(to, purpose);
-      if (!permission.allowed) return { sent: false, reason: permission.reason };
-      const current = consent.configuration();
-      if (!current || current.businessId !== config.businessId || current.sender !== config.sender || !live()) {
-        return { sent: false, reason: 'configuration_changed' };
-      }
-      const accepted = await client.messages.create({ to, from: config.sender, body: message });
-      if (accepted && (accepted.errorCode === 21610 || accepted.errorCode === '21610')) return providerBlocked(to);
-      if (!accepted || typeof accepted.sid !== 'string' || !accepted.sid || accepted.errorCode ||
-          ['failed', 'undelivered', 'canceled'].includes(accepted.status)) {
-        return { sent: false, reason: 'provider_failed' };
-      }
-      // Live message bodies and recipients never go to sms.log or stdout.
-      console.log('SMS accepted (live)');
-      return { sent: true, mode: 'live' };
-    } catch (error) {
-      if (error && (error.code === 21610 || error.code === '21610')) return providerBlocked(to);
-      return { sent: false, reason: 'provider_failed' };
+function capHit(name, key, windowMs) { capBucket(name).hit(key, windowMs); }
+// Returns null after counting the send against every active cap, or the blocking cap { scope, per, max, entry }.
+function capCheck(shop) {
+  const id = shop ? shop.id : 'legacy';
+  const own = ['hour', 'day'].map((per) => ({ per, max: shopMax(per, shop) })).filter((x) => x.max > 0);
+  const platform = Object.entries(CAPS).filter(([, c]) => capMax(c) > 0);
+  for (const x of own) {
+    if (capBlocked(`sms-shop-${x.per}`, id, SHOP_CAPS[x.per].windowMs, x.max)) {
+      return { scope: 'shop', per: x.per, max: x.max, alertKey: `shop:${id}:${x.per}`, windowMs: SHOP_CAPS[x.per].windowMs };
     }
   }
-  // An incomplete credential pair is a configuration error, not a successful simulation.
-  if (process.env.TWILIO_ACCOUNT_SID || process.env.TWILIO_AUTH_TOKEN) {
-    return { sent: false, reason: 'provider_not_configured' };
+  for (const [per, c] of platform) {
+    if (capBlocked(`sms-platform-${per}`, 'all', c.windowMs, capMax(c))) {
+      return { scope: 'platform', per, max: capMax(c), alertKey: `platform:${per}`, windowMs: c.windowMs };
+    }
   }
-  permission = canSend(to, purpose);
-  if (!permission.allowed) return { sent: false, reason: permission.reason };
-  try {
-    const directory = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, '..', 'data');
-    fs.appendFileSync(path.join(directory, 'sms.log'),
-      `[${new Date().toISOString()}] SMS (${purpose}) -> ${to}: ${message}\n`, { encoding: 'utf8', mode: 0o600 });
-  } catch {
-    return { sent: false, reason: 'log_failed' };
-  }
-  console.log('SMS simulated (log-only)');
-  return { sent: true, mode: 'log-only' };
+  for (const x of own) capHit(`sms-shop-${x.per}`, id, SHOP_CAPS[x.per].windowMs);
+  for (const [per, c] of platform) capHit(`sms-platform-${per}`, 'all', c.windowMs);
+  return null;
 }
-async function sendSms(to, body, options = {}) {
+let onCap = async () => {};
+// No caller-facing text without a real shop name (A2P: every message identifies the business). Blocked sends alert the
+// platform administrator (server.js sets the hook), at most once per shop per hour.
+let onNoName = async () => {};
+const setNoNameAlert = (fn) => { onNoName = fn || (async () => {}); };
+const noNameAlerted = new Map();
+const setCapAlert = (fn) => { onCap = fn || (async () => {}); };
+let warnedPlaceholder = false;
+
+function writeLog(logPath, to, body, kind, result) {
+  const ts = new Date().toISOString();
+  const meta = `[${ts}] SMS -> ${maskPhone(to)} (${kind}, ${String(body || '').length} chars): ${result}`;
+  console.log(meta);
+  const prod = isProduction();
+  const full = !prod || on(process.env.LOG_FULL_PHONES);
+  const bodies = !prod || on(process.env.SMS_LOG_BODIES);
+  const line = bodies ? `[${ts}] SMS -> ${to}: ${body}` : `[${ts}] SMS -> ${to} (${kind}, ${String(body || '').length} chars): ${result}`;
+  try { fs.appendFileSync(logPath, (full ? line : maskPhone(line)) + '\n', { mode: 0o600 }); } catch (e) { console.error('sms.log write failed:', e.message); }
+}
+
+// opts.kind -> permission purpose (src/smsPermission.js): 'caller' (default; customer_service; counts toward the
+//   hourly/daily caps) | 'owner' (owner/staff/platform alerts, billing/account; owner_alerts)
+//   | 'otp' (onboarding codes; owner_alerts; platform caps + OTP_MAX_PER_DAY, no shop-name or A2P hold).
+// Every application text needs SMS_ENABLED=1 and recorded written permission for its purpose in the current shop's
+// scope; nothing bypasses that gate (there is no force option), log-only simulations included.
+const PURPOSE = { caller: 'customer_service', owner: 'owner_alerts', otp: 'owner_alerts' };
+let pendingSends = 0;
+function gate(to, kind) {
+  if (process.env.SMS_ENABLED !== '1') return { allowed: false, reason: 'sms_disabled' };
+  return smsPermission.check(to, PURPOSE[kind]);
+}
+// Side-effect free: would a text of this kind to this number pass SMS_ENABLED and the permission check right now?
+const validKind = (kind) => typeof kind === 'string' && Object.hasOwn(PURPOSE, kind);
+const canSend = (to, kind = 'caller') => (validKind(kind) ? gate(to, kind) : { allowed: false, reason: 'invalid_kind' });
+async function deliver(to, body, opts) {
+  if (!opts || typeof opts !== 'object' || Array.isArray(opts)) return { ok: false, skipped: 'invalid_options' };
+  const kind = opts.kind === undefined ? 'caller' : opts.kind;
+  if (!validKind(kind)) return { ok: false, skipped: 'invalid_kind' };
+  try {
+    // Capture operation-local resources before awaiting the shared provider client.
+    const context = shopContext.current();
+    const actualStore = context ? context.store : store.root;
+    const from = env.TWILIO_PHONE_NUMBER;
+    const logPath = path.join(actualStore.dataDir(), 'sms.log');
+    if (context?.shop.status === 'suspended') return { ok: false, skipped: 'vendor_suspended' };
+    if (process.env.SMS_ENABLED !== '1') return { ok: false, skipped: 'sms_disabled' };
+    if (context && (!from || !/^\+[1-9]\d{7,14}$/.test(from))) return { ok: false, skipped: 'no_sender' };
+    if (!to) return { ok: false, skipped: 'no_recipient' };
+    if (to === PLACEHOLDER_PHONE && isProduction()) {
+      if (!warnedPlaceholder) { console.error(`[security] OWNER_PHONE is not set (placeholder ${PLACEHOLDER_PHONE}): owner alerts are NOT being sent. Set OWNER_PHONE.`); warnedPlaceholder = true; }
+      return { ok: false, skipped: 'placeholder_owner' };
+    }
+    if (typeof body !== 'string' || !body.trim()) return { ok: false, skipped: 'invalid_body' };
+    const permission = gate(to, kind);
+    if (!permission.allowed) { console.log(`[sms] skipped ${maskPhone(to)} (${kind}): ${permission.reason}`); return { ok: false, skipped: permission.reason }; }
+    if (kind === 'caller' && !shopName()) {
+      const id = context ? context.id : 'legacy';
+      console.error(`[sms] blocked caller text to ${maskPhone(to)}: the shop has no business name${context ? ` (vendor ${id.slice(0, 8)})` : ''}`);
+      if (Date.now() - (noNameAlerted.get(id) || 0) > 3600000) {
+        noNameAlerted.set(id, Date.now());
+        const info = { shopId: context ? context.id : null };
+        Promise.resolve().then(() => onNoName(info)).catch((e) => console.error('no-name alert failed:', e.message));
+      }
+      return { ok: false, skipped: 'no_shop_name' };
+    }
+    if (actualStore.isOptedOut(to)) { console.log(`[sms] skipped ${maskPhone(to)}: opted out`); return { ok: false, skipped: 'opted_out' }; }
+    if (kind === 'caller' && actualStore.isPaused && actualStore.isPaused(to)) { console.log(`[sms] skipped ${maskPhone(to)}: automated texts paused (possible opt-out)`); return { ok: false, skipped: 'paused' }; }
+    if (kind === 'caller' && !opts.allowHeld) {
+      const held = require('./onboardingStore');
+      if (held.callerTextsHeld()) {
+        held.queueHeld(to, body);
+        console.log(`[sms] held ${maskPhone(to)}: carrier registration is not approved yet`);
+        return { ok: false, skipped: 'a2p_held', held: true };
+      }
+    }
+    if (kind === 'otp') {
+      const otpMax = capMax(OTP_CAP);
+      if (otpMax > 0 && capBlocked('sms-otp', 'otp', OTP_CAP.windowMs, otpMax)) {
+        console.error(`[security] OTP daily cap reached (${otpMax}/day): not texting ${maskPhone(to)}`);
+        return { ok: false, skipped: 'otp_cap' };
+      }
+      const platform = Object.entries(CAPS).filter(([, c]) => capMax(c) > 0);
+      for (const [per, c] of platform) {
+        if (capBlocked(`sms-platform-${per}`, 'all', c.windowMs, capMax(c))) {
+          console.error(`[security] outbound SMS platform cap reached (${capMax(c)}/${per}): not texting OTP to ${maskPhone(to)}`);
+          return { ok: false, skipped: per === 'day' ? 'cap_day' : 'cap' };
+        }
+      }
+      for (const [per, c] of platform) capHit(`sms-platform-${per}`, 'all', c.windowMs);
+      if (otpMax > 0) capHit('sms-otp', 'otp', OTP_CAP.windowMs);
+    }
+    if (kind === 'caller') {
+      const blocked = capCheck(context ? context.shop : null);
+      if (blocked) {
+        const { scope, per, max, alertKey } = blocked;
+        console.error(`[security] outbound SMS ${scope} cap reached (${max}/${per}${context ? `, vendor ${context.id.slice(0, 8)}` : ''}): not texting ${maskPhone(to)}`);
+        if (Date.now() - (shopAlerts.get(alertKey) || 0) > blocked.windowMs) {
+          shopAlerts.set(alertKey, Date.now());
+          const info = { scope, per, max, shopId: context ? context.id : null, shopName: context ? context.shop.name : null };
+          Promise.resolve().then(() => onCap(info)).catch((e) => console.error('cap alert failed:', e.message));
+        }
+        return { ok: false, skipped: `${scope === 'shop' ? 'shop_' : ''}${per === 'day' ? 'cap_day' : 'cap'}` };
+      }
+    }
+    // Re-check at the actual handoff (nothing above awaits, but keep the gate next to the provider call).
+    const handoff = gate(to, kind);
+    if (!handoff.allowed) return { ok: false, skipped: handoff.reason };
+    if (!client || (!from && !injectedClient)) { writeLog(logPath, to, body, kind, 'log-only'); return { ok: true, logOnly: true }; }
+    try {
+      const m = await client.messages.create({ to, from, body });
+      const code = Number(m && m.errorCode) || null;
+      if (code || !m || ['failed', 'undelivered', 'canceled'].includes(m.status)) {
+        writeLog(logPath, to, body, kind, `FAILED ${code || ''}`.trim());
+        if (OPTED_OUT_CODES.has(code)) await providerBlocked(to, code);
+        return { ok: false, code, error: 'provider_failed', ...(OPTED_OUT_CODES.has(code) ? { skipped: 'provider_blocked' } : {}) };
+      }
+      writeLog(logPath, to, body, kind, `sent ${m && m.sid ? m.sid : ''}`.trim());
+      return { ok: true, sid: m && m.sid };
+    } catch (e) {
+      const code = Number(e && e.code) || null;
+      writeLog(logPath, to, body, kind, `FAILED ${code || ''} ${e && e.message ? e.message : e}`.trim());
+      if (OPTED_OUT_CODES.has(code)) await providerBlocked(to, code);
+      return { ok: false, code, error: e && e.message, ...(OPTED_OUT_CODES.has(code) ? { skipped: 'provider_blocked' } : {}) };
+    }
+  } catch (e) { // never throw to callers
+    console.error('sendSms error:', e && e.message);
+    return { ok: false, error: e && e.message };
+  }
+}
+// Twilio 21610: the recipient is blocked at the provider. Revoke every purpose and record the provider block.
+async function providerBlocked(to, code) {
+  try { await smsPermission.revoke(to, { method: `twilio_${code}`, providerBlocked: true }); }
+  catch (e) { console.error(`[sms] provider opt-out for ${maskPhone(to)} not fully persisted: ${e && e.message}`); }
+}
+async function sendSms(to, body, opts = {}) {
   pendingSends++;
-  try { return await deliverSms(to, body, options); }
+  try { return await deliver(to, body, opts); }
   finally { pendingSends--; }
 }
-// HTTP clients can disconnect before the provider answers. Such work must prevent a clean exit.
-function hasPendingSends() { return pendingSends > 0; }
-module.exports = { sendSms, canSend, hasPendingSends, get live() { return live(); } };
+// Provider work outlives a disconnected HTTP client; graceful shutdown must not call such a session clean.
+const hasPendingSends = () => pendingSends > 0;
+// Tests inject a fake Twilio client (never hits the network).
+const setClient = (c) => { client = c; injectedClient = !!c; };
+const resetCap = () => {
+  shopAlerts.clear(); noNameAlerted.clear();
+  for (const name of ['sms-platform-hour', 'sms-platform-day', 'sms-otp', 'sms-shop-hour', 'sms-shop-day']) {
+    try { require('./security').rateBucket(name).clear(); } catch { /* store not ready */ }
+  }
+};
+module.exports = { sendSms, canSend, hasPendingSends, live: !!client, setClient, setCapAlert, setNoNameAlert, resetCap, shopMax, OPTED_OUT_CODES, PURPOSE };

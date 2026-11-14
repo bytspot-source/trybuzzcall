@@ -1,5 +1,4 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<!-- TODO(legal): Entity is TryBuzzCall LLC (Georgia, owned by Bytspot Inc.); confirm filed name and its own EIN match Terms, Privacy, A2P 10DLC brand and Stripe before launch. -->
 <title>How Text Consent Works | BuzzCall | TryBuzzCall</title>
 <meta name="description" content="Written permission for BuzzCall customer-service texts and separate owner alerts, plus STOP and HELP information.">
 <link rel="stylesheet" href="styles.css"></head><body>
@@ -7,10 +6,10 @@
 <nav><a href="privacy.html">Privacy</a><a href="terms.html">Terms</a><a href="refunds.html">Refunds</a><a href="sms-consent.html">SMS Consent</a></nav></div></header>
 <main class="doc"><div class="wrap">
 <h1>How text consent works</h1>
-<p class="meta">Last updated Oct 22, 2026</p>
+<p class="meta">Last updated Nov 14, 2026</p>
 <p class="review-note">Note: this document is a plain-English draft and is pending review by legal counsel. It is not legal advice.</p>
 
-<p><b>BuzzCall Missed-Call Text-Back</b> is operated by TryBuzzCall for Home Services businesses (plumbing and HVAC) and Braiders. This page describes the program's conservative recorded-permission requirements. It is not a compliance certification or evidence of carrier approval.</p>
+<p><b>BuzzCall Missed-Call Text-Back</b> is operated by TryBuzzCall for local service businesses, such as Home Services businesses (plumbing, HVAC and other home-service companies), Braiders, and beauty pros. Texts are sent on behalf of the business, which is the sender. This page describes the program's conservative recorded-permission requirements, what people receive, and how to opt out. It is not a compliance certification or evidence of carrier approval.</p>
 
 <h2>Opt-in: written permission before application texts</h2>
 <p><b>A missed call is not SMS consent.</b> SMS is off by default. Missed calls, inbound messages, START, payments, waitlist signup, and merely providing a phone number do not create an SMS permission grant. We do not use purchased lists or send marketing messages, and we do not send an unsolicited text to ask for initial opt-in.</p>
@@ -18,9 +17,12 @@
 <div class="step"><b>1. Review the specific business's disclosure.</b><br>Before texting begins, the business identifies itself, its sending number, the nonmarketing message purpose, variable frequency, possible message and data rates, and STOP/HELP instructions. Consent is not a condition of purchase; you may call the business instead.</div>
 <div class="step"><b>2. Give written permission outside the automated text flow.</b><br>The business collects an affirmative written opt-in, such as a reviewed written or electronic form. It retains the actual evidence securely. Reading this page, calling, or paying is not an opt-in.</div>
 <div class="step"><b>3. Record permission for that business, sender, and purpose.</b><br>An authenticated operator records the consent time, disclosure version, and a non-secret reference to the evidence. Customer-service permission (<code>customer_service</code>) and owner-alert permission (<code>owner_alerts</code>) are separate. Permission is not transferred to another business or sender.</div>
-<div class="step"><b>4. Text only while permission remains active.</b><br>Automatic text-back is only for an already permissioned recipient. Every application SMS, including booking/deposit confirmations and owner/billing alerts, passes the permission check. Voice fallback advises you to call again and does not claim that a text was sent.</div>
+<div class="step"><b>4. Text only while permission remains active.</b><br>Automatic text-back is only for an already permissioned recipient. Every application SMS, including booking/deposit confirmations, owner/billing alerts, and SMS sign-in codes, passes the permission check. The first message names the business and includes STOP and HELP instructions; a text is never sent without the business's name.</div>
 </div>
-<p>Twilio's policy permits a response scoped to an incoming text, not general recurring messages. BuzzCall deliberately uses a stricter recorded-written-permission requirement and does not automatically grant permission from an incoming text. Owners and staff must separately give written permission for lead, booking, and account alerts; supplying a setup number is not enough.</p>
+<h3>What happens when a call is missed</h3>
+<p>There is no "press 1" offer on the phone. If you already gave the business written permission and texting is enabled, you get a text from the business's number to continue by text. If not, you hear a short message asking you to call again later, and you are not texted. The phone message never claims that a text was sent when none was.</p>
+<p>Twilio's policy permits a response scoped to an incoming text, not general recurring messages. BuzzCall deliberately uses a stricter recorded-written-permission requirement and does not automatically grant permission from an incoming text. Owners and staff must separately give written permission for lead, booking, and account alerts and SMS sign-in codes; supplying a setup number is not enough.</p>
+<p>Each business also has its own public texting page at <code>/s/[shop]/sms</code> with its name, its BuzzCall number, how its written opt-in is collected outside of text messages, and sample messages.</p>
 
 <h2>Sample messages</h2>
 <p><small>Illustrative only, after a recorded <code>customer_service</code> grant and sender/campaign review. [Shop name], times, and names are placeholders, not an approved sender or guaranteed delivery. Home Services and Braiders use their own service wording and deposit settings. Any live deposit link must use the reviewed payment flow.</small></p>
@@ -36,6 +38,10 @@
 </div>
 
 <h3>HELP, STOP, and starting again</h3>
+<div class="phone"><div class="lbl">Caller's phone (permissioned recipient)</div>
+<div class="bubble in">HELP</div>
+<div class="bubble out">[Shop name] missed-call text-back via BuzzCall. For help call (470) 482-8377 or email hello@trybuzzcall.com. Msg frequency varies. Msg &amp; data rates may apply. Reply STOP to opt out.</div>
+</div>
 <p><b>Reply STOP to opt out, HELP for help.</b> Standard opt-out keywords include STOP, STOPALL, UNSUBSCRIBE, CANCEL, END, QUIT, REVOKE, and OPTOUT. Natural-language requests such as "please stop texting me" also revoke all purposes locally, including future confirmations and owner/billing alerts for that recipient. Contact the business or <a href="mailto:hello@trybuzzcall.com">hello@trybuzzcall.com</a> for help without relying on SMS delivery.</p>
 <p>Twilio may send a provider-managed opt-out or help response. Its standard filtering is different from optional Advanced Opt-Out, which is disabled by default. If Twilio supplies an <code>OptOutType</code> START, STOP, or HELP notification, it has already replied; BuzzCall does not send a duplicate application reply.</p>
 <p><b>START only clears a delivery block; it never restores grants.</b> After an opt-out, fresh written evidence and a fresh operator-recorded grant are required. If Twilio has blocked delivery, you must first explicitly opt back in with the provider; that step alone does not restore BuzzCall permission. We do not promise an application confirmation after revocation, because application texts remain blocked.</p>

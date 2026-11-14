@@ -1,6 +1,6 @@
 # SMS Operations — recorded permission
 
-Applies to **Home Services** (plumbing/HVAC) and **Braiders** on `feat/recorded-sms-permission`. **A missed call is not SMS consent.** This is the conservative implementation contract for the branch, not a compliance certification, a legal opinion, or evidence of carrier approval. Verify runtime behavior and the deployed version against this contract before enabling a pilot. Public legal pages remain drafts pending counsel review.
+Applies to **Home Services** (plumbing/HVAC), **Braiders**, and the other trades on `feat/recorded-sms-permission`, for both the legacy single-business line and every vendor shop. **A missed call is not SMS consent.** This is the conservative implementation contract for the branch, not a compliance certification, a legal opinion, or evidence of carrier approval. Verify runtime behavior and the deployed version against this contract before enabling a pilot. Public legal pages remain drafts pending counsel review.
 
 No deployment, carrier submission, number purchase, fee, or live message is authorized by this document. Those actions need separate approval. Use the [Pilot Checklist](PILOT_CHECKLIST.md) to record the review.
 
@@ -9,21 +9,22 @@ No deployment, carrier submission, number purchase, fee, or live message is auth
 | Area | Application contract | External/operator responsibility |
 | --- | --- | --- |
 | Permission | Record scoped grants/revocations and check every application SMS | Collect actual written evidence, review disclosure and scope, retain proof securely |
-| Business/sender | Bind permission to configured business, sender, and purpose | Verify the actual customer's identity, approved brand/campaign, and number association |
+| Business/sender | Bind permission to business id, sender, phone, and purpose | Verify the actual customer's identity, approved brand/campaign, and number association |
 | Opt-out | Revoke all purposes locally; START cannot restore grants | Review Twilio filtering and recipient-initiated provider opt-back-in when blocked |
 | Webhooks | Validate live signatures, account, and routing | Configure the exact public HTTPS URL, account, sender, and callback routes |
-| Persistence | Store permission and suppression state under `DATA_DIR` | Protect files/logs/backups, attach persistent storage, test restarts, review retention |
+| Persistence | Store permission and suppression state in the shop's durable store (Postgres via `DATABASE_URL` in production) | Provision Postgres, protect the database/logs/backups, test restarts, review retention |
+| Carrier registration | Generate an A2P campaign description and per-shop page `/s/<slug>/sms` that describe written opt-in collected outside SMS | Update any already published campaign message flow or opt-in proof that describes press-1 with the carrier before enabling SMS |
 
 The application does not certify the truth or legal sufficiency of an evidence reference, perform carrier approval, or replace legal review. A passing test, successful payment, health response, or enabled flag proves none of those external prerequisites.
 
 ## 2. Start with SMS disabled and identities fixed
 
-- `SMS_ENABLED` defaults off. Leave it off during setup and external review. Every application SMS uses the central permission gate, including log-only sends, customer confirmations, deposit/payment messages, owner alerts, billing reminders, HELP replies, and inactive-service messages. Provider-generated filtering/help responses are outside that application gate.
-- Set `SMS_CONSENT_BUSINESS_ID` to a stable per-business slug, not a display name that changes during rebranding. Set `TWILIO_PHONE_NUMBER` to the reviewed E.164 sending number. Keep the actual identity and routing consistent with registration.
-- `customer_service` covers the disclosed nonmarketing client service/booking exchange. `owner_alerts` separately covers disclosed lead, booking, and billing/account alerts to owners or staff. One scope does not authorize the other, even for the same phone number.
-- Business and sender are taken from configuration, not request-supplied overrides. Do not copy grants between businesses or senders; changed identities require reviewed new permission.
-- Missed calls, inbound messages, START, payment, waitlist signup, and merely providing a number do not create grants. Never solicit initial opt-in by unsolicited SMS. Twilio's allowance for an exchange scoped to an incoming text is not recurring permission; BuzzCall deliberately requires recorded written permission even for that exchange.
-- Voice fallback advises the caller to call again and never claims a text was sent. Automatic text-back is only for an already permissioned recipient. Consent is not a condition of purchase; a telephone alternative remains available.
+- `SMS_ENABLED` defaults off. Leave it off during setup and external review. Every application SMS uses the central permission gate, including log-only sends, customer confirmations, deposit/payment messages, owner alerts, billing reminders, SMS sign-in/OTP codes, HELP replies, and inactive-service messages. Provider-generated filtering/help responses are outside that application gate. `/health` includes `smsEnabled`.
+- Records are scoped to business id + sender + phone + purpose. For the legacy single-business line, set `SMS_CONSENT_BUSINESS_ID` to a stable slug, not a display name that changes during rebranding, and set `TWILIO_PHONE_NUMBER` to the reviewed E.164 sending number. A vendor shop uses its shop id as the business id and its assigned shop number as the sender. Keep the actual identity and routing consistent with registration.
+- `customer_service` covers the disclosed nonmarketing client service/booking exchange. `owner_alerts` separately covers disclosed lead, booking, and billing/account alerts to owners, staff, or the platform admin, plus SMS sign-in/OTP codes (including the self-serve onboarding code). One scope does not authorize the other, even for the same phone number. An owner without an `owner_alerts` grant receives no alerts or OTP codes.
+- Business and sender are taken from configuration (or the selected vendor shop), not request-supplied overrides. Do not copy grants between businesses or senders; changed identities require reviewed new permission.
+- Missed calls, inbound messages, START, payment, waitlist signup, and merely providing a number do not create grants. Neither do press-1 key presses, `/setup`, onboarding, or signup forms. Never solicit initial opt-in by unsolicited SMS. Twilio's allowance for an exchange scoped to an incoming text is not recurring permission; BuzzCall deliberately requires recorded written permission even for that exchange.
+- There is no press-1 voice offer. A missed caller with written permission on file (and SMS enabled) gets an automatic text-back; otherwise the caller hears a polite message to call again later, is not texted, and voice never claims a text was sent. The previous press-1 voice script is not consent, and old press-1 records do not authorize sends. Consent is not a condition of purchase; a telephone alternative remains available.
 
 ## 3. Collect evidence before recording a grant
 
@@ -37,18 +38,19 @@ The application does not certify the truth or legal sufficiency of an evidence r
 
 Both `GET /api/consent` (read) and `POST /api/consent` (write) require **Basic admin authentication**. Use an approved authenticated client over HTTPS for live administration; keep credentials out of command lines, URLs, documentation, and logs. This endpoint is not a public opt-in form.
 
-Writes accept **JSON only** with `Content-Type: application/json`. If an `Origin` header is present, it must be **same-origin**; cross-origin writes must be rejected. Omitting Origin never bypasses authentication. The operator supplies the following fields for a grant, not a business or sender override:
+Writes accept **JSON only** with `Content-Type: application/json`. If an `Origin` header is present, it must be **same-origin**; cross-origin writes must be rejected. Omitting Origin never bypasses authentication. Without `shopId`, both endpoints act on the legacy single-business line. For a vendor shop, pass the optional `shopId` as a query parameter on `GET /api/consent` or as a body field on `POST /api/consent`; that shop's id and assigned number become the business and sender. The operator supplies the following fields for a grant, not a business or sender override:
 
 | Field | Meaning |
 | --- | --- |
 | `action` | `grant` |
+| `shopId` | Optional vendor shop id; omit for the legacy line |
 | `phone` | Recipient phone number in E.164 form |
 | `purpose` | Exactly `customer_service` or `owner_alerts` |
 | `consentedAt` | Actual consent time as an ISO timestamp |
 | `disclosureVersion` | Identifier for the disclosure the recipient accepted |
 | `evidenceRef` | Non-secret internal reference to secured actual written evidence; not a URL or token |
 
-To revoke, send a JSON write with `action` set to `revoke` and `phone` set to the recipient. Revocation applies to all purposes for that recipient in the configured business/sender context. Do not edit stored JSON directly to erase suppression history. The API records permission; it does not bypass `SMS_ENABLED`, provider blocks, or sender registration.
+To revoke, send a JSON write with `action` set to `revoke` and `phone` set to the recipient (plus `shopId` for a vendor shop). Revocation applies to all purposes for that recipient in that business/sender context. A grant is visible in `GET /api/consent` only after a successful durable write; a failed write is reported as an error, not as a grant. Do not edit stored JSON or database rows directly to erase suppression history. The API records permission; it does not bypass `SMS_ENABLED`, provider blocks, or sender registration.
 
 ## 4. Opt-out, HELP, and fresh permission
 
@@ -70,19 +72,19 @@ Existing `scripts/demo_simulate.sh`, `scripts/demo_braiders.sh`, and `scripts/de
 
 ## 6. Protected persistence and retention
 
-Use a dedicated, access-restricted `DATA_DIR` for each business deployment. Permission records include recipient, business, sender, purpose, consent/recording timestamps, source, disclosure version, and evidence reference; revocation timestamps/source and delivery-block state must remain available to prevent unwanted sends. Keep the actual written evidence separately secured, and protect application logs and backups as well as the JSON store.
+Permission records are stored in each shop's durable store: Postgres via `DATABASE_URL` in production (required), or `DATA_DIR` files only for a local/file backend. Permission records include recipient, business, sender, purpose, consent/recording timestamps, source, disclosure version, and evidence reference; revocation timestamps/source and delivery-block state must remain available to prevent unwanted sends. Keep the actual written evidence separately secured, and protect the database, application logs, and backups as well as the JSON store.
 
-On Render, configure `DATA_DIR` on a **persistent disk**, not ephemeral application storage. Restart with the same directory and verify both active grants and revoked/blocked recipients retain their state. Repeat this check before the approved live pilot; an in-memory test alone is insufficient. If permission or suppression history is missing after a restore, keep SMS disabled and reconcile records before any send.
+Render free/ephemeral disk is not durable, and a `DATA_DIR` on a Render **persistent disk** is not a substitute for Postgres in production. Grants are visible only after a successful durable write. Restart against the same database and verify both active grants and revoked/blocked recipients retain their state. Repeat this check before the approved live pilot; an in-memory test alone is insufficient. If permission or suppression history is missing after a restore, keep SMS disabled and reconcile records before any send.
 
 ### Crash and storage-error recovery
 
-Before accepting traffic, the process atomically persists `smsSessionClean=false`. A graceful SIGTERM/SIGINT shutdown drains requests and writes `smsSessionClean=true` only if permission persistence is healthy and no provider send remains pending. A disconnected HTTP client cannot hide pending provider work; that shutdown keeps the unclean marker and requires recovery. A forced exit, crash, or failed permission write leaves the marker unclean: the next process blocks all SMS and new grants until an operator completes recovery. Startup fails if the safety marker cannot be persisted. Run only one process per data directory; this JSON store has no multi-writer coordination.
+Before accepting traffic, the process atomically persists `smsSessionClean=false` in the durable store (Postgres in production). A graceful SIGTERM/SIGINT shutdown drains requests and writes `smsSessionClean=true` only if permission persistence is healthy and no provider send remains pending. A disconnected HTTP client cannot hide pending provider work; that shutdown keeps the unclean marker and requires recovery. A forced exit, crash, or failed permission write leaves the marker unclean: the next process blocks all SMS and new grants until an operator completes recovery. Startup fails if the safety marker cannot be persisted. Run only one process per data directory or database; this JSON store has no multi-writer coordination.
 
 Failed revocations remain suppressed in memory and can be retried (including the same MessageSid) after storage recovers. A duplicate retry persists the original suppression; it does not create a new grant. A crash before that retry can lose the unsaved event, so **never clear quarantine just to restart delivery**.
 
 1. Keep or set `SMS_ENABLED=0`. If needed, restart with SMS off; restarting alone does not clear quarantine.
-2. Review authenticated `GET /api/consent`, including `recoveryRequired` and `persistenceFailed`. Reconcile any missing opt-outs against provider delivery records and retained external evidence. Record missing suppressions through authenticated `action: revoke`; this remains available in quarantine. Keep evidence private.
-3. Only after reconciliation, submit an authenticated, JSON-only, same-origin `POST /api/consent` with `action` set to `recover` and `acknowledgment` set to `suppression_history_reviewed`. Recovery is rejected while `SMS_ENABLED=1`. This persists retained suppressions and removes the recovery block; it grants no permission and clears no recipient-level revocation or provider block.
+2. Review authenticated `GET /api/consent` (with `shopId` for each vendor shop), including `recoveryRequired` and `persistenceFailed`. Reconcile any missing opt-outs against provider delivery records and retained external evidence. Record missing suppressions through authenticated `action: revoke`; this remains available in quarantine. Keep evidence private.
+3. Only after reconciliation, submit an authenticated, JSON-only, same-origin `POST /api/consent` with `action` set to `recover` and `acknowledgment` set to `suppression_history_reviewed` (plus `shopId` for a vendor shop). Recovery is rejected while `SMS_ENABLED=1`. This persists retained suppressions and removes the recovery block; it grants no permission and clears no recipient-level revocation or provider block.
 4. Verify denied recipients and restart persistence again before separately reviewed re-enablement. Do not edit or delete `smsSessionClean` or suppression records to bypass recovery. If shutdown cannot write the clean marker, recovery remains required after restart.
 
 There is **no automatic retention-based deletion schedule** in the current implementation. Operators must review retention with the business and counsel and manually handle authorized deletion requests across records, logs, backups, and external evidence. Do not promise deletion within a fixed number of days or erase opt-out state in a way that resumes messages. Persistent storage is not, by itself, a security or encryption guarantee.
@@ -91,7 +93,7 @@ There is **no automatic retention-based deletion schedule** in the current imple
 
 Run `node --test tests/consent-docs.test.js` for static documentation checks and the source regression suite for enforcement. These are separate: document tests do not validate signatures, actual evidence, carrier status, or legal sufficiency. In isolated local tests verify default-off blocking, separate scopes, no automatic grants, invalid consent writes, every outbound SMS path, STOP variations, no duplicate provider replies, fresh-grant requirements, and restart persistence.
 
-Complete the [Pilot Checklist](PILOT_CHECKLIST.md). Enable `SMS_ENABLED` only after reviewed approval of the actual customer profile/brand, verified campaign and sender association, written evidence/disclosures, routing/signatures, protected persistence, and passing runtime checks. Separately authorize any live deployment or smoke messages; use only already permissioned recipients. Record reviewer/date and non-secret references to external approval and test results. Do not label this review as compliance certification.
+Complete the [Pilot Checklist](PILOT_CHECKLIST.md). Before enabling, the operator must update any already published A2P campaign message flow and opt-in proof that describes press-1 so it describes written opt-in collected outside SMS; this branch does not contact the carrier or change a live campaign. Enable `SMS_ENABLED` only after reviewed approval of the actual customer profile/brand, verified campaign and sender association, written evidence/disclosures, routing/signatures, protected persistence, and passing runtime checks. Separately authorize any live deployment or smoke messages; use only already permissioned recipients. Record reviewer/date and non-secret references to external approval and test results. Do not label this review as compliance certification.
 
 ## Official sources and external review
 
