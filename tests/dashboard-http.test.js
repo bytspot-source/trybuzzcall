@@ -416,6 +416,38 @@ test('dashboard and payment safety over isolated local HTTP', { timeout: 60000 }
     assert.deepEqual(f.snapshot(), before);
   });
 
+  await t.test('short booking link shows tappable Pay and Directions buttons, read-only, never the raw checkout URL in text', async () => {
+    f.reset();
+    const payUrl = 'https://checkout.stripe.com/c/pay/cs_test_fixture?x=1&y=2';
+    const b = f.seedBooking({ payUrl }), route = `/b/${b.id}`, before = f.snapshot();
+    let response = await f.request(route);
+    assert.equal(response.headers['cache-control'], 'no-store');
+    let body = html(response);
+    assert.ok(attributes(body, 'href').includes('https://checkout.stripe.com/c/pay/cs_test_fixture?x=1&amp;y=2'), 'Pay button links to the checkout');
+    assert.match(body, /<a class="button button-primary button-full"[^>]*>.*Pay \$49 deposit/);
+    assert.match(body, /<meta name="referrer" content="no-referrer">/);
+    assert.match(body, /<meta property="og:title" content="Pay \$49 deposit · Fixture shop">/);
+    assert.doesNotMatch(body, /Get directions|Fixture customer|\+14705550123/, 'No address set; never the customer name or phone');
+    process.env.BUSINESS_ADDRESS = '12 Peach St <b>, Atlanta, GA';
+    body = html(await f.request(route));
+    assert.ok(attributes(body, 'href').includes('https://www.google.com/maps/search/?api=1&amp;query=12%20Peach%20St%20%3Cb%3E%2C%20Atlanta%2C%20GA'));
+    assert.match(body, /Get directions/);
+    assert.doesNotMatch(body, /<b>,/, 'Address is escaped');
+    delete process.env.BUSINESS_ADDRESS;
+    assert.deepEqual(f.snapshot(), before, 'Opening the short link is read-only');
+    for (const extra of [{ payUrl: 'javascript:alert(1)' }, { payUrl, holdExpiresAt: new Date(Date.now() - 60000).toISOString() }, { payUrl, status: 'confirmed', paid: true }]) {
+      const other = f.seedBooking(extra);
+      body = html(await f.request(`/b/${other.id}`));
+      assert.doesNotMatch(body, /Pay \$49 deposit<\/span>|javascript:/, JSON.stringify(extra));
+      if (extra.paid) assert.match(body, /You&#39;re booked|You're booked/);
+    }
+    assert.equal((await f.request('/b/unknown-fixture')).status, 404);
+    assert.equal((await f.request('/b/bad%20id')).status, 404);
+    response = await f.post(route);
+    assert.equal(response.status, 404, 'The short link has no POST action');
+    assert.equal(f.store.findBooking(b.id).paid, false, 'The short link never records a payment');
+  });
+
   await t.test('a recorded payment with a lost or unresolved slot never claims the booking is confirmed', async () => {
     for (const status of ['paid_conflict', 'expired']) {
       f.reset();

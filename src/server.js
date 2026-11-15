@@ -738,8 +738,8 @@ async function onBooked(lead, b) {
   }
   if (b.status === 'held') {
     const c = booking.cfg();
-    msg = b.payUrl ? agent.texts.held(lead.name, b, c.holdMin, b.payUrl) : agent.texts.heldNoLink(lead.name, b);
-  } else msg = agent.texts.bookedNoDeposit(lead.name, b);
+    msg = b.payUrl ? agent.texts.held(lead.name, b, c.holdMin, bookingPage(b)) : agent.texts.heldNoLink(lead.name, b);
+  } else msg = agent.texts.bookedNoDeposit(lead.name, b) + directionsNote(b);
   await sendLeadMessage(lead, msg);
   outcomes.booked(lead, b);
   const ask = outcomes.askEmail(lead); // null unless OUTCOMES_EMAIL_STEP=1
@@ -753,6 +753,9 @@ async function onBooked(lead, b) {
 // Vendor's signed one-tap "I'm here" link (src/disputes.js), appended to the booking buzz once the booking is confirmed
 // (no deposit: at booking; deposit: in the BOOKED + PAID buzz).
 const checkinNote = (b) => ` Tap when you arrive: ${disputes.checkinLink(BASE, b)}`;
+// Short customer link (GET /b/:id): a page with Pay deposit / Get directions buttons instead of a long raw URL.
+const bookingPage = (b) => `${BASE}/b/${encodeURIComponent(b.id)}`;
+const directionsNote = (b) => (String(env.BUSINESS_ADDRESS || '').trim() ? `\nDirections: ${bookingPage(b)}` : '');
 
 const money = (n) => (Number.isInteger(n) ? String(n) : Number(n).toFixed(2));
 const feeNote = (b) => b.lead_fee_status === 'waived' ? 'lead fee waived (pilot)' : `lead fee $${money(b.lead_fee || 0)}${b.lead_fee_status === 'collected' ? ' (auto-deducted)' : ''}`;
@@ -772,7 +775,7 @@ async function onPaid(id, payment = {}) {
     await owner(b.leadId, `⚠️ PAID BUT SLOT LOST $${b.amount}: ${b.name || 'Caller (name not given)'}, ${b.need}, ${b.slotLabel} (hold expired). Reschedule/refund (lead fee on hold for review). Tap to call: tel:${b.phone}`);
     return b;
   }
-  await sendLeadMessage(lead, agent.texts.paid(b));
+  await sendLeadMessage(lead, agent.texts.paid(b) + directionsNote(b));
   if (b.service) { // appointment trades: 'BOOKED + PAID: <name>, <service>, <time>, $50 deposit'
     await owner(b.leadId, `BOOKED + PAID: ${b.name || 'Caller (name not given)'}, ${b.service}, ${b.slotLabel}, $${money(b.amount)} deposit${b.details ? `. Notes: ${b.details}` : ''}. tel:${b.phone}${refundNote(b)}${checkinNote(b)}`);
   } else await owner(b.leadId, `${tag(lead)}BOOKED + PAID $${b.amount}: ${b.name || 'Caller (name not given)'}, ${b.need}, ${b.slotLabel}, ${feeNote(b)}, tel:${b.phone}${refundNote(b)}${checkinNote(b)}`);
@@ -802,6 +805,15 @@ app.post('/pay/mock/:id', mockPaymentOnly, sameOrigin, routeBooking, async (req,
   await onPaid(b.id);
   res.redirect(303, `/pay/mock/${encodeURIComponent(b.id)}`);
 });
+// Read-only; links out to the existing checkout. Throttled per IP so booking ids can't be scanned.
+const bookingLinkLimit = sec.rateLimit({ windowMs: 10 * 60000, max: sec.num(process.env.BOOKING_LINK_RATE_MAX, 60) });
+app.get('/b/:id', bookingLinkLimit, (req, res, next) => (/^[A-Za-z0-9_-]{1,80}$/.test(req.params.id) ? next() : res.status(404).send('booking not found')), routeBooking, (req, res) => {
+  const b = store.findBooking(req.params.id);
+  if (!b) return res.status(404).send('booking not found');
+  res.set('Cache-Control', 'no-store').type('html').send(paymentPages.bookingLink({ booking: b, businessName: env.BUSINESS_NAME || 'Your business',
+    address: env.BUSINESS_ADDRESS, mode: env.STRIPE_SECRET_KEY ? (/^sk_test_/.test(env.STRIPE_SECRET_KEY) ? 'test' : 'live') : 'mock' }));
+});
+app.locals.resetBookingLinkLimit = () => bookingLinkLimit.reset();
 // Redirect parameters never prove payment. These read-only pages wait for provider/webhook confirmation.
 for (const [route, kind] of [['/payment/return', 'deposit'], ['/billing/return', 'subscription']]) {
   app.get(route, (req, res) => res.type('html').send(paymentPages.returnPage({ kind,

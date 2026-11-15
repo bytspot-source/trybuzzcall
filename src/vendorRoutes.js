@@ -18,7 +18,7 @@ const root = vendors.root;
 const json = req => req.is('application/json') || /application\/json/i.test(req.get('accept') || '');
 const bool = value => /^(1|true|yes|on)$/i.test(String(value || ''));
 const plan = value => ['monthly','annual'].includes(value) ? value : null;
-const editable = ['BUSINESS_NAME','BUSINESS_TYPE','BUSINESS_TRADE_LABEL','BUSINESS_FLOW','BUSINESS_CITY','BUSINESS_TZ','BUSINESS_DAYS','BUSINESS_HOURS','SERVICES','BOOKING_ENABLED',
+const editable = ['BUSINESS_NAME','BUSINESS_TYPE','BUSINESS_TRADE_LABEL','BUSINESS_FLOW','BUSINESS_CITY','BUSINESS_ADDRESS','BUSINESS_TZ','BUSINESS_DAYS','BUSINESS_HOURS','SERVICES','BOOKING_ENABLED',
   'DEPOSIT_ENABLED','DEPOSIT_AMOUNT','SLOT_MINUTES','HOLD_MINUTES','BOOKING_LEAD_MINUTES','BOOKING_LINK'];
 const SERVICE_RE = /^.{1,100}:\d+$/;
 const validServices = value => !value.split(',').some(s => !SERVICE_RE.test(s.trim()) || +s.split(':').at(-1) < 15 || +s.split(':').at(-1) > 720);
@@ -60,6 +60,7 @@ function validateSettings(body) {
     if (!['string','number'].includes(typeof body[key])) throw vendors.error('Invalid setting value.');
     const value = String(body[key]).trim();
     if (value.length > (key === 'SERVICES' ? 2000 : 300)) throw vendors.error('A setting is too long.');
+    if (key === 'BUSINESS_ADDRESS' && (value.length > 200 || /[\u0000-\u001F\u007F<>]/.test(value))) throw vendors.error('Enter a street address of at most 200 characters, or leave it blank.');
     values[key] = value;
   }
   if (!values.BUSINESS_NAME || values.BUSINESS_NAME.length > 80) throw vendors.error('Enter a business name of at most 80 characters.');
@@ -181,10 +182,23 @@ function register(app, { requireAdmin, BASE, sameOrigin }) {
   const disputeView = (req, extra = {}) => {
     const d = deposits.find(req.params.id);
     if (!d || !d.dispute) throw vendors.error('Claim not found.',404);
-    return { deposit:d, booking:store.findBooking(d.bookingId), shopName:config.env.BUSINESS_NAME || req.vendor.name, action:`/vendor/disputes/${encodeURIComponent(d.id)}/proof`,
+    const base = `/vendor/disputes/${encodeURIComponent(d.id)}`;
+    return { deposit:d, booking:store.findBooking(d.bookingId), shopName:config.env.BUSINESS_NAME || req.vendor.name, action:`${base}/proof`,
+      evidenceHref:`${base}/evidence.txt`, photoUrl:(pid) => `${base}/photo/${encodeURIComponent(pid)}`,
       open:disputes.isOpen(d), mode:connect.mode() === 'mock' && !sec.demoAllowed() ? 'unconfigured' : connect.mode(), backHref:'/vendor#payments', ...extra };
   };
   app.get('/vendor/disputes/:id', requireVendor, safe(async (req,res) => show(res,require('./disputePages').proofPage(disputeView(req)))));
+  // The shop's own evidence summary and uploaded photos, for its Stripe dispute response.
+  app.get('/vendor/disputes/:id/evidence.txt', requireVendor, safe(async (req,res) => {
+    const view = disputeView(req);
+    const text = disputes.evidenceText(view.deposit, view.booking, { shop:view.shopName, vendor:true });
+    res.set('Content-Disposition', `attachment; filename="evidence-${String(view.deposit.bookingId).replace(/[^A-Za-z0-9_-]/g, '')}.txt"`).type('text/plain; charset=utf-8').send(text);
+  }));
+  app.get('/vendor/disputes/:id/photo/:pid', requireVendor, safe(async (req,res) => {
+    const p = disputes.getPhoto(disputeView(req).deposit, req.params.pid);
+    if (!p) throw vendors.error('Photo not found.',404);
+    res.set({ 'Content-Disposition':'inline', 'Content-Security-Policy':"default-src 'none'; sandbox" }).type(p.type).send(Buffer.from(p.data, 'base64'));
+  }));
   app.post('/vendor/disputes/:id/proof', requireVendor, safe(async (req,res) => {
     const view = disputeView(req);
     const r = app.locals.submitProof(view.deposit, req.body, 'portal');
