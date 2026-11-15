@@ -146,6 +146,110 @@ test('postgres unreachable at boot: falls back to file storage and keeps working
   assert.equal(again.getOverride().values.BUSINESS_NAME, 'Fallback');
 });
 
+// ---------- corrupt local files are never overwritten; writes are atomic ----------
+const corruptCopies = (dir, base = 'db.json') => fs.readdirSync(dir).filter((f) => f.startsWith(`${base}.corrupt-`));
+test('corrupt db.json: refuses to load, original left as is, one 0600 copy kept, opt-outs not erased', async (t) => {
+  quiet(t);
+  const dir = tmp(t), file = path.join(dir, 'db.json');
+  const good = createStore({ dir });
+  await good.optOut('+14045550123', 'keyword');
+  const truncated = fs.readFileSync(file, 'utf8').slice(0, 40);
+  fs.writeFileSync(file, truncated);
+  for (let i = 0; i < 2; i++) assert.throws(() => createStore({ dir }), (e) => e.code === 'STORE_CORRUPT' && /invalid JSON/.test(e.message));
+  assert.equal(fs.readFileSync(file, 'utf8'), truncated, 'never overwritten');
+  const copies = corruptCopies(dir);
+  assert.equal(copies.length, 1, 'one copy per distinct content, even after repeated attempts');
+  assert.equal(fs.readFileSync(path.join(dir, copies[0]), 'utf8'), truncated);
+  assert.equal(fs.statSync(path.join(dir, copies[0])).mode & 0o777, 0o600);
+  // Wrong shapes are refused too (they would drop data on the next save).
+  for (const [doc, why] of [['[]', /not a JSON object/], ['null', /not a JSON object/], ['{"optOuts":[]}', /optOuts is not an object/], ['{"leads":{}}', /leads is not a list/]]) {
+    fs.writeFileSync(file, doc);
+    assert.throws(() => createStore({ dir }), (e) => e.code === 'STORE_CORRUPT' && why.test(e.message), doc);
+    assert.equal(fs.readFileSync(file, 'utf8'), doc);
+  }
+  assert.equal(corruptCopies(dir).length, 5);
+  // Repairing the file (here: restoring the good data) brings the opt-out back.
+  fs.writeFileSync(file, JSON.stringify({ optOuts: { '+14045550123': { at: 'x', source: 'keyword' } } }));
+  assert.equal(createStore({ dir }).isOptedOut('+14045550123'), true);
+});
+
+test('corrupt or unreadable config.json and an unreadable db.json are refused too; a missing file is a fresh start', (t) => {
+  quiet(t);
+  const dir = tmp(t);
+  assert.deepEqual(createStore({ dir }).db.leads, [], 'ENOENT: fresh start');
+  fs.writeFileSync(path.join(dir, 'config.json'), '{"values":');
+  assert.throws(() => createStore({ dir }), (e) => e.code === 'STORE_CORRUPT' && /config\.json/.test(e.message));
+  assert.equal(fs.readFileSync(path.join(dir, 'config.json'), 'utf8'), '{"values":');
+  assert.equal(corruptCopies(dir, 'config.json').length, 1);
+  const dir2 = tmp(t);
+  fs.mkdirSync(path.join(dir2, 'db.json')); // EISDIR: unreadable
+  assert.throws(() => createStore({ dir: dir2 }), (e) => e.code === 'STORE_CORRUPT' && /EISDIR/.test(e.message));
+  assert.ok(fs.statSync(path.join(dir2, 'db.json')).isDirectory());
+});
+
+test('atomic file writes: 0600, no temp files left, a failed rename keeps the old file and removes only its own temp', (t) => {
+  const dir = tmp(t), file = path.join(dir, 'db.json');
+  const s = createStore({ dir });
+  for (let i = 0; i < 5; i++) s.createLead(`+1555000${i}`);
+  s.setOverride({ values: { BUSINESS_NAME: 'Atomic Shop' } });
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['config.json', 'db.json']);
+  for (const f of ['config.json', 'db.json']) assert.equal(fs.statSync(path.join(dir, f)).mode & 0o777, 0o600);
+  const before = fs.readFileSync(file, 'utf8');
+  const foreign = path.join(dir, '.db.json.other.tmp');
+  fs.writeFileSync(foreign, 'not ours');
+  t.mock.method(fs, 'renameSync', () => { throw Object.assign(new Error('simulated rename failure'), { code: 'EIO' }); });
+  assert.throws(() => s.createLead('+15550099'), /simulated rename failure/);
+  t.mock.restoreAll();
+  assert.equal(fs.readFileSync(file, 'utf8'), before, 'the previous file is intact');
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['.db.json.other.tmp', 'config.json', 'db.json'], 'only our own temp file was removed');
+  s.save();
+  assert.equal(createStore({ dir }).db.leads.length, 6);
+});
+
+test('postgres: an invalid stored document is refused and never overwritten', async (t) => {
+  quiet(t);
+  for (const [key, value] of [['db', '[]'], ['db', 'null'], ['db', '{"optOuts":"x"}'], ['config', '"oops"']]) {
+    const { mem, poolFactory } = memPg();
+    mem.public.none(`CREATE TABLE buzz_kv (key text PRIMARY KEY, value jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`);
+    mem.public.none(`INSERT INTO buzz_kv (key, value) VALUES ('${key}', '${value}'::jsonb)`);
+    const dir = tmp(t);
+    fs.writeFileSync(path.join(dir, 'db.json'), JSON.stringify({ leads: [{ id: 'local', phone: '+15550300', messages: [] }] }));
+    const s = createStore({ dir, databaseUrl: 'postgres://u:p@db.example/x', poolFactory });
+    await assert.rejects(s.init(), (e) => e.code === 'STORE_CORRUPT' && new RegExp(`Postgres document ${key}`).test(e.message), `${key}=${value}`);
+    const rows = mem.public.many('SELECT key, value FROM buzz_kv');
+    assert.deepEqual(rows.map((r) => [r.key, JSON.stringify(r.value)]), [[key, JSON.stringify(JSON.parse(value))]], 'nothing written');
+    assert.notEqual(s.backend(), 'postgres');
+  }
+});
+
+test('postgres: a corrupt local file is ignored when Postgres has the data, refused when it would be needed', async (t) => {
+  quiet(t);
+  const corruptDir = (t2) => { const d = tmp(t2); fs.writeFileSync(path.join(d, 'db.json'), '{"optOuts":'); return d; };
+  const url = 'postgres://u:p@db.example/x';
+  // Postgres has the db document: boot normally, leave the local file alone.
+  const { poolFactory } = memPg();
+  const seed = createStore({ dir: tmp(t), databaseUrl: url, poolFactory });
+  await seed.init(); await seed.optOut('+14045550124', 'keyword'); await seed.close();
+  const dir = corruptDir(t);
+  const s = createStore({ dir, databaseUrl: url, poolFactory });
+  assert.equal((await s.init()).backend, 'postgres');
+  assert.equal(s.isOptedOut('+14045550124'), true);
+  assert.equal(fs.readFileSync(path.join(dir, 'db.json'), 'utf8'), '{"optOuts":');
+  await s.close();
+  // Empty database: seeding from an unreadable file is refused (nothing written).
+  const fresh = memPg();
+  const s2 = createStore({ dir: corruptDir(t), databaseUrl: url, poolFactory: fresh.poolFactory });
+  await assert.rejects(s2.init(), (e) => e.code === 'STORE_CORRUPT');
+  assert.equal(fresh.mem.public.many('SELECT key FROM buzz_kv').length, 0);
+  // Postgres unreachable: no fallback onto the corrupt file, and it is not overwritten.
+  const d3 = corruptDir(t);
+  const bad = () => ({ query: () => Promise.reject(new Error('ECONNREFUSED')), end: async () => {}, on() {} });
+  const s3 = createStore({ dir: d3, databaseUrl: url, poolFactory: bad });
+  await assert.rejects(s3.init(), (e) => e.code === 'STORE_CORRUPT');
+  assert.throws(() => s3.save(), (e) => e.code === 'STORE_CORRUPT', 'file writes are refused');
+  assert.equal(fs.readFileSync(path.join(d3, 'db.json'), 'utf8'), '{"optOuts":');
+});
+
 const freePort = () => new Promise((resolve, reject) => {
   const s = net.createServer(); s.once('error', reject);
   s.listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); });
@@ -175,6 +279,25 @@ test('server boots on file storage with no DATABASE_URL, and with an unreachable
       for (const p of ['/', '/setup']) assert.equal((await fetch(`http://127.0.0.1:${port}${p}`)).status, 200);
     });
   }
+});
+
+test('server refuses to start on a corrupt db.json and leaves it in place', { timeout: 30000 }, async (t) => {
+  const dir = tmp(t), file = path.join(dir, 'db.json');
+  fs.writeFileSync(file, '{"optOuts":{"+14045550125":');
+  const port = await freePort();
+  const child = spawn(process.execPath, [path.resolve(__dirname, '../src/server.js')], {
+    cwd: dir, stdio: ['ignore', 'pipe', 'pipe'],
+    env: { PATH: process.env.PATH, NODE_ENV: 'test', PORT: String(port), DATA_DIR: dir, DATABASE_URL: '', DOTENV_CONFIG_PATH: '/nonexistent' },
+  });
+  t.after(() => child.kill('SIGKILL'));
+  let out = ''; child.stdout.on('data', (c) => { out += c; }); child.stderr.on('data', (c) => { out += c; });
+  const code = await Promise.race([new Promise((r) => child.on('exit', r)), new Promise((r) => setTimeout(() => r('timeout'), 15000))]);
+  assert.notEqual(code, 0, out);
+  assert.notEqual(code, 'timeout', out);
+  assert.doesNotMatch(out, /missedcall-buzz on :/);
+  assert.match(out, /db\.json is unreadable or invalid \(invalid JSON\); refusing to load or overwrite it/);
+  assert.equal(fs.readFileSync(file, 'utf8'), '{"optOuts":{"+14045550125":');
+  assert.equal(corruptCopies(dir).length, 1);
 });
 
 test('real Postgres round trip (only when TEST_DATABASE_URL is set)', { skip: !process.env.TEST_DATABASE_URL }, async (t) => {

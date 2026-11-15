@@ -860,6 +860,25 @@ test('vendor isolation and verified provider routing over local HTTP', { timeout
     await settle(() => f.store.root.db.alerts.some(x => /across all lines/.test(x.body)), 'Platform-wide cap alerts the platform');
   });
 
+  await t.test('a corrupt vendor store is isolated: no text, data kept, platform alerted once, other vendors unaffected', async t => {
+    const f = await fixture(t), { a, b } = f;
+    await forwardAll(f);
+    await f.vendors.close(); // cold reload: vendor stores are read again on next use
+    const file = path.join(f.store.root.dataDir(), 'shops', a.id, 'db.json'), bad = '{"optOuts":';
+    fs.writeFileSync(file, bad);
+    const sent = f.messages.length, caller = '+14705550141';
+    await missedCall(f, a.number, caller);
+    status(await f.signed('/twilio/sms', { From: caller, To: a.number, Body: 'Hi I need a plumber' }), 200);
+    assert.equal(f.messages.slice(sent).filter(m => m.from === a.number || m.to === caller).length, 0, 'The line with corrupt data sends nothing');
+    check(fs.readFileSync(file, 'utf8') === bad, 'Corrupt vendor data is not overwritten');
+    const repairAlerts = () => f.store.root.db.alerts.filter(x => /has unreadable or invalid saved data/.test(x.body));
+    await settle(() => repairAlerts().length === 1, 'Platform admin is alerted');
+    check(repairAlerts()[0].body.includes(a.name), 'Alert names the vendor');
+    await missedCall(f, b.number, '+14705550142');
+    assert.equal(f.messages.filter(m => m.from === b.number && m.to === '+14705550142').length, 1, 'Other vendor keeps texting');
+    assert.equal(repairAlerts().length, 1, 'Alerted once per shop');
+  });
+
   await t.test('M1: vendor sign-in limits are per account and per IP, so a few IPs cannot lock everyone out', async t => {
     const f = await fixture(t), { a, b } = f;
     process.env.CLIENT_IP_HEADER = 'x-test-ip';

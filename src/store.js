@@ -6,8 +6,11 @@
 // so the missed-call line keeps answering (data is then only as durable as the file). The server adds an owner alert,
 // and REQUIRE_POSTGRES=1 makes that fatal instead (see src/server.js initStorage).
 // Opt-outs/opt-ins are written through immediately (no debounce): optOut()/optIn() return the flush promise.
+// A missing db.json/config.json is a fresh start; an unreadable or invalid one (or stored Postgres document) is never
+// overwritten: the store refuses to load (error code STORE_CORRUPT, see readJson). File writes are atomic (temp + rename).
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const MAX_SETUPS = 500;
 const MAX_WAITLIST = Number(process.env.MAX_WAITLIST) > 0 ? Number(process.env.MAX_WAITLIST) : 5000; // public form: bounded
@@ -80,6 +83,55 @@ function ensureDir(dir, name, warnings) {
 }
 const FILE_MODE = { mode: 0o600 };
 
+// ---- Corrupt data never overwritten ----
+// A missing file (ENOENT) is a fresh start. Anything else (unreadable, invalid JSON, wrong shape) throws STORE_CORRUPT:
+// the original stays in place untouched and a copy is kept as <name>.corrupt-<timestamp>-<id> (0600, one per distinct
+// content). The platform store then fails startup (Render keeps the previous deploy); a vendor store refuses that shop
+// only (src/vendors.js). Keeping the original means a restart can't silently start empty and forget opt-outs.
+const DB_LISTS = ['leads', 'alerts', 'waitlist', 'bookings', 'setups', 'deposits'];
+const DB_OBJECTS = ['optOuts', 'billing', 'vendorDebt', 'depositsMeta'];
+const plainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+function invalidDb(doc) {
+  if (!plainObject(doc)) return 'not a JSON object';
+  for (const k of DB_LISTS) if (Object.hasOwn(doc, k) && !Array.isArray(doc[k])) return `${k} is not a list`;
+  for (const k of DB_OBJECTS) if (Object.hasOwn(doc, k) && !plainObject(doc[k])) return `${k} is not an object`;
+  return null;
+}
+const invalidConfig = (doc) => (plainObject(doc) ? null : 'not a JSON object');
+const corruptError = (what, why) => Object.assign(new Error(`${what} is unreadable or invalid (${why}); refusing to load or overwrite it`), { code: 'STORE_CORRUPT', status: 503 });
+function keepCorrupt(file, why) {
+  const err = corruptError(file, why);
+  let kept = 'no copy (file not readable)';
+  try {
+    const bytes = fs.readFileSync(file), dir = path.dirname(file), prefix = `${path.basename(file)}.corrupt-`;
+    const same = fs.readdirSync(dir).find((f) => { try { return f.startsWith(prefix) && fs.readFileSync(path.join(dir, f)).equals(bytes); } catch { return false; } });
+    const copy = path.join(dir, same || `${prefix}${new Date().toISOString().replace(/[:.]/g, '-')}-${crypto.randomBytes(3).toString('hex')}`);
+    if (!same) fs.writeFileSync(copy, bytes, { mode: 0o600, flag: 'wx' });
+    kept = `copy at ${copy}`;
+  } catch (e) { if (e.code !== 'EISDIR' && e.code !== 'EACCES') kept = `no copy (${e.code || e.message})`; }
+  console.error(`[store] !!!!!!!!!! ERROR: ${err.message}. Original left in place, ${kept}. Repair or restore it, then restart.`);
+  return err;
+}
+// Parsed document, or undefined when the file does not exist.
+function readJson(file, invalid) {
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return undefined; throw keepCorrupt(file, e.code || 'read error'); }
+  let doc;
+  try { doc = JSON.parse(text); } catch { throw keepCorrupt(file, 'invalid JSON'); }
+  const why = invalid(doc);
+  if (why) throw keepCorrupt(file, why);
+  return doc;
+}
+// Atomic replace: temp file in the same folder (0600), then rename. On failure only that temp file is removed.
+function writeAtomic(file, text) {
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`);
+  const fd = fs.openSync(tmp, 'wx', 0o600);
+  try {
+    try { fs.writeFileSync(fd, text); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.renameSync(tmp, file);
+  } catch (e) { try { fs.rmSync(tmp, { force: true }); } catch {} throw e; }
+}
+
 // Outcomes log (src/outcomes.js): any opt-out (STOP, a plain-language revocation, Twilio 21610) excludes every outcome
 // record of that caller from the de-identified training export, and marks their latest record's stage opted_out.
 // Kept even after a later START (we don't re-include data the caller asked us to stop using). Never throws.
@@ -127,11 +179,16 @@ function createStore(opts = {}) {
 
   const db = defaultDb();
   let override = {};
+  // Without DATABASE_URL a corrupt file is fatal right here. With it the files are only a first-boot seed and the
+  // fallback, so init() refuses only when a corrupt file would be needed; it is never written either way.
+  const fileProblems = {};
   const readFileState = () => {
-    try { Object.assign(db, JSON.parse(fs.readFileSync(FILE, 'utf8'))); } catch {}
-    try { override = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) || {}; } catch {}
+    try { const d = readJson(FILE, invalidDb); if (d) Object.assign(db, d); } catch (e) { fileProblems.db = e; }
+    try { const c = readJson(CONFIG_FILE, invalidConfig); if (c) override = c; } catch (e) { fileProblems.config = e; }
   };
   readFileState();
+  const fileProblem = () => fileProblems.db || fileProblems.config;
+  if (!databaseUrl && fileProblem()) throw fileProblem();
 
   let backend = 'file';      // 'file' | 'postgres'
   let pool = null;
@@ -191,9 +248,13 @@ function createStore(opts = {}) {
   }
   const clearSpill = () => { try { fs.rmSync(SPILL, { force: true }); } catch {} };
 
-  const writeFiles = () => fs.writeFileSync(FILE, JSON.stringify(db, null, 2), FILE_MODE);
+  const writeFiles = () => {
+    if (fileProblems.db) throw fileProblems.db;
+    writeAtomic(FILE, JSON.stringify(db, null, 2));
+  };
   const writeConfigFile = () => {
-    if (Object.keys(override).length) fs.writeFileSync(CONFIG_FILE, JSON.stringify(override, null, 2), FILE_MODE);
+    if (fileProblems.config) throw fileProblems.config;
+    if (Object.keys(override).length) writeAtomic(CONFIG_FILE, JSON.stringify(override, null, 2));
     else fs.rmSync(CONFIG_FILE, { force: true });
   };
 
@@ -253,7 +314,8 @@ function createStore(opts = {}) {
     if (backend === 'postgres') { dbDirty = true; schedule(); } else writeFiles();
   };
 
-  // Load state from Postgres (if configured). Always resolves; may be called again to retry after a failed attempt.
+  // Load state from Postgres (if configured). Resolves (falling back to files when Postgres is unreachable) unless the
+  // data is corrupt (STORE_CORRUPT: invalid stored document, or a corrupt file that would be needed). May be retried.
   async function init() {
     if (!databaseUrl) { if (mergeSpill()) writeFiles(); clearSpill(); return { backend }; } // file backend: db.json now has them
     if (backend === 'postgres') return { backend };
@@ -264,26 +326,36 @@ function createStore(opts = {}) {
         ? await pool.query(`SELECT key, value FROM ${TABLE} WHERE key IN ('db', 'config')`)
         : await pool.query(`SELECT key, value FROM ${TABLE} WHERE key IN ($1, $2)`, [dbKey, configKey]);
       const byKey = Object.fromEntries(rows.map((r) => [r.key === dbKey ? 'db' : 'config', r.value]));
-      if (byKey.db) {
+      const has = (k) => Object.hasOwn(byKey, k);
+      for (const [k, invalid, key] of [['db', invalidDb, dbKey], ['config', invalidConfig, configKey]]) {
+        const why = has(k) && invalid(byKey[k]);
+        if (why) throw corruptError(`Postgres document ${key}`, why);
+        if (!has(k) && fileProblems[k]) throw fileProblems[k]; // would seed the database from an unreadable file
+      }
+      if (has('db')) {
         for (const k of Object.keys(db)) delete db[k];
         Object.assign(db, defaultDb(), byKey.db);
       }
-      if (byKey.config) override = byKey.config || {};
+      if (has('config')) override = byKey.config;
       backend = 'postgres';
       // First run on this database: seed it from whatever the file backend had (migration), so nothing is lost.
-      if (!byKey.db) dbDirty = true;
-      if (!byKey.config && Object.keys(override).length) cfgDirty = true;
+      if (!has('db')) dbDirty = true;
+      if (!has('config') && Object.keys(override).length) cfgDirty = true;
+      if (fileProblem()) console.error('[store] the unreadable local file above is ignored: Postgres has the data (it is left in place, not overwritten)');
       const merged = mergeSpill();
       if (merged) { dbDirty = true; console.error(`[store] merged ${merged} opt-out record(s) from ${path.basename(SPILL)} (saved during a postgres outage)`); }
       await flush();
-      console.log(`[store] postgres backend ready (${byKey.db ? 'loaded existing data' : 'seeded new database'})`);
+      console.log(`[store] postgres backend ready (${has('db') ? 'loaded existing data' : 'seeded new database'})`);
     } catch (e) {
-      console.error('[store] DATABASE_URL set but postgres unavailable (the server decides: fail closed in production, file storage otherwise):', redact(e.message));
+      const corrupt = e.code === 'STORE_CORRUPT' ? e : fileProblem(); // corrupt data, or a fallback onto a corrupt file
+      if (corrupt) console.error(`[store] !!!!!!!!!! ERROR: ${redact(corrupt.message)}`);
+      else console.error('[store] DATABASE_URL set but postgres unavailable (the server decides: fail closed in production, file storage otherwise):', redact(e.message));
       backend = 'file';
-      lastError = e.message;
-      if (mergeSpill()) writeFiles(); // honour spilled opt-outs; the spill file is kept until Postgres has them
+      lastError = (corrupt || e).message;
+      if (!corrupt && mergeSpill()) writeFiles(); // honour spilled opt-outs; the spill file is kept until Postgres has them
       try { await pool?.end(); } catch {}
       pool = null;
+      if (corrupt) throw corrupt;
     }
     return { backend };
   }

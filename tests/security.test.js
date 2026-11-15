@@ -142,6 +142,26 @@ test('twilio: with a token, unsigned posts are 403; SKIP_TWILIO_VALIDATION only 
   assert.equal((await form('/twilio/voice/consent', press, { 'x-twilio-signature': sig2 })).status, 200);
 });
 
+test('twilio: a validly signed request for another account (AccountSid != TWILIO_ACCOUNT_SID) is 403; match or no AccountSid passes', async (t) => {
+  quiet(t);
+  const token = 'account-check-fixture-token-' + 'q'.repeat(8), account = `AC${'1'.repeat(32)}`, other = `AC${'2'.repeat(32)}`;
+  withEnv(t, { TWILIO_AUTH_TOKEN: token, TWILIO_ACCOUNT_SID: account, NODE_ENV: 'test', DEMO_MODE: undefined, SKIP_TWILIO_VALIDATION: undefined });
+  const signed = (p, params) => form(p, params, { 'x-twilio-signature': twilio.getExpectedTwilioSignature(token, `https://shop.example${p}`, params) });
+  const status = { From: '+14707770020', DialCallStatus: 'no-answer' };
+  assert.equal((await signed('/twilio/voice/status', { ...status, AccountSid: other })).status, 403);
+  assert.equal((await signed('/twilio/voice/status', { ...status, AccountSid: account })).status, 200);
+  assert.equal((await signed('/twilio/voice/status', status)).status, 200, 'no AccountSid: unchanged');
+  const stop = { From: '+14707770021', Body: 'STOP', AccountSid: other };
+  assert.equal((await signed('/twilio/sms', stop)).status, 403);
+  assert.equal(store.isOptedOut('+14707770021'), false, 'rejected before any state change');
+  assert.equal((await signed('/twilio/sms', { ...stop, AccountSid: account })).status, 200);
+  assert.equal(store.isOptedOut('+14707770021'), true);
+  process.env.SKIP_TWILIO_VALIDATION = '1';
+  assert.equal((await form('/twilio/voice/status', { ...status, AccountSid: other })).status, 200, 'SKIP_TWILIO_VALIDATION (non-production) unchanged');
+  delete process.env.SKIP_TWILIO_VALIDATION; delete process.env.TWILIO_ACCOUNT_SID;
+  assert.equal((await signed('/twilio/voice/status', { ...status, AccountSid: other })).status, 200, 'no TWILIO_ACCOUNT_SID configured: unchanged');
+});
+
 // ---------- (4) per-number text-back throttle ----------
 test('text-back: one first text per number per cooldown; other numbers unaffected; 0 disables', async (t) => {
   quiet(t);

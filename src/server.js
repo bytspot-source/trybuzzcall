@@ -290,13 +290,17 @@ const twiml = (res, xml) => res.type('text/xml').send(`<?xml version="1.0" encod
 // (SKIP_TWILIO_VALIDATION=1 is honored outside production only). Without a token there is nothing to validate
 // against: allowed for local/demo use (SMS are then log-only), refused in production unless DEMO_MODE=1.
 // Signatures are computed over PUBLIC_BASE_URL + path, so PUBLIC_BASE_URL must be exactly the URL Twilio calls.
+// A validly signed request whose AccountSid differs from TWILIO_ACCOUNT_SID (when both are present) is refused too.
 if (sec.isProduction() && env.SKIP_TWILIO_VALIDATION === '1') console.error('[security] SKIP_TWILIO_VALIDATION=1 is ignored in production.');
 function verifyTwilio(req, res, next) {
   const token = process.env.TWILIO_AUTH_TOKEN;
   if (!token) return sec.demoAllowed() ? next() : res.status(503).send('twilio webhook not configured');
   if (env.SKIP_TWILIO_VALIDATION === '1' && !sec.isProduction()) return next();
   const ok = require('twilio').validateRequest(token, req.headers['x-twilio-signature'] || '', BASE + req.originalUrl, req.body || {});
-  return ok ? next() : res.status(403).send('bad signature');
+  if (!ok) return res.status(403).send('bad signature');
+  const account = env.TWILIO_ACCOUNT_SID, claimed = (req.body || {}).AccountSid;
+  if (account && claimed !== undefined && claimed !== account) return res.status(403).send('wrong account');
+  next();
 }
 
 const missedSayNoText = () => (agent.isAppointments() && agent.solo() ? 'Sorry I missed you. Please try again later.' : 'Sorry we missed you. Please try again later.');
@@ -559,16 +563,40 @@ app.post('/twilio/voice/consent', verifyTwilio, routeTwilio(true), async (req, r
 // Record an opt-out durably before answering (Postgres write-through), but never hold the webhook past 5s.
 const optOutNow = (phone, source) => Promise.race([store.optOut(phone, source), sec.sleep(5000)]);
 
+// Twilio may retry an inbound SMS webhook. Each valid MessageSid is handled once per shop store: the mark is saved
+// before any side effect, so a retry can't advance the conversation, text the caller or buzz the owner again.
+// Bounded: 48h and the newest 2000. A missing or malformed MessageSid is processed normally.
+const MESSAGE_SID = /^(SM|MM)[A-Za-z0-9]{32}$/;
+const SEEN_SMS_MS = 48 * 3600000, SEEN_SMS_MAX = 2000;
+function repeatDelivery(sid) {
+  if (typeof sid !== 'string' || !MESSAGE_SID.test(sid)) return false;
+  const seen = (store.db.inboundSids ||= {}), now = Date.now();
+  if (now - seen[sid] < SEEN_SMS_MS) return true;
+  for (const [k, at] of Object.entries(seen)) if (!(now - at < SEEN_SMS_MS)) delete seen[k];
+  seen[sid] = now;
+  const keys = Object.keys(seen);
+  if (keys.length > SEEN_SMS_MAX) for (const k of keys.sort((a, b) => seen[a] - seen[b]).slice(0, keys.length - SEEN_SMS_MAX)) delete seen[k];
+  store.save();
+  return false;
+}
+
 // 3) Caller SMS replies
 app.post('/twilio/sms', verifyTwilio, routeTwilio(), async (req, res) => {
   const from = req.body.From, body = String(req.body.Body || '');
   if (!sec.isNanp(from)) return twiml(res, ''); // never text non-US/CA or anonymous senders
-  const kw = optout.classify(body);
+  // OptOutType: Twilio Advanced Opt-Out matched a STOP/START/HELP keyword (its own list) and already replied. The
+  // opt-out/opt-in is recorded as usual, but the app sends no confirmation of its own, whatever KEYWORD_REPLIES says.
+  const provider = ['STOP', 'START', 'HELP'].includes(req.body.OptOutType) ? req.body.OptOutType : null;
+  const kw = provider ? { STOP: 'optout', START: 'optin', HELP: 'help' }[provider] : optout.classify(body);
+  if (repeatDelivery(req.body.MessageSid)) { // retry: an opt-out is still honoured (idempotent, silent), nothing else
+    if (kw === 'optout' || kw === 'revoke') await optOutNow(from, kw === 'optout' ? 'keyword' : 'message');
+    return twiml(res, '');
+  }
   const biz = consent.shopName(); // '' blocks every caller text in sms.js (and alerts the admin)
   // KEYWORD_REPLIES=twilio: Twilio Advanced Opt-Out sends the STOP/START confirmations, the app stays silent for exact
   // keywords (STOP, START, HELP). Default (app): the app sends the shop-named confirmations. With Twilio's own STOP handling on, Twilio
   // blocks the app's STOP confirmation (error 21610) and only Twilio's reply reaches the caller.
-  const appKeywordReplies = String(process.env.KEYWORD_REPLIES || 'app').toLowerCase() !== 'twilio';
+  const appKeywordReplies = !provider && String(process.env.KEYWORD_REPLIES || 'app').toLowerCase() !== 'twilio';
   if (kw === 'optout') { // exact Twilio keyword
     const already = store.isOptedOut(from); // confirm once, then silence (like every other opt-out)
     await optOutNow(from, 'keyword'); await owner(null, `BUZZ ${env.BUSINESS_NAME || ''}: ${from} replied ${body.trim().slice(0, 20)} and is opted out of texts.`);
@@ -586,7 +614,7 @@ app.post('/twilio/sms', verifyTwilio, routeTwilio(), async (req, res) => {
     }
     return twiml(res, '');
   }
-  if (kw === 'optin' && (store.isOptedOut(from) || optout.letters(body) !== 'YES')) {
+  if (kw === 'optin' && (provider || store.isOptedOut(from) || optout.letters(body) !== 'YES')) {
     await Promise.race([store.optIn(from), sec.sleep(5000)]); store.resumeBot(from);
     if (appKeywordReplies && biz) await sendSms(from, consent.startText(biz));
     return twiml(res, '');
@@ -684,6 +712,8 @@ async function platformAlert(msg, subject) {
   mail.adminAlert(subject, msg);
 }
 deposits.setAlert((msg, subject) => platformAlert(msg, subject));
+vendors.setStorageAlert(({ shopId, shopName }) => platformAlert(`BUZZ platform: ${String(shopName || 'Vendor').slice(0, 80)} (vendor ${shopId.slice(0, 8)}) has unreadable or invalid saved data, so its line is not texting callers or saving changes. The data was kept, not overwritten. Repair or restore it, then restart.`,
+  'BuzzCall: vendor data needs repair'));
 sms.setCapAlert(async ({ scope, per = 'hour', max, shopId, shopName } = {}) => {
   if (scope === 'shop' && shopId) {
     const who = `${String(shopName || 'Vendor').slice(0, 80)} (vendor ${shopId.slice(0, 8)})`;
@@ -1385,7 +1415,12 @@ async function initStorage({ retries, retryDelayMs = 3000 } = {}) {
   const pol = storagePolicy();
   const tries = pol.failClosed ? Math.max(1, retries ?? sec.num(process.env.REQUIRE_POSTGRES_RETRIES, 5)) : 1;
   for (let i = 1; ; i++) {
-    await store.init();
+    try { await store.init(); } catch (e) {
+      if (!e || e.code !== 'STORE_CORRUPT') throw e;
+      const message = `${e.message}; refusing to start (the data is left as is).`;
+      console.error(`[store] FATAL: ${message}`);
+      return { ok: false, fatal: true, message };
+    }
     if (store.backend() === 'postgres' || i >= tries || !store.status().configured) break;
     console.error(`[store] postgres not reachable (attempt ${i}/${tries}); retrying in ${Math.round(retryDelayMs / 1000)}s (fail-closed: ${pol.why})`);
     await sec.sleep(retryDelayMs);
