@@ -10,6 +10,11 @@ const scrypt = promisify(crypto.scrypt);
 const stores = new Map();
 const provisioning = new Set();
 let tenantPool = null;
+// Corrupt vendor data (STORE_CORRUPT, see src/store.js): only that shop's store refuses to load or save, so its line
+// gets the error path (empty TwiML: no text) and nothing is overwritten. Logged and alerted once per shop per process.
+let storageAlert = null;
+const corruptAlerted = new Set();
+const setStorageAlert = fn => { storageAlert = fn || null; };
 function poolFactory(url) {
   if (!tenantPool) {
     tenantPool = new (require('pg').Pool)(store.pgConfig(url));
@@ -41,7 +46,13 @@ async function scopedStore(shop) {
       await child.init(); healthy(child); return child;
     })();
     stores.set(shop.id, promise);
-    promise.catch(() => { if (stores.get(shop.id) === promise) stores.delete(shop.id); });
+    promise.catch(e => {
+      if (stores.get(shop.id) === promise) stores.delete(shop.id);
+      if (e?.code !== 'STORE_CORRUPT' || corruptAlerted.has(shop.id)) return;
+      corruptAlerted.add(shop.id);
+      console.error(`[vendors] Vendor ${shop.id.slice(0, 8)} data is unreadable or invalid: its store refuses to load until it is repaired (its line sends no texts).`);
+      if (storageAlert) Promise.resolve().then(() => storageAlert({ shopId: shop.id, shopName: shop.name })).catch(() => {});
+    });
   }
   const child = await stores.get(shop.id); healthy(child); return child;
 }
@@ -335,4 +346,4 @@ async function close({ strict = false } = {}) {
   if (strict && failed) throw error('Vendor storage could not be flushed.',503);
 }
 module.exports = { root, all, get, create, invite, activate, login, authenticate, logout, setCookie, setStatus, assignPhone, setSmsCaps,
-  run, scopedStore, publicShop, persist, flush, healthy, twilioShop, stripeShop, bookingShop, close, error, SESSION_MS };
+  run, scopedStore, publicShop, persist, flush, healthy, twilioShop, stripeShop, bookingShop, close, error, setStorageAlert, SESSION_MS };

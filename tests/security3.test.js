@@ -332,6 +332,92 @@ test('N5: job texts mid-conversation keep the conversation going', async (t) => 
   assert.equal(sentTo(p).length, 3, 'agent replied to both messages');
 });
 
+// ---------- Twilio retries (MessageSid) and Advanced Opt-Out (OptOutType) ----------
+let msgN = 0; const msgSid = () => `SM${String(++msgN).padStart(32, '0')}`;
+const ownerAbout = (p) => sentTo(OWNER).filter((l) => l.includes(p)).length;
+test('Twilio retry: a duplicate MessageSid is handled once (STOP confirmation, conversation reply, owner buzz)', async (t) => {
+  quiet(t);
+  const p = num(); await call(p);
+  const base = sentTo(p).length, ownerBase = ownerAbout(p);
+  const stop = { From: p, Body: 'STOP', MessageSid: msgSid() };
+  await form('/twilio/sms', stop); await form('/twilio/sms', stop);
+  assert.equal(store.isOptedOut(p), true);
+  assert.equal(sentTo(p).length, base + 1, 'one STOP confirmation');
+  assert.equal(ownerAbout(p), ownerBase + 1, 'one owner notice');
+  const q = num(); await call(q);
+  const lead = store.findOpenLead(q), qOwnerBase = ownerAbout(q);
+  for (const Body of ['Dana', 'leaking pipe under the sink', 'tomorrow after 4pm']) {
+    const msg = { From: q, Body, MessageSid: msgSid() };
+    const sent = sentTo(q).length, owner = ownerAbout(q), inbound = lead.messages.filter((m) => m.dir === 'in').length;
+    await form('/twilio/sms', msg);
+    const after = { sent: sentTo(q).length, owner: ownerAbout(q), step: lead.step };
+    assert.equal(after.sent, sent + 1, `${Body}: replied`);
+    await form('/twilio/sms', msg);
+    assert.deepEqual({ sent: sentTo(q).length, owner: ownerAbout(q), step: lead.step }, after, `${Body}: the retry changes nothing`);
+    assert.equal(lead.messages.filter((m) => m.dir === 'in').length, inbound + 1);
+  }
+  assert.equal(lead.status, 'done');
+  assert.equal(ownerAbout(q), qOwnerBase + 1, 'one completed-request buzz');
+});
+test('Twilio retry: an opt-out is still honoured (silently) when its MessageSid was already seen; missing/malformed SIDs are processed normally', async (t) => {
+  quiet(t);
+  const p = num(); await call(p);
+  const sid = msgSid(), base = sentTo(p).length, ownerBase = ownerAbout(p);
+  store.db.inboundSids[sid] = Date.now(); // first delivery recorded, then interrupted before the opt-out
+  await form('/twilio/sms', { From: p, Body: 'please stop texting me', MessageSid: sid });
+  assert.equal(store.isOptedOut(p), true);
+  assert.deepEqual([sentTo(p).length, ownerAbout(p)], [base, ownerBase], 'no second confirmation or owner notice');
+  for (const MessageSid of [undefined, 'SM123', `XX${'0'.repeat(32)}`, `SM${'0'.repeat(31)}!`]) {
+    const q = num(), fields = { From: q, Body: 'HELP', ...(MessageSid ? { MessageSid } : {}) };
+    await form('/twilio/sms', fields); await form('/twilio/sms', fields);
+    assert.equal(sentTo(q).length, 2, `${MessageSid}: both processed`);
+  }
+  assert.equal(Object.keys(store.db.inboundSids).some((k) => !/^(SM|MM)[A-Za-z0-9]{32}$/.test(k)), false);
+});
+test('Twilio retry: the MessageSid record is bounded (48h, newest 2000)', async (t) => {
+  quiet(t);
+  const now = Date.now(), seen = {};
+  seen[`SM${'a'.repeat(32)}`] = now - 49 * 3600000;
+  for (let i = 0; i < 2000; i++) seen[`SM${String(i).padStart(32, 'b')}`] = now - 3600000 + i;
+  store.db.inboundSids = seen;
+  const sid = `MM${'c'.repeat(32)}`;
+  await form('/twilio/sms', { From: num(), Body: 'HELP', MessageSid: sid });
+  const kept = store.db.inboundSids;
+  assert.equal(Object.keys(kept).length, 2000);
+  assert.ok(kept[sid] && !(`SM${'a'.repeat(32)}` in kept) && !(`SM${'0'.padStart(32, 'b')}` in kept), 'expired and oldest dropped');
+  store.db.inboundSids = {};
+});
+test('Twilio Advanced Opt-Out (OptOutType): STOP/START/HELP recorded as usual, no app reply', async (t) => {
+  quiet(t);
+  const p = num(); await call(p);
+  const base = sentTo(p).length, ownerBase = ownerAbout(p);
+  const send = (Body, OptOutType) => form('/twilio/sms', { From: p, Body, OptOutType, MessageSid: msgSid() });
+  await send('STOP', 'STOP');
+  assert.equal(store.isOptedOut(p), true);
+  assert.equal(ownerAbout(p), ownerBase + 1, 'owner still told');
+  await send('START', 'START');
+  assert.equal(store.isOptedOut(p), false, 'START resubscribes');
+  await send('HELP', 'HELP');
+  await send('PARAR', 'STOP'); // a keyword on Twilio's own list, not the app's
+  assert.equal(store.isOptedOut(p), true);
+  await send('REANUDAR', 'START');
+  assert.equal(store.isOptedOut(p), false);
+  assert.equal(sentTo(p).length, base, 'Twilio already replied: the app sent nothing');
+  await form('/twilio/sms', { From: p, Body: 'STOP' });
+  await form('/twilio/sms', { From: p, Body: 'START' });
+  assert.equal(store.isOptedOut(p), false);
+  assert.equal(sentTo(p).length, base + 2, 'without OptOutType the app confirms STOP and START as before');
+});
+test('initStorage: corrupt data (STORE_CORRUPT) is fatal at boot', async (t) => {
+  quiet(t);
+  const orig = store.init;
+  store.init = async () => { throw Object.assign(new Error('db.json is unreadable or invalid (invalid JSON); refusing to load or overwrite it'), { code: 'STORE_CORRUPT' }); };
+  t.after(() => { store.init = orig; });
+  const r = await initStorage({ retries: 3, retryDelayMs: 1 });
+  assert.deepEqual([r.ok, r.fatal], [false, true]);
+  assert.match(r.message, /invalid JSON.*refusing to start/);
+});
+
 // ---------- L5: retention ----------
 test('L5: RETENTION_DAYS defaults to 365; inactiveTexts stamps older than 24h are pruned', (t) => {
   quiet(t);

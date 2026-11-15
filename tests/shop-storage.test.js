@@ -178,6 +178,19 @@ test('same caller opt-outs and bot pauses are isolated and persisted to the actu
   assert.equal(b.store.isOptedOut(phone), false);
 });
 
+test('a corrupt namespaced store refuses to load without touching its file or another shop', async (t) => {
+  const o = console.error; console.error = () => {}; t.after(() => { console.error = o; });
+  const a = makeShop(t, 'corrupt-a'), b = makeShop(t, 'corrupt-b'), phone = '+15550002003';
+  await a.store.optOut(phone, 'test'); await b.store.optOut(phone, 'test');
+  const file = path.join(a.store.dataDir(), 'db.json'), bad = fs.readFileSync(file, 'utf8').slice(0, 30);
+  fs.writeFileSync(file, bad);
+  assert.throws(() => store.createStore({ dir: a.store.dataDir(), namespace: a.id }), (e) => e.code === 'STORE_CORRUPT');
+  assert.equal(fs.readFileSync(file, 'utf8'), bad);
+  const again = store.createStore({ dir: b.store.dataDir(), namespace: b.id });
+  assert.equal(again.isOptedOut(phone), true);
+  await again.close();
+});
+
 test('shared SPILL_DIR writes/replays only the matching namespace, even during PG failure', async (t) => {
   const spillBase = path.join(suiteDir, `spills-${++counter}`);
   envFor(t, { SPILL_DIR: spillBase });
