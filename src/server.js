@@ -28,6 +28,7 @@ const smsPage = require('./smsPage');
 const outcomes = require('./outcomes'); // outcomes log: every entry point is failure-safe (never breaks call/SMS handling)
 const disputes = require('./disputes'); // vendor check-in, no-show disputes, proof, auto-release, repeat-claim flags
 const disputePages = require('./disputePages');
+const { tapToCall } = require('./ui');
 
 const app = express();
 app.disable('x-powered-by');
@@ -747,8 +748,8 @@ async function onBooked(lead, b) {
   const status = b.status === 'held' ? `slot held, deposit pending ($${b.amount}, hold expires ${new Date(b.holdExpiresAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })})`
     : b.depositSkipped ? `BOOKED (no deposit; deposit off: ${b.depositSkipped})` : 'BOOKED (no deposit)';
   const arrive = b.status === 'confirmed' ? checkinNote(b) : '';
-  if (b.service) await owner(lead.id, `BUZZ ${env.BUSINESS_NAME || ''}: ${status.replace('slot held', 'time held')}: ${lead.name || 'Caller (name not given)'}, ${lead.need}, ${b.slotLabel}. tel:${lead.phone}${arrive}`);
-  else await owner(lead.id, `${tag(lead)}BUZZ ${env.BUSINESS_NAME || ''}: ${status}: ${lead.name || 'Caller (name not given)'}, ${lead.need}, ${b.slotLabel}. Tap to call: tel:${lead.phone}${arrive}`);
+  if (b.service) await owner(lead.id, `BUZZ ${env.BUSINESS_NAME || ''}: ${status.replace('slot held', 'time held')}: ${lead.name || 'Caller (name not given)'}, ${lead.need}, ${b.slotLabel}. ${tapToCall(lead.phone)}${arrive}`);
+  else await owner(lead.id, `${tag(lead)}BUZZ ${env.BUSINESS_NAME || ''}: ${status}: ${lead.name || 'Caller (name not given)'}, ${lead.need}, ${b.slotLabel}. ${tapToCall(lead.phone)}${arrive}`);
 }
 // Vendor's signed one-tap "I'm here" link (src/disputes.js), appended to the booking buzz once the booking is confirmed
 // (no deposit: at booking; deposit: in the BOOKED + PAID buzz).
@@ -772,15 +773,15 @@ async function onPaid(id, payment = {}) {
   const lead = store.db.leads.find((l) => l.id === b.leadId) || { id: b.leadId, phone: b.phone, name: b.name, need: b.need };
   if (conflict) {
     await sendSms(b.phone, agent.texts.paidConflict(b));
-    await owner(b.leadId, `⚠️ PAID BUT SLOT LOST $${b.amount}: ${b.name || 'Caller (name not given)'}, ${b.need}, ${b.slotLabel} (hold expired). Reschedule/refund (lead fee on hold for review). Tap to call: tel:${b.phone}`);
+    await owner(b.leadId, `⚠️ PAID BUT SLOT LOST $${b.amount}: ${b.name || 'Caller (name not given)'}, ${b.need}, ${b.slotLabel} (hold expired). Reschedule/refund (lead fee on hold for review). ${tapToCall(b.phone)}`);
     return b;
   }
   const msg = agent.texts.paid(b) + directionsNote(b);
   if (lead.messages) { lead.messages.push({ dir: 'out', body: msg }); store.save(); }
   await sendSms(b.phone, msg);
   if (b.service) { // appointment trades: 'BOOKED + PAID: <name>, <service>, <time>, $50 deposit'
-    await owner(b.leadId, `BOOKED + PAID: ${b.name || 'Caller (name not given)'}, ${b.service}, ${b.slotLabel}, $${money(b.amount)} deposit${b.details ? `. Notes: ${b.details}` : ''}. tel:${b.phone}${refundNote(b)}${checkinNote(b)}`);
-  } else await owner(b.leadId, `${tag(lead)}BOOKED + PAID $${b.amount}: ${b.name || 'Caller (name not given)'}, ${b.need}, ${b.slotLabel}, ${feeNote(b)}, tel:${b.phone}${refundNote(b)}${checkinNote(b)}`);
+    await owner(b.leadId, `BOOKED + PAID: ${b.name || 'Caller (name not given)'}, ${b.service}, ${b.slotLabel}, $${money(b.amount)} deposit${b.details ? `. Notes: ${b.details}` : ''}. ${tapToCall(b.phone)}${refundNote(b)}${checkinNote(b)}`);
+  } else await owner(b.leadId, `${tag(lead)}BOOKED + PAID $${b.amount}: ${b.name || 'Caller (name not given)'}, ${b.need}, ${b.slotLabel}, ${feeNote(b)}. ${tapToCall(b.phone)}${refundNote(b)}${checkinNote(b)}`);
   return b;
 }
 
@@ -825,8 +826,8 @@ for (const [route, kind] of [['/payment/return', 'deposit'], ['/billing/return',
 
 async function buzzOwner(lead) {
   const msg = agent.isAppointments()
-    ? `BUZZ ${env.BUSINESS_NAME || ''}: ${lead.name || 'Caller (name not given)'} (${lead.phone}) wants: ${lead.need}. Call back: ${lead.window}. tel:${lead.phone}`
-    : `${lead.urgent ? '🚨 URGENT ' : ''}BUZZ ${env.BUSINESS_NAME || ''}: ${lead.name || 'Caller (name not given)'} (${lead.phone}) needs: ${lead.need}. Callback: ${lead.window}. Tap to call: tel:${lead.phone}`;
+    ? `BUZZ ${env.BUSINESS_NAME || ''}: ${lead.name || 'Caller (name not given)'} (${lead.phone}) wants: ${lead.need}. Call back: ${lead.window}. ${tapToCall(lead.phone)}`
+    : `${lead.urgent ? '🚨 URGENT ' : ''}BUZZ ${env.BUSINESS_NAME || ''}: ${lead.name || 'Caller (name not given)'} (${lead.phone}) needs: ${lead.need}. Callback: ${lead.window}. ${tapToCall(lead.phone)}`;
   store.addAlert({ leadId: lead.id, to: env.OWNER_PHONE, body: msg });
   await sendSms(env.OWNER_PHONE || sec.PLACEHOLDER_PHONE, msg, { kind: 'owner' });
 }
