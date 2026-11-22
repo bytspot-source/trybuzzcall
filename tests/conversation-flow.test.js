@@ -476,6 +476,9 @@ test('HTTP: voice -> consent -> SMS -> owner buzz -> repeated thanks/okay/yes/no
   assert.ok(alerts[0].body.includes(lead.need));
   assert.ok(alerts[0].body.includes(lead.window));
   assert.match(alerts[0].body, /Caller \(name not given\)/);
+  const { tapToCall } = require('../src/ui');
+  assert.ok(alerts[0].body.includes(tapToCall(from)), 'completed buzz uses a formatted tap-to-call number');
+  assert.doesNotMatch(alerts[0].body, /tel:/i);
   assert.equal(sentTo(OWNER).length, 2, 'one instant buzz plus one completed-request buzz');
   assert.equal(store.db.alerts.length, 2);
   const completedAt = lead.completedAt;

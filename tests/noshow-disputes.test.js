@@ -168,6 +168,9 @@ test('booking buzz to the vendor carries the signed one-tap check-in link', asyn
   const lines = sentTo(OWNER).slice(before);
   const buzz = lines.find((l) => l.includes('BOOKED + PAID'));
   assert.ok(buzz, 'paid buzz sent');
+  const { tapToCall } = require('../src/ui');
+  assert.ok(buzz.includes(tapToCall(b.phone)), 'paid buzz uses a formatted tap-to-call number');
+  assert.doesNotMatch(buzz, /tel:/i);
   const m = /Tap when you arrive: https:\/\/shop\.example\/v\/checkin\/([A-Za-z0-9_.-]+)/.exec(buzz);
   assert.ok(m, 'link included');
   assert.equal(disputes.readToken(m[1], 'ci').b, b.id);

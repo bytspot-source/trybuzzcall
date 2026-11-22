@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 process.env.TZ = 'UTC';
 process.env.BUSINESS_TZ = 'America/New_York';
 const { extractName } = require('../src/agent');
-const { formatPhone, labelCells } = require('../src/ui');
+const { formatPhone, tapToCall, labelCells } = require('../src/ui');
 const admin = require('../src/adminPages');
 
 test('extractName keeps names and never saves a request sentence as a name', () => {
@@ -18,7 +18,11 @@ test('extractName keeps names and never saves a request sentence as a name', () 
 
 test('formatPhone and labelCells', () => {
   assert.equal(formatPhone('+14045550101'), '(404) 555-0101');
+  assert.equal(formatPhone('+17705275396'), '(770) 527-5396');
   assert.equal(formatPhone('+442079460123'), '+442079460123');
+  assert.equal(tapToCall('+17705275396'), 'Tap to call: (770) 527-5396');
+  assert.equal(tapToCall('+442079460123'), 'Tap to call: +442079460123');
+  assert.equal(tapToCall(''), '');
   assert.equal(labelCells('<tr><td>a</td><td class="x">b</td></tr>', ['One', 'Two']), '<tr><td data-label="One">a</td><td data-label="Two" class="x">b</td></tr>');
 });
 

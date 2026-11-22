@@ -33,10 +33,16 @@ function date(value, options = {}) {
   try { return new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric', ...options }).format(new Date(value)); }
   catch { return new Date(value).toISOString().slice(0, 10); }
 }
-// +12125550111 -> (212) 555-0111 for US/Canada numbers; anything else is shown as stored.
+// +12125550111 -> (212) 555-0111 for US/Canada numbers; anything else is shown as stored (E.164 if that's what we have).
 function formatPhone(value) {
   const m = /^\+1(\d{3})(\d{3})(\d{4})$/.exec(String(value || ''));
   return m ? `(${m[1]}) ${m[2]}-${m[3]}` : String(value || '');
+}
+// Owner/vendor SMS only. A normal US/Canada number is auto-linked by phone text apps; a tel: URI often is not.
+// Non-NANP numbers stay E.164, still without a tel: prefix. Empty input yields an empty string (no "Tap to call:" orphan).
+function tapToCall(phone) {
+  const shown = formatPhone(phone);
+  return shown ? `Tap to call: ${shown}` : '';
 }
 // Adds data-label="<column header>" to each body cell so narrow screens can show rows as labelled cards.
 function labelCells(rows, headers) {
@@ -84,4 +90,4 @@ function page({ title, body, area = 'workspace', businessName = 'Your business',
     : `<header class="payment-header">${brand()}${action}</header><main id="main" class="payment-main">${modeNotice(mode)}${body}</main><footer class="payment-footer"><a href="/terms.html">Terms</a><a href="/privacy.html">Privacy</a><a href="/refunds.html">Refund policy</a><span>© ${new Date().getFullYear()} TryBuzzCall LLC</span></footer>`;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex, nofollow"><meta name="theme-color" content="#142b32">${meta.referrer ? `<meta name="referrer" content="${esc(meta.referrer)}">` : ''}${meta.description ? `<meta name="description" content="${esc(meta.description)}"><meta property="og:type" content="website"><meta property="og:site_name" content="BuzzCall"><meta property="og:title" content="${esc(meta.title || title)}"><meta property="og:description" content="${esc(meta.description)}">` : ''}<title>${esc(title)} | BuzzCall</title><link rel="stylesheet" href="/dashboard.css">${script ? '<script src="/dashboard.js" defer></script>' : ''}</head><body class="${workspace ? 'workspace-page' : 'payment-page'}"><a class="skip-link" href="#main">Skip to content</a>${shell}<dialog class="confirmation-dialog" id="confirm-dialog" aria-labelledby="confirm-title"><form method="dialog"><span class="dialog-symbol">${icon('shield')}</span><h2 id="confirm-title">Confirm this change</h2><p id="confirm-description"></p><div class="dialog-actions"><button class="button button-outline" value="cancel">Keep current settings</button><button class="button button-primary" value="confirm">Confirm change</button></div></form></dialog></body></html>`;
 }
-module.exports = { esc, icon, money, date, formatPhone, labelCells, badge, empty, stripeLink, brand, modeNotice, page };
+module.exports = { esc, icon, money, date, formatPhone, tapToCall, labelCells, badge, empty, stripeLink, brand, modeNotice, page };
